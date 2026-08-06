@@ -1,0 +1,107 @@
+<mujoco model="Panda dynamic cable grasp">
+  <compiler meshdir="assets" angle="radian" autolimits="true"/>
+  <include file="panda.xml"/>
+
+  <extension>
+    <plugin plugin="mujoco.elasticity.cable"/>
+  </extension>
+
+  <option timestep="0.002" integrator="implicitfast" gravity="0 0 -9.81"/>
+  <size njmax="1200" nconmax="600"/>
+  <statistic center="0.45 0 0.35" extent="1.55"/>
+
+  <visual>
+    <global azimuth="135" elevation="-25"/>
+    <quality shadowsize="2048"/>
+    <map znear="0.01" zfar="12" fogstart="4" fogend="10"/>
+    <rgba haze="0.12 0.18 0.25 1"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.32 0.52 0.72"
+             rgb2="0.02 0.04 0.08" width="512" height="512"/>
+    <texture name="table_tex" type="2d" builtin="checker"
+             rgb1="0.18 0.20 0.22" rgb2="0.10 0.12 0.14"
+             width="256" height="256"/>
+    <material name="table_mat" texture="table_tex" texrepeat="5 5"
+              texuniform="true" reflectance="0.12"/>
+  </asset>
+
+  <worldbody>
+    <light directional="true" pos="-2 -3 4" dir="0.3 0.35 -1"
+           diffuse="0.95 0.92 0.84" specular="0.3 0.3 0.3"/>
+    <light directional="true" pos="2 1 3" dir="-0.35 -0.15 -1"
+           diffuse="0.25 0.35 0.45"/>
+
+    <geom name="table" type="box" pos="0.55 0 -0.06" size="0.72 0.62 0.06"
+          material="table_mat" friction="0.35 0.05 0.01"/>
+    <geom name="table_edge" type="box" pos="0.55 0.66 0.12" size="0.72 0.025 0.18"
+          rgba="0.12 0.14 0.16 1"/>
+
+    <!-- 0.8 m cable, initially lying on the table. The official cable plugin
+         provides smooth bending and twist; the Python controller adds a
+         spatially varying lateral disturbance so its shape keeps changing. -->
+    <composite prefix="cable" type="cable" curve="s" count="41 1 1" size="0.8"
+               offset="0.23 0 0.045" initial="free">
+      <plugin plugin="mujoco.elasticity.cable">
+      <config key="twist" value="1e4"/>
+      <config key="bend" value="2e3"/>
+        <config key="vmax" value="0.08"/>
+      </plugin>
+      <joint kind="main" damping="0.025"/>
+      <geom type="capsule" size="0.014" density="150"
+            rgba="0.95 0.22 0.035 1" condim="3"
+            friction="2.0 0.08 0.01"/>
+    </composite>
+
+    <site name="cable_marker" pos="0.63 0 0.08" size="0.018"
+          rgba="1 0.85 0.08 0.8"/>
+  </worldbody>
+
+  <!-- Isolate the two physically different contacts.  Cable-pad contacts keep
+       the cable's high friction above; table-cable contacts override it with
+       low sliding friction so a missed cable slides aside instead of sticking,
+       buckling and being funnelled into a moving closed gripper. -->
+  <contact>
+    <pair geom1="table" geom2="cableG0" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG1" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG2" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG3" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG4" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG5" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG6" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG7" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG8" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG9" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG10" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG11" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG12" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG13" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG14" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG15" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG16" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG17" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG18" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG19" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG20" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG21" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG22" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG23" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG24" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG25" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG26" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG27" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG28" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG29" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG30" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG31" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG32" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG33" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG34" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG35" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG36" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG37" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG38" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+    <pair geom1="table" geom2="cableG39" friction="0.12 0.12 0.003 0.0001 0.0001"/>
+  </contact>
+</mujoco>
