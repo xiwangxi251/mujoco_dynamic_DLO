@@ -110,6 +110,7 @@ def main() -> None:
     callbacks = CallbackList([checkpoint_callback, metrics_callback])
     configuration = {
         "algorithm": "PPO",
+        "grasp_model": "physical_friction_v1",
         "timesteps": args.timesteps,
         "workers": args.workers,
         "seed": args.seed,

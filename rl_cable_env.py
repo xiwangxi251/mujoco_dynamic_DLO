@@ -1,7 +1,7 @@
 """供强化学习使用的 Gymnasium 接口。
 
 该文件只负责把观测和动作转换成固定长度向量，并计算训练奖励。线缆扰动、
-接触、弹性夹持代理和成功判定仍完全由 CableGraspEnv 决定。
+接触、纯摩擦夹持和成功判定仍完全由 CableGraspEnv 决定。
 """
 
 from __future__ import annotations

@@ -50,7 +50,7 @@
       </plugin>
       <joint kind="main" damping="0.025"/>
       <geom type="capsule" size="0.014" density="150"
-            rgba="0.95 0.22 0.035 1" condim="3"
+            rgba="0.95 0.22 0.035 1" condim="4"
             friction="2.0 0.08 0.01"/>
     </composite>
 
