@@ -81,8 +81,9 @@ MuJoCo 的普通摩擦接触并不保证一条很细、持续受强扰动的柔�
 `0.12` 的滑动摩擦。因此桌面接触不会再继承线缆的高摩擦，抓空后更倾向于滑到一侧。
 
 夹爪现在请求完全闭合，但最终开口由线缆—指垫碰撞决定；环境将 Menagerie 原本较柔和的
-夹爪位置增益和闭合刚度等比例放大 1.5 倍，目标位置映射不变，只适度增加夹持力。抓取期间必须持续
-保留双侧真实接触，否则 0.35 秒后掉落。这仍是局部柔性夹持代理，不是 FEM 指垫模型。
+夹爪位置增益和闭合刚度等比例放大 1.5 倍，目标位置映射不变，只适度增加夹持力。双侧接触只用于
+建立抓取；确认后允许接触在左右指垫之间切换。只有代理误差连续超过 0.025 m，或者线缆中心连续
+离开两指夹持区域 0.15 秒，才撤销夹持代理。这仍是局部柔性夹持代理，不是 FEM 指垫模型。
 
 成功必须连续 0.55 秒同时满足：
 
@@ -94,3 +95,80 @@ MuJoCo 的普通摩擦接触并不保证一条很细、持续受强扰动的柔�
 - 被抓线段仍位于夹爪附近。
 
 终端会输出状态转换、追踪误差、接触数，以及成功时的抬升比例和抓取误差。
+
+## PPO强化学习策略
+
+RL环境完全绕过 `dynamic_grasp_policy.py` 的脚本状态机。PPO直接输出8维连续动作：前7维
+控制Panda关节位置目标的增量，第8维控制夹爪，`-1`表示闭合、`+1`表示张开。环境只做
+执行器合法范围裁剪，不根据训练阶段修改策略动作。
+
+40维归一化观测包括：
+
+- 目标线段的世界位置和线速度；
+- 目标线段相对真实指垫中心的位置；
+- 7个机械臂关节的位置和速度；
+- 两个手指关节的位置和速度；
+- 真实指垫中心的位置、手部四元数、线速度和角速度。
+
+策略看不到完整线缆形状，也不读取脚本策略阶段。奖励由接近进度、真实指垫接触、已确认抓取、
+抬升高度、整条线缆离桌比例和最终成功组成，并包含很小的动作代价。奖励只读取状态，不修改
+线缆扰动、接触、夹持代理或机器人动作。
+
+首次使用已经在 `dynamic` 环境安装了依赖；如需重建环境可运行：
+
+```powershell
+& C:\ProgramData\anaconda3\envs\dynamic\python.exe -m pip install -r .\requirements_rl.txt
+```
+
+默认用6个独立MuJoCo进程训练200万步：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_rl_train.ps1
+```
+
+短训练或改变并行数：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_rl_train.ps1 `
+  --timesteps 200000 --workers 6 --output .\runs\ppo_cable_200k
+```
+
+训练时每完成20轮会在终端输出最近100轮的成功率、抓取率、平均回报和平均线缆抬升比例；
+同样的滚动指标会写入TensorBoard的 `task/` 分组。训练产物包括：
+
+- `final_model.zip` 和定期检查点；
+- `training_metrics.csv`：每轮原始成功、抓取、回报和抬升数据；
+- `training_curves.csv`：最近100轮滑动指标；
+- `success_rate.png`：成功率和抓取率曲线；
+- `reward_curve.png`：平均回报曲线；
+- TensorBoard日志、Monitor记录和完整训练配置。
+
+查看实时TensorBoard曲线：
+
+```powershell
+& C:\ProgramData\anaconda3\envs\dynamic\python.exe -m tensorboard.main `
+  --logdir .\runs\ppo_cable\tensorboard
+```
+
+继续训练可使用：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_rl_train.ps1 `
+  --resume .\runs\ppo_cable\final_model.zip --timesteps 1000000
+```
+
+无界面测试20个新随机场景：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_rl_test.ps1 `
+  --model .\runs\ppo_cable\final_model.zip --headless --episodes 20
+```
+
+打开实时MuJoCo窗口观察5轮：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_rl_test.ps1 `
+  --model .\runs\ppo_cable\final_model.zip --episodes 5 --speed 1
+```
+
+`runs/smoke_test`只是2048步程序链路检查，不是已经学会抓取的模型；正式效果需要运行足够长的训练。
