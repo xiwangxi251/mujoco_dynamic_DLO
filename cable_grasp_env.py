@@ -153,21 +153,10 @@ class CableGraspEnv:
             raise RuntimeError(
                 f"Expected 10 Panda pad collision boxes, found {len(self.pad_geom_ids)}"
             )
-        # 原主指垫只有17×17 mm，而当前线缆直径为28 mm，圆柱很容易从边缘滚出。
-        # 将左右主橡胶垫扩为36×100 mm，并让黑色碰撞垫可见；这仍是普通刚体碰撞，
-        # 没有焊接、弹簧或隐藏约束。桌面接触参数由XML的专用pair独立覆盖。
-        self.main_pad_geom_ids = {
-            geom_id for geom_id in self.pad_geom_ids
-            if np.allclose(
-                self.model.geom_pos[geom_id], [0.0, 0.0055, 0.0445], atol=1e-6
-            )
-        }
-        if len(self.main_pad_geom_ids) != 2:
-            raise RuntimeError(
-                f"Expected 2 Panda main pads, found {len(self.main_pad_geom_ids)}"
-            )
+        # 指垫的尺寸、位置、姿态和可视模型全部保持Menagerie原样。这里只修改材料接触参数，
+        # 因此策略必须真正把28 mm线缆对准官方17 mm主指垫，环境不会用大碰撞盒或凹槽兜底。
         for geom_id in self.pad_geom_ids:
-            # 指垫优先级高于普通线缆geom，使用较硬的橡胶接触，避免强闭爪时穿透线缆。
+            # 指垫优先级高于普通线缆geom，使用高摩擦且较硬的橡胶接触。
             self.model.geom_priority[geom_id] = 1
             # condim=6同时启用滑动、绕法线扭转和滚动摩擦。这里模拟高摩擦橡胶指垫；
             # 由于priority=1，参数只在该指垫参与接触时覆盖普通线缆参数。
@@ -175,42 +164,6 @@ class CableGraspEnv:
             self.model.geom_friction[geom_id] = [6.0, 0.35, 0.12]
             self.model.geom_solref[geom_id] = [0.002, 1.0]
             self.model.geom_solimp[geom_id] = [0.98, 0.995, 0.0005, 0.5, 2.0]
-        for geom_id in self.main_pad_geom_ids:
-            self.model.geom_size[geom_id] = [0.018, 0.005, 0.050]
-            self.model.geom_rbound[geom_id] = float(
-                np.linalg.norm(self.model.geom_size[geom_id])
-            )
-            self.model.geom_group[geom_id] = 2
-            self.model.geom_rgba[geom_id] = [0.08, 0.08, 0.08, 1.0]
-        # 复用每根手指的四个小指垫box作为左右、上下挡边，形成可见的凹槽指垫。
-        # 它阻止28 mm圆柱从指垫边缘滚出；所有挡边都只通过普通碰撞起作用，
-        # 不跟踪、不固定任何线缆节点，也不随“抓取成功”状态开关。
-        for finger_id in self.finger_ids:
-            small_pads = sorted(
-                geom_id for geom_id in self.pad_geom_ids
-                if (
-                    int(self.model.geom_bodyid[geom_id]) == finger_id
-                    and geom_id not in self.main_pad_geom_ids
-                )
-            )
-            for geom_id, x_position in zip(small_pads[:2], [-0.026, 0.026]):
-                self.model.geom_pos[geom_id] = [x_position, 0.012, 0.0445]
-                self.model.geom_quat[geom_id] = [1.0, 0.0, 0.0, 0.0]
-                self.model.geom_size[geom_id] = [0.008, 0.008, 0.050]
-                self.model.geom_rbound[geom_id] = float(
-                    np.linalg.norm(self.model.geom_size[geom_id])
-                )
-                self.model.geom_group[geom_id] = 2
-                self.model.geom_rgba[geom_id] = [0.05, 0.05, 0.05, 1.0]
-            for geom_id, z_position in zip(small_pads[2:], [0.014, 0.075]):
-                self.model.geom_pos[geom_id] = [0.0, 0.012, z_position]
-                self.model.geom_quat[geom_id] = [1.0, 0.0, 0.0, 0.0]
-                self.model.geom_size[geom_id] = [0.018, 0.008, 0.010]
-                self.model.geom_rbound[geom_id] = float(
-                    np.linalg.norm(self.model.geom_size[geom_id])
-                )
-                self.model.geom_group[geom_id] = 2
-                self.model.geom_rgba[geom_id] = [0.05, 0.05, 0.05, 1.0]
         self.finger_joint_ids = np.array([
             id_of(self.model, mujoco.mjtObj.mjOBJ_JOINT, "finger_joint1"),
             id_of(self.model, mujoco.mjtObj.mjOBJ_JOINT, "finger_joint2"),
