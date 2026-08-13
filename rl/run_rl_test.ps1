@@ -5,11 +5,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RlDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProjectDir = Split-Path -Parent $RlDir
 Push-Location $ProjectDir
 try {
-  & $Python ".\test_rl.py" @TestArgs
+  & $Python -m rl.test_rl @TestArgs
 } finally {
   Pop-Location
 }
-

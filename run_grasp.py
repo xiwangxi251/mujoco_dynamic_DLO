@@ -3,10 +3,31 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+from pathlib import Path
 import time
 
 from cable_grasp_env import CableGraspEnv, EnvConfig, XML_PATH
 from dynamic_grasp_policy import DynamicCableGraspPolicy
+from experiment_scenarios import get_scenario, list_scenario_names
+
+
+def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
+    if args.scenario is None:
+        return EnvConfig(
+            seed=args.seed,
+            episode_seconds=args.episode_seconds,
+            disturbance_strength=args.disturbance,
+        )
+    scenario = get_scenario(args.scenario)
+    return EnvConfig(
+        seed=args.seed,
+        episode_seconds=args.episode_seconds,
+        scenario_name=scenario.name,
+        scenario_id=scenario.scenario_id,
+        scenario_split=scenario.split.value,
+        **scenario.to_env_overrides(),
+    )
 
 
 def print_trial_start(env: CableGraspEnv) -> None:
@@ -19,27 +40,86 @@ def print_trial_start(env: CableGraspEnv) -> None:
 
 
 def run_headless(args: argparse.Namespace) -> None:
+    import cv2
+    import mujoco
+    import numpy as np
+
     """快速验证；使用与GUI模式完全相同的环境和策略。"""
     # 无界面模式不等待墙钟时间，因此适合批量统计成功率；物理与GUI模式完全相同。
-    env = CableGraspEnv(EnvConfig(
-        seed=args.seed,
-        episode_seconds=args.episode_seconds,
-        disturbance_strength=args.disturbance,
-    ))
+    env = CableGraspEnv(env_config_from_args(args))
     policy = DynamicCableGraspPolicy(env)
     successes = 0
 
+    # 每次运行使用独立子目录，避免覆盖之前各回合的视频。
+    run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
+    video_dir = args.video_dir / run_name
+    suffix = 1
+    while video_dir.exists():
+        video_dir = args.video_dir / f"{run_name}_{suffix:02d}"
+        suffix += 1
+    video_dir.mkdir(parents=True)
+
+    # MuJoCo默认离屏 framebuffer 只有640x480；按请求尺寸自动扩展后再创建渲染器。
+    # 这只修改当前进程中的模型，不改变物理参数，也不要求用户手工编辑XML。
+    env.model.vis.global_.offwidth = max(
+        int(env.model.vis.global_.offwidth), args.video_width
+    )
+    env.model.vis.global_.offheight = max(
+        int(env.model.vis.global_.offheight), args.video_height
+    )
+    renderer = mujoco.Renderer(
+        env.model, height=args.video_height, width=args.video_width
+    )
+    model_path = video_dir / "model.mjb"
+    mujoco.mj_saveModel(env.model, str(model_path), None)
+    state_spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
+    state_size = mujoco.mj_stateSize(env.model, state_spec)
+    camera = mujoco.MjvCamera()
+    mujoco.mjv_defaultCamera(camera)
+    camera.lookat[:] = [0.55, 0.0, 0.30]
+    camera.distance = 1.65
+    camera.azimuth = 135
+    camera.elevation = -25
+
+    def write_frame(writer: cv2.VideoWriter, recorded_states: list[np.ndarray]) -> None:
+        """渲染当前物理状态，并写入本回合的视频。"""
+        state = np.empty(state_size, dtype=np.float64)
+        mujoco.mj_getState(env.model, env.data, state, state_spec)
+        recorded_states.append(state)
+        renderer.update_scene(env.data, camera=camera)
+        rgb = renderer.render()
+        writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
     print(f"model={XML_PATH}", flush=True)
+    print(f"headless_videos={video_dir.resolve()}", flush=True)
     for trial in range(args.trials):
-        if trial:
-            env.reset()
-            policy.reset()
+        episode_seed = args.seed + trial
+        env.reset(seed=episode_seed)
+        policy.reset()
         print_trial_start(env)
+        video_path = video_dir / f"trial_{env.trial_index:03d}.mp4"
+        writer = cv2.VideoWriter(
+            str(video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            args.video_fps,
+            (args.video_width, args.video_height),
+        )
+        if not writer.isOpened():
+            renderer.close()
+            raise RuntimeError(f"无法创建视频文件: {video_path}")
         previous_phase = policy.phase
+        next_frame_time = 0.0
+        recorded_states: list[np.ndarray] = []
+        # 保存重置后的初始画面；之后按仿真时间而不是计算耗时采样。
+        write_frame(writer, recorded_states)
+        next_frame_time += 1.0 / args.video_fps
         while not policy.finished and env.data.time < env.config.episode_seconds:
             # 标准交互循环：策略产生动作 -> 环境执行动作并推进物理。
             action = policy.action()
             _, _, _, truncated, _ = env.step(action)
+            if env.data.time + 1e-9 >= next_frame_time:
+                write_frame(writer, recorded_states)
+                next_frame_time += 1.0 / args.video_fps
             if policy.phase is not previous_phase:
                 tracking_error = ((env.hand_position - policy.last_desired) ** 2).sum() ** 0.5
                 print(
@@ -55,9 +135,32 @@ def run_headless(args: argparse.Namespace) -> None:
             if truncated:
                 policy.result = "failed_timeout"
                 policy.finished = True
+        writer.release()
+        states_path = video_dir / f"trial_{env.trial_index:03d}_states.npz"
+        np.savez_compressed(
+            states_path,
+            states=np.stack(recorded_states),
+            state_spec=np.int64(int(state_spec)),
+            frame_times=np.asarray([state[0] for state in recorded_states]),
+            fps=np.float64(args.video_fps),
+            width=np.int64(args.video_width),
+            height=np.int64(args.video_height),
+            model_file=np.asarray(model_path.name),
+            source_xml=np.asarray(str(XML_PATH.resolve())),
+            mujoco_version=np.asarray(mujoco.__version__),
+            trial=np.int64(env.trial_index),
+            seed=np.int64(episode_seed),
+            scenario_name=np.asarray(env.config.scenario_name),
+            scenario_id=np.asarray(env.config.scenario_id or ""),
+            motion_profile_hash=np.asarray(env.motion_profile_hash),
+            result=np.asarray(policy.result),
+        )
         successes += int(policy.result == "success")
         print(policy.summary(), flush=True)
+        print(f"  video={video_path.resolve()}", flush=True)
+        print(f"  states={states_path.resolve()}", flush=True)
 
+    renderer.close()
     print(f"completed={args.trials} successes={successes} rate={successes / args.trials:.1%}")
 
 
@@ -66,11 +169,8 @@ def run_viewer(args: argparse.Namespace) -> None:
     # GUI不是预先计算后的回放：窗口存在时才持续生成新的物理步。
     from mujoco import viewer
 
-    env = CableGraspEnv(EnvConfig(
-        seed=args.seed,
-        episode_seconds=args.episode_seconds,
-        disturbance_strength=args.disturbance,
-    ))
+    env = CableGraspEnv(env_config_from_args(args))
+    env.reset(seed=args.seed)
     policy = DynamicCableGraspPolicy(env)
 
     controls = {
@@ -174,6 +274,10 @@ def run_viewer(args: argparse.Namespace) -> None:
             max_steps = 8
             steps = 0
             while env.data.time < target_sim_time and steps < max_steps:
+                # 试次结束后停止推进物理，等待一秒后自动重置或保留最终画面。
+                # 否则failed_timeout虽已打印，旧状态机仍会继续产生动作和转换日志。
+                if policy.finished:
+                    break
                 # 同一GUI帧内可推进多个50 Hz动作，viewer仍按约60 FPS刷新。
                 action = policy.action()
                 _, _, _, truncated, _ = env.step(action)
@@ -244,13 +348,29 @@ def parse_args() -> argparse.Namespace:
                         help="initial GUI simulation-time multiplier (0.25 to 8)")
     parser.add_argument("--disturbance", type=float, default=1.5,
                         help="cable disturbance multiplier, independent of actions")
+    parser.add_argument(
+        "--scenario", choices=list_scenario_names(),
+        help="run one frozen experiment scenario; overrides --disturbance",
+    )
     parser.add_argument("--episode-seconds", type=float, default=28.0,
                         help="maximum simulated seconds per trial")
     parser.add_argument("--seed", type=int, default=20260804)
+    parser.add_argument("--video-dir", type=Path, default=Path("headless_videos"),
+                        help="headless视频根目录；每次运行会建立独立子目录")
+    parser.add_argument("--video-fps", type=float, default=25.0,
+                        help="headless视频帧率")
+    parser.add_argument("--video-width", type=int, default=960,
+                        help="headless视频宽度")
+    parser.add_argument("--video-height", type=int, default=540,
+                        help="headless视频高度")
     args = parser.parse_args()
     args.speed = min(8.0, max(0.25, args.speed))
     if args.headless and args.trials <= 0:
         parser.error("--headless requires --trials greater than zero")
+    if args.video_fps <= 0.0:
+        parser.error("--video-fps must be greater than zero")
+    if args.video_width <= 0 or args.video_height <= 0:
+        parser.error("--video-width and --video-height must be greater than zero")
     return args
 
 

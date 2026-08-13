@@ -6,7 +6,8 @@
     <plugin plugin="mujoco.elasticity.cable"/>
   </extension>
 
-  <option timestep="0.002" integrator="implicitfast" gravity="0 0 -9.81"/>
+  <option timestep="0.002" integrator="implicitfast" gravity="0 0 -9.81"
+          solver="Newton" cone="elliptic" impratio="20"     noslip_iterations="1"/>
   <size njmax="1200" nconmax="600"/>
   <statistic center="0.45 0 0.35" extent="1.55"/>
 

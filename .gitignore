@@ -1,4 +1,8 @@
 __pycache__/
 *.py[cod]
 MUJOCO_LOG.TXT
-runs/
+rl/runs/
+headless_videos/
+rl_test_videos*/
+benchmark_runs/
+

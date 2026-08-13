@@ -1,0 +1,595 @@
+"""在冻结场景矩阵和相同 seed 上配对评估脚本基线与 PPO。"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from dataclasses import asdict
+from datetime import datetime, timezone
+import hashlib
+from importlib.metadata import PackageNotFoundError, version
+import json
+import math
+from pathlib import Path
+import platform
+import subprocess
+import sys
+from typing import Any
+
+import mujoco
+import numpy as np
+
+from cable_grasp_env import CableGraspEnv, EnvConfig, XML_PATH
+from dynamic_grasp_policy import DynamicCableGraspPolicy, PolicyConfig
+from experiment_scenarios import (
+    SCENARIO_SUITE_NAMES,
+    ScenarioConfig,
+    get_scenario,
+    list_scenario_names,
+    list_suite_scenarios,
+)
+from failure_taxonomy import (
+    TASK_OUTCOME_TYPES,
+    base_scene_fingerprint,
+    classify_task_outcome,
+    confirmed_break_times,
+    scene_fingerprint,
+)
+from motion_diagnostics import env_config_for_scenario
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def _distribution_version(name: str) -> str | None:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
+
+
+def _sha256(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_text(*args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=ROOT, check=True, capture_output=True, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip()
+
+
+def _legacy_config(seed: int, disturbance: float, seconds: float) -> EnvConfig:
+    return EnvConfig(
+        seed=seed,
+        disturbance_strength=disturbance,
+        episode_seconds=seconds,
+    )
+
+
+def _scenario_config(
+    scenario: ScenarioConfig | None,
+    *,
+    seed: int,
+    disturbance: float,
+    seconds: float,
+) -> EnvConfig:
+    if scenario is None:
+        return _legacy_config(seed, disturbance, seconds)
+    return env_config_for_scenario(
+        scenario, seed=seed, episode_seconds=seconds,
+    )
+
+
+def _base_row(
+    method: str,
+    episode: int,
+    seed: int,
+    scenario: ScenarioConfig | None,
+    initial_info: dict[str, Any],
+    info: dict[str, Any],
+    break_history: list[dict[str, Any]],
+) -> dict[str, Any]:
+    actual_seed = initial_info.get("episode_seed")
+    if actual_seed != seed:
+        raise RuntimeError(
+            f"episode seed mismatch for {method}: requested={seed}, actual={actual_seed}"
+        )
+    task_success = bool(info.get("base_success", info.get("success", False)))
+    ever_candidate = bool(info.get("ever_bilateral_candidate", False))
+    ever_confirmed = bool(info.get("ever_confirmed_grasp", False))
+    first_breaks = confirmed_break_times(break_history)
+    scenario_name = initial_info.get("scenario_name", "legacy_shape_current")
+    scenario_id = initial_info.get("scenario_id") or "legacy-shape-current"
+    row = {
+        "method": method,
+        "episode": episode,
+        "scenario_episode_id": f"{scenario_id}:seed-{seed}",
+        "scenario_name": scenario_name,
+        "scenario_id": scenario_id,
+        "scenario_split": initial_info.get("scenario_split", "legacy"),
+        "motion_type": initial_info.get("motion_mode", "shape"),
+        "motion_profile_version": initial_info.get(
+            "motion_profile_version", "legacy_v1"
+        ),
+        "motion_regularity": initial_info.get(
+            "motion_regularity", "quasiperiodic"
+        ),
+        "amplitude_level": (
+            None if scenario is None else scenario.amplitude_level.value
+        ),
+        "frequency_level": (
+            None if scenario is None else scenario.frequency_level.value
+        ),
+        "disturbance_strength": float(
+            initial_info.get("disturbance_strength", 1.5)
+        ),
+        "motion_frequency_scale": float(
+            initial_info.get("motion_frequency_scale", 1.0)
+        ),
+        "motion_profile_hash": initial_info.get("motion_profile_hash"),
+        "cable_length_scale": float(initial_info.get("cable_length_scale", 1.0)),
+        "cable_density_scale": float(initial_info.get("cable_density_scale", 1.0)),
+        "cable_stiffness_scale": float(
+            initial_info.get("cable_stiffness_scale", 1.0)
+        ),
+        "cable_damping_scale": float(
+            initial_info.get("cable_damping_scale", 1.0)
+        ),
+        "cable_friction_scale": float(
+            initial_info.get("cable_friction_scale", 1.0)
+        ),
+        "cable_length_ood": bool(scenario and scenario.cable_length_ood),
+        "cable_material_profile": (
+            "nominal" if scenario is None else scenario.cable_material_profile
+        ),
+        "cable_material_ood": bool(scenario and scenario.cable_material_ood),
+        "requested_seed": seed,
+        "actual_episode_seed": actual_seed,
+        "base_scene_fingerprint": base_scene_fingerprint(initial_info),
+        "scene_fingerprint": scene_fingerprint(initial_info),
+        "task_success": task_success,
+        "policy_internal_success": bool(info.get("success", False)),
+        "ever_pinched": bool(
+            info.get("ever_pinched", info.get("grasped_body_id") is not None)
+        ),
+        "ever_secured": bool(info.get("ever_grasped", False)),
+        "ever_bilateral_candidate": ever_candidate,
+        "ever_confirmed_grasp": ever_confirmed,
+        "target_body_id": int(initial_info["target_body_id"]),
+        "grasped_body_id": info.get("grasped_body_id"),
+        "initial_cable_dx": float(initial_info.get("initial_cable_dx", np.nan)),
+        "initial_cable_dy": float(initial_info.get("initial_cable_dy", np.nan)),
+        "disturbance_phase": float(initial_info.get("disturbance_phase", np.nan)),
+        "disturbance_spatial_phase": float(
+            initial_info.get("disturbance_spatial_phase", np.nan)
+        ),
+        "active_open_break_count": int(info.get("active_open_break_count", 0)),
+        "physical_slip_break_count": int(info.get("physical_slip_break_count", 0)),
+        "active_open_after_secured_count": int(
+            info.get("active_open_after_secured_count", 0)
+        ),
+        "physical_slip_after_secured_count": int(
+            info.get("physical_slip_after_secured_count", 0)
+        ),
+        "active_open_after_confirmed_count": int(
+            info.get("active_open_after_confirmed_count", 0)
+        ),
+        "physical_slip_after_confirmed_count": int(
+            info.get("physical_slip_after_confirmed_count", 0)
+        ),
+        "open_during_contact_loss_after_confirmed_count": int(
+            info.get("open_during_contact_loss_after_confirmed_count", 0)
+        ),
+        "first_active_open_after_confirmed_time": first_breaks.get("active_open"),
+        "first_physical_slip_after_confirmed_time": first_breaks.get("physical_slip"),
+        "first_open_during_contact_loss_after_confirmed_time": first_breaks.get(
+            "open_during_contact_loss"
+        ),
+        "last_grasp_break_reason": info.get("last_grasp_break_reason"),
+        "last_grasp_break_causal_class": info.get(
+            "last_grasp_break_causal_class"
+        ),
+        "lifted_fraction": float(info.get("lifted_fraction", 0.0)),
+        "max_z": float(info.get("max_z", 0.0)),
+        "success_hold": float(
+            info.get("strict_success_hold", info.get("success_hold", 0.0))
+        ),
+    }
+    row["task_failure_type"] = classify_task_outcome(
+        task_success=task_success,
+        ever_bilateral_candidate=ever_candidate,
+        ever_confirmed_grasp=ever_confirmed,
+        break_events=break_history,
+    )
+    return row
+
+
+def _run_scripted(
+    seeds: list[int],
+    scenario: ScenarioConfig | None,
+    disturbance: float,
+    episode_seconds: float,
+) -> list[dict[str, Any]]:
+    config = _scenario_config(
+        scenario, seed=seeds[0], disturbance=disturbance, seconds=episode_seconds,
+    )
+    env = CableGraspEnv(config)
+    policy = DynamicCableGraspPolicy(env)
+    rows: list[dict[str, Any]] = []
+    for episode, seed in enumerate(seeds, start=1):
+        _, initial_info = env.reset(seed=seed)
+        policy.reset()
+        min_target_distance = float("inf")
+        while not policy.finished and env.data.time < env.config.episode_seconds:
+            action = policy.action()
+            _, _, _, truncated, _ = env.step(action)
+            min_target_distance = min(
+                min_target_distance,
+                float(np.linalg.norm(env.target_position() - env.hand_position)),
+            )
+            if truncated:
+                policy.result = "failed_timeout"
+                policy.finished = True
+        info = env.info()
+        info["ever_pinched"] = env.last_grasped_body_id is not None
+        info["base_success"] = env.ever_success
+        info["success"] = policy.result == "success"
+        reached_time_limit = bool(
+            env.data.time >= env.config.episode_seconds - 1e-9
+        )
+        row = _base_row(
+            "scripted", episode, seed, scenario, initial_info, info,
+            env.grasp_break_history,
+        )
+        row.update({
+            "steps": int(round(env.data.time / (
+                env.model.opt.timestep * max(1, env.config.frame_skip)
+            ))),
+            "sim_time": float(env.data.time),
+            "episode_return": np.nan,
+            "min_target_distance": min_target_distance,
+            "policy_result": policy.result,
+            "terminated": policy.result == "success",
+            "truncated": reached_time_limit,
+        })
+        rows.append(row)
+    return rows
+
+
+def _run_ppo(
+    seeds: list[int],
+    scenario: ScenarioConfig | None,
+    disturbance: float,
+    episode_seconds: float,
+    model_path: Path,
+    device: str,
+) -> list[dict[str, Any]]:
+    from stable_baselines3 import PPO
+    from rl.rl_cable_env import RLCableGraspEnv
+
+    config = _scenario_config(
+        scenario, seed=seeds[0], disturbance=disturbance, seconds=episode_seconds,
+    )
+    env = RLCableGraspEnv(env_config=config)
+    model = PPO.load(model_path, device=device)
+    rows: list[dict[str, Any]] = []
+    try:
+        for episode, seed in enumerate(seeds, start=1):
+            observation, info = env.reset(seed=seed)
+            initial_info = dict(info)
+            episode_return = 0.0
+            steps = 0
+            min_target_distance = float(info["target_distance"])
+            while True:
+                action, _ = model.predict(observation, deterministic=True)
+                observation, reward, terminated, truncated, info = env.step(action)
+                episode_return += float(reward)
+                steps += 1
+                min_target_distance = min(
+                    min_target_distance, float(info["target_distance"])
+                )
+                if terminated or truncated:
+                    break
+            row = _base_row(
+                "ppo", episode, seed, scenario, initial_info, info,
+                env.base_env.grasp_break_history,
+            )
+            row.update({
+                "steps": steps,
+                "sim_time": float(env.data.time),
+                "episode_return": episode_return,
+                "min_target_distance": min_target_distance,
+                "policy_result": "success" if terminated else "truncated",
+                "terminated": bool(terminated),
+                "truncated": bool(truncated),
+            })
+            rows.append(row)
+    finally:
+        env.close()
+    return rows
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fields: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fields:
+                fields.append(key)
+    with path.open("w", encoding="utf-8", newline="") as target:
+        writer = csv.DictWriter(target, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _wilson_interval(successes: int, total: int, z: float) -> tuple[float, float]:
+    if total <= 0:
+        return math.nan, math.nan
+    probability = successes / total
+    denominator = 1.0 + z * z / total
+    center = (probability + z * z / (2.0 * total)) / denominator
+    radius = z * math.sqrt(
+        probability * (1.0 - probability) / total
+        + z * z / (4.0 * total * total)
+    ) / denominator
+    return max(0.0, center - radius), min(1.0, center + radius)
+
+
+def _aggregate(selected: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(selected)
+    successes = sum(bool(row["task_success"]) for row in selected)
+    failures = total - successes
+    outcomes = {outcome: 0 for outcome in TASK_OUTCOME_TYPES}
+    for row in selected:
+        outcomes[str(row["task_failure_type"])] += 1
+    slip_failures = outcomes["physical_slip_after_confirmed_grasp"]
+    success_low, success_high = _wilson_interval(successes, total, 1.959964)
+    _, slip_upper = _wilson_interval(slip_failures, failures, 1.644854)
+    return {
+        "episodes": total,
+        "task_successes": successes,
+        "task_success_rate": successes / total if total else None,
+        "task_success_wilson95_low": None if total == 0 else success_low,
+        "task_success_wilson95_high": None if total == 0 else success_high,
+        "policy_internal_successes": sum(
+            bool(row["policy_internal_success"]) for row in selected
+        ),
+        "task_policy_success_mismatches": sum(
+            bool(row["task_success"]) != bool(row["policy_internal_success"])
+            for row in selected
+        ),
+        "outcome_counts": outcomes,
+        "task_failures": failures,
+        "task_physical_slip_failures": slip_failures,
+        "physical_slip_fraction_of_task_failures": (
+            slip_failures / failures if failures else None
+        ),
+        "physical_slip_fraction_one_sided95_upper": (
+            None if failures == 0 else slip_upper
+        ),
+        "physical_slip_non_dominance_supported": (
+            None if failures == 0 else slip_upper < 0.5
+        ),
+        "episodes_with_confirmed_physical_slip": sum(
+            int(row.get("physical_slip_after_confirmed_count", 0)) > 0
+            for row in selected
+        ),
+    }
+
+
+def _group(
+    selected: list[dict[str, Any]], key: str,
+) -> dict[str, dict[str, Any]]:
+    values = sorted({str(row[key]) for row in selected})
+    return {
+        value: _aggregate([row for row in selected if str(row[key]) == value])
+        for value in values
+    }
+
+
+def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for method in sorted({str(row["method"]) for row in rows}):
+        selected = [row for row in rows if row["method"] == method]
+        by_scenario = _group(selected, "scenario_name")
+        scenario_rates = [
+            float(summary["task_success_rate"])
+            for summary in by_scenario.values()
+            if summary["task_success_rate"] is not None
+        ]
+        result[method] = {
+            "overall_micro": _aggregate(selected),
+            "overall_macro_cell_equal_task_success_rate": (
+                float(np.mean(scenario_rates)) if scenario_rates else None
+            ),
+            "by_scenario": by_scenario,
+            "by_motion_type": _group(selected, "motion_type"),
+            "by_split": _group(selected, "scenario_split"),
+        }
+    return result
+
+
+def _select_scenarios(args: argparse.Namespace) -> list[ScenarioConfig | None]:
+    if args.scenario is not None:
+        return [get_scenario(args.scenario)]
+    if args.suite is not None:
+        return list(list_suite_scenarios(args.suite))
+    return [None]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Paired scenario-matrix benchmark for cable grasping"
+    )
+    parser.add_argument(
+        "--methods", nargs="+", choices=("scripted", "ppo"), default=("scripted",)
+    )
+    parser.add_argument("--ppo-model", type=Path)
+    parser.add_argument(
+        "--episodes", type=int, default=20,
+        help="paired repeats per scenario",
+    )
+    parser.add_argument("--seed", type=int, default=20280804)
+    parser.add_argument("--disturbance", type=float, default=1.5)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--scenario", choices=list_scenario_names())
+    selection.add_argument("--suite", choices=SCENARIO_SUITE_NAMES)
+    parser.add_argument("--episode-seconds", type=float, default=28.0)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--output", type=Path, default=Path("benchmark_runs"))
+    args = parser.parse_args()
+    args.methods = list(dict.fromkeys(args.methods))
+    if args.episodes < 1 or args.episode_seconds <= 0.0:
+        parser.error("--episodes and --episode-seconds must be positive")
+    if args.disturbance < 0.0 or not math.isfinite(args.disturbance):
+        parser.error("--disturbance must be finite and non-negative")
+    if "ppo" in args.methods and args.ppo_model is None:
+        parser.error("--ppo-model is required when evaluating PPO")
+    if args.ppo_model is not None and not args.ppo_model.is_file():
+        parser.error(f"PPO model not found: {args.ppo_model}")
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    scenarios = _select_scenarios(args)
+    seeds = [args.seed + index for index in range(args.episodes)]
+    run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    output_dir = args.output / run_name
+    suffix = 1
+    while output_dir.exists():
+        output_dir = args.output / f"{run_name}_{suffix:02d}"
+        suffix += 1
+    output_dir.mkdir(parents=True)
+
+    rows: list[dict[str, Any]] = []
+    for scenario in scenarios:
+        for method in args.methods:
+            if method == "scripted":
+                rows.extend(_run_scripted(
+                    seeds, scenario, args.disturbance, args.episode_seconds,
+                ))
+            else:
+                rows.extend(_run_ppo(
+                    seeds, scenario, args.disturbance, args.episode_seconds,
+                    args.ppo_model, args.device,
+                ))
+
+    fingerprints: dict[str, set[str]] = {}
+    methods: dict[str, list[str]] = {}
+    for row in rows:
+        key = str(row["scenario_episode_id"])
+        fingerprints.setdefault(key, set()).add(str(row["scene_fingerprint"]))
+        methods.setdefault(key, []).append(str(row["method"]))
+    mismatched = [key for key, values in fingerprints.items() if len(values) != 1]
+    if mismatched:
+        raise RuntimeError(f"paired scene fingerprint mismatch: {mismatched}")
+    incomplete = [
+        key for key, values in methods.items()
+        if sorted(values) != sorted(args.methods)
+    ]
+    if incomplete:
+        raise RuntimeError(f"missing or duplicate method rows: {incomplete}")
+    paired_verification: bool | None = True if len(args.methods) > 1 else None
+    for row in rows:
+        row["paired_scene_match"] = paired_verification
+
+    summary = _summary(rows)
+    _write_csv(output_dir / "episodes.csv", rows)
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    models_dir = output_dir / "models"
+    models_dir.mkdir()
+    compiled_models: dict[str, Any] = {}
+    for scenario in scenarios:
+        config = _scenario_config(
+            scenario, seed=args.seed, disturbance=args.disturbance,
+            seconds=args.episode_seconds,
+        )
+        model_env = CableGraspEnv(config)
+        scenario_name = config.scenario_name
+        model_path = models_dir / f"{scenario_name}.mjb"
+        mujoco.mj_saveModel(model_env.model, str(model_path), None)
+        compiled_models[scenario_name] = {
+            "path": str(model_path.resolve()),
+            "sha256": _sha256(model_path),
+        }
+        del model_env
+
+    git_status = _git_text("status", "--porcelain=v1")
+    manifest = {
+        "schema_version": 3,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "command": [sys.executable, *sys.argv],
+        "arguments": {
+            key: str(value.resolve()) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "methods": args.methods,
+        "suite": args.suite,
+        "scenarios": [
+            (
+                {"name": "legacy_shape_current", "legacy": True}
+                if scenario is None else scenario.asdict()
+            )
+            for scenario in scenarios
+        ],
+        "seeds_per_scenario": seeds,
+        "episode_seconds": args.episode_seconds,
+        "ppo_model": None if args.ppo_model is None else str(args.ppo_model.resolve()),
+        "ppo_model_sha256": _sha256(args.ppo_model),
+        "source_xml": str(XML_PATH.resolve()),
+        "source_xml_sha256": _sha256(XML_PATH),
+        "compiled_models": compiled_models,
+        "source_files": {
+            name: {"path": str(path.resolve()), "sha256": _sha256(path)}
+            for name, path in {
+                "benchmark": Path(__file__),
+                "base_environment": ROOT / "cable_grasp_env.py",
+                "scenario_registry": ROOT / "experiment_scenarios.py",
+                "motion_diagnostics": ROOT / "motion_diagnostics.py",
+                "scripted_policy": ROOT / "dynamic_grasp_policy.py",
+                "failure_taxonomy": ROOT / "failure_taxonomy.py",
+                "rl_environment": ROOT / "rl" / "rl_cable_env.py",
+            }.items()
+        },
+        "configs": {"scripted_policy": asdict(PolicyConfig())},
+        "task_outcome_types": list(TASK_OUTCOME_TYPES),
+        "paired_scene_fingerprints_verified": paired_verification,
+        "git_commit": _git_text("rev-parse", "HEAD"),
+        "git_dirty": bool(git_status),
+        "git_status_sha256": (
+            None if git_status is None
+            else hashlib.sha256(git_status.encode("utf-8")).hexdigest()
+        ),
+        "python": platform.python_version(),
+        "mujoco": mujoco.__version__,
+        "numpy": np.__version__,
+        "stable_baselines3": _distribution_version("stable-baselines3"),
+        "gymnasium": _distribution_version("gymnasium"),
+        "torch": _distribution_version("torch"),
+        "summary": summary,
+    }
+    if "ppo" in args.methods:
+        from rl.rl_cable_env import RLConfig
+        manifest["configs"]["rl"] = asdict(RLConfig())
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    print(f"benchmark_output={output_dir.resolve()}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
