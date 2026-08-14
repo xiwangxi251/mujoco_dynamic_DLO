@@ -42,6 +42,19 @@ class EnvironmentScenarioTests(unittest.TestCase):
             scenario, seed=seed, episode_seconds=0.1,
         ))
 
+    def test_constructor_initialization_is_not_counted_as_a_trial(self) -> None:
+        env = self.make("id_static")
+        try:
+            self.assertEqual(env.trial_index, 0)
+            _, first = env.reset(seed=1001)
+            self.assertEqual(env.trial_index, 1)
+            self.assertEqual(first["trial"], 1)
+            _, second = env.reset(seed=1002)
+            self.assertEqual(env.trial_index, 2)
+            self.assertEqual(second["trial"], 2)
+        finally:
+            del env
+
     def test_seed_reproduces_initial_scene_and_motion_profile(self) -> None:
         env = self.make("ood_dynamics_high_stochastic")
         try:

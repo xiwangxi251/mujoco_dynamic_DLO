@@ -61,10 +61,10 @@ class DynamicCableGraspPolicy:
     该类只读取环境状态并输出执行器命令，绝不缩放外力或修改线缆物理。
     """
 
-    # actuator8 将255映射为每根手指张开40 mm。ctrl=20对应的无负载目标总开口
-    # 约6.3 mm，仍远小于28 mm线径并会真实夹紧，但避免零间隙目标把圆线过度挤出浅槽。
-    # 最终可见开口仍由线缆—指垫碰撞和执行器力范围决定。
-    HOLD_GRIPPER_CTRL = 20.0
+    # actuator8 将255映射为每根手指张开40 mm，0为完全闭合。20对0的20-seed
+    # 成对消融没有显示减小挤压的稳定收益，反而增加了确认抓取后的终局物理滑脱，
+    # 因此脚本基线恢复为完全闭合；最终开口仍由真实碰撞和执行器力范围决定。
+    HOLD_GRIPPER_CTRL = 0.0
 
     def __init__(self, env: CableGraspEnv, config: PolicyConfig | None = None):
         self.env = env

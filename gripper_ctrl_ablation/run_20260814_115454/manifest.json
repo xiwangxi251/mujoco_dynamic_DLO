@@ -1,0 +1,96 @@
+{
+  "created_at": "2026-08-14T04:01:33.031116+00:00",
+  "command": [
+    "C:\\ProgramData\\anaconda3\\envs\\dynamic\\python.exe",
+    "gripper_ctrl_ablation.py",
+    "--scenario",
+    "id_shape_nominal_current",
+    "--seeds",
+    "20",
+    "--seed",
+    "20280901",
+    "--episode-seconds",
+    "28",
+    "--workers",
+    "6",
+    "--sample-every",
+    "5",
+    "--output",
+    "gripper_ctrl_ablation"
+  ],
+  "arguments": {
+    "scenario": "id_shape_nominal_current",
+    "seeds": 20,
+    "seed": 20280901,
+    "episode_seconds": 28.0,
+    "workers": 6,
+    "sample_every": 5,
+    "output": "C:\\Users\\27642\\Desktop\\dynamic_cable\\panda_cable_grasp\\gripper_ctrl_ablation"
+  },
+  "scenario": {
+    "name": "id_shape_nominal_current",
+    "split": "id",
+    "motion_type": "shape",
+    "amplitude_level": "nominal",
+    "frequency_level": "nominal",
+    "regularity": "quasiperiodic",
+    "motion_profile_version": "factorized_v1",
+    "disturbance_strength": 1.5,
+    "frequency_scale": 1.0,
+    "cable_length_scale": 1.0,
+    "cable_length_ood": false,
+    "cable_material_profile": "nominal",
+    "cable_material_ood": false,
+    "cable_density_scale": 1.0,
+    "cable_stiffness_scale": 1.0,
+    "cable_damping_scale": 1.0,
+    "cable_friction_scale": 1.0,
+    "description": "Current EnvConfig compatibility scene: mean-removed shape motion, quasiperiodic, disturbance_strength=1.5.",
+    "tags": [
+      "main_grid"
+    ],
+    "schema_version": 1,
+    "scenario_id": "scenario-v1-e5735b4a1f4efd43",
+    "scenario_hash": "e5735b4a1f4efd437edd51b8cb06eebb4c6c619ec70bfdeccb8eda1819e1c5c8"
+  },
+  "seeds": [
+    20280901,
+    20280902,
+    20280903,
+    20280904,
+    20280905,
+    20280906,
+    20280907,
+    20280908,
+    20280909,
+    20280910,
+    20280911,
+    20280912,
+    20280913,
+    20280914,
+    20280915,
+    20280916,
+    20280917,
+    20280918,
+    20280919,
+    20280920
+  ],
+  "source_files": {
+    "ablation": {
+      "path": "C:\\Users\\27642\\Desktop\\dynamic_cable\\panda_cable_grasp\\gripper_ctrl_ablation.py",
+      "sha256": "a9ef35b0d47af311ec2cd743bd04890050e8d23d59475ef78917321115f7be77"
+    },
+    "environment": {
+      "path": "C:\\Users\\27642\\Desktop\\dynamic_cable\\panda_cable_grasp\\cable_grasp_env.py",
+      "sha256": "1ce6937242cbbbd51776322923ee11d8f24203d4de7c7de3428f94ec5d124432"
+    },
+    "policy": {
+      "path": "C:\\Users\\27642\\Desktop\\dynamic_cable\\panda_cable_grasp\\dynamic_grasp_policy.py",
+      "sha256": "429129f2b87832c6477dbe5522ccd144275bf21d5f046aa7aabaf9f02bff36e8"
+    },
+    "scenario_registry": {
+      "path": "C:\\Users\\27642\\Desktop\\dynamic_cable\\panda_cable_grasp\\experiment_scenarios.py",
+      "sha256": "8ad9119e3e89430c63e7f7bc951573adf8547eb6e5631135c7b11a8dd59a53a1"
+    }
+  }
+}
