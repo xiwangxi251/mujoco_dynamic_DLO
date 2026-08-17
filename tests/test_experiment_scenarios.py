@@ -6,6 +6,7 @@ import unittest
 import mujoco
 import numpy as np
 
+from dynamic_grasp_policy import DynamicCableGraspPolicy, Phase, PolicyConfig
 from cable_grasp_env import (
     CableGraspEnv,
     EnvConfig,
@@ -14,6 +15,7 @@ from cable_grasp_env import (
     RIGID_PILOT_START_Y,
     RIGID_PILOT_TRAVEL,
     RIGID_PILOT_ROTATION,
+    rotation_to_quat,
 )
 from experiment_scenarios import (
     DEFAULT_SCENARIO,
@@ -212,6 +214,26 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
+    def test_curved_grasp_uses_two_node_contact_radius(self) -> None:
+        config = EnvConfig(grasp_contact_index_radius=2)
+        self.assertEqual(config.grasp_contact_index_radius, 2)
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            EnvConfig(grasp_contact_index_radius=-1)
+
+    def test_scripted_policy_uses_measured_pilot_delay_compensation(self) -> None:
+        config = PolicyConfig()
+        self.assertEqual(config.prediction_horizon, 0.36)
+        self.assertEqual(config.approach_prediction_horizon, 0.36)
+        self.assertEqual(config.close_prediction_horizon, 0.12)
+        self.assertEqual(config.target_filter_alpha, 0.10)
+        self.assertEqual(config.intercept_y_limits, (-0.43, 0.43))
+        with self.assertRaisesRegex(ValueError, "prediction_horizon"):
+            PolicyConfig(prediction_horizon=-0.01)
+        with self.assertRaisesRegex(ValueError, "target_filter_alpha"):
+            PolicyConfig(target_filter_alpha=0.0)
+        with self.assertRaisesRegex(ValueError, "intercept_y_limits"):
+            PolicyConfig(intercept_y_limits=(0.5, -0.5))
+
     def test_environment_rejects_nonfinite_actions(self) -> None:
         env = self.make("id_static")
         try:
@@ -220,6 +242,56 @@ class EnvironmentScenarioTests(unittest.TestCase):
             action[0] = math.nan
             with self.assertRaisesRegex(ValueError, "finite"):
                 env.step(action)
+        finally:
+            del env
+
+    def test_approach_requires_both_position_and_orientation(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1008)
+            policy = DynamicCableGraspPolicy(env)
+            policy.phase = Phase.APPROACH
+            policy.phase_start = float(env.data.time)
+            policy._predicted_segment = lambda prediction_horizon=None: (
+                env.hand_position - np.array([0.0, 0.0, 0.20])
+            )
+
+            # 位置已经满足，但reset时仍有90度待对齐偏航，不能开始向桌面下降。
+            policy.action()
+            self.assertIs(policy.phase, Phase.APPROACH)
+
+            rotation = env.data.xmat[env.hand_id].reshape(3, 3)
+            policy.desired_quat = rotation_to_quat(rotation)
+            policy.action()
+            self.assertIs(policy.phase, Phase.INTERCEPT)
+        finally:
+            del env
+
+    def test_approach_timeout_recovers_instead_of_descending(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1009)
+            policy = DynamicCableGraspPolicy(env)
+            policy.phase = Phase.APPROACH
+            policy.phase_start = (
+                float(env.data.time) - policy.config.approach_timeout - 0.1
+            )
+            policy.action()
+            self.assertIs(policy.phase, Phase.RECOVER)
+            self.assertGreater(policy.recover_goal[2], policy.recover_start[2])
+        finally:
+            del env
+
+    def test_intercept_rejects_unsafe_gripper_orientation(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1010)
+            policy = DynamicCableGraspPolicy(env)
+            policy.phase = Phase.INTERCEPT
+            policy.phase_start = float(env.data.time)
+            # reset目标与当前姿态相差90度，必须撤离而不是继续追踪桌面目标。
+            policy.action()
+            self.assertIs(policy.phase, Phase.RECOVER)
         finally:
             del env
 
@@ -356,6 +428,25 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
+    def test_long_pilot_path_keeps_no_contact_termination(self) -> None:
+        level1 = self.make("pilot_rigid_l1_high")
+        level2 = self.make("pilot_rigid_l2_high")
+        try:
+            self.assertEqual(RIGID_PILOT_TRAVEL, 1.4)
+            self.assertGreater(level1._rigid_pilot_duration(), 3.6)
+            self.assertGreater(level2._rigid_pilot_duration(), 3.6)
+
+            level1.reset(seed=43)
+            level1.data.time = (
+                RIGID_PILOT_START_TIME + level1._rigid_pilot_duration()
+            )
+            _, _, _, truncated, info = level1.step(level1.ready_ctrl)
+            self.assertTrue(info["rigid_pilot_finished"])
+            self.assertFalse(info["rigid_pilot_contacted"])
+            self.assertTrue(truncated)
+        finally:
+            del level1, level2
+
     def test_rigid_pilot_uses_paired_curved_shape_and_rotation(self) -> None:
         level1 = self.make("pilot_rigid_l1_nominal", seed=45)
         level2 = self.make("pilot_rigid_l2_nominal", seed=45)
@@ -457,7 +548,33 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_rigid_pilot_releases_environment_drive_after_first_contact(self) -> None:
+    def test_rigid_pilot_waits_for_confirmed_grasp_before_releasing_drive(self) -> None:
+        env = self.make("pilot_rigid_l1_nominal")
+        try:
+            env.reset(seed=47)
+            env._last_contact_count = 1
+            env.grasp_state = GraspState(
+                body_id=env.target_body_id,
+                candidate_time=float(env.data.time),
+                bilateral_confirmed=False,
+                last_bilateral_time=float(env.data.time),
+                lost_contact_time=0.0,
+            )
+            env._update_rigid_pilot_contact_state()
+            self.assertFalse(env.rigid_pilot_contacted)
+
+            env.grasp_state.bilateral_confirmed = True
+            env._update_rigid_pilot_contact_state()
+            self.assertTrue(env.rigid_pilot_contacted)
+
+            # 该状态需要锁存，防止抓取后的短暂接触抖动重新启动整体驱动。
+            env.grasp_state = None
+            env._update_rigid_pilot_contact_state()
+            self.assertTrue(env.rigid_pilot_contacted)
+        finally:
+            del env
+
+    def test_rigid_pilot_releases_environment_drive_after_confirmed_grasp(self) -> None:
         env = self.make("pilot_rigid_l1_nominal")
         try:
             env.reset(seed=44)
@@ -484,7 +601,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_combined_pilot_releases_only_rigid_drive_after_contact(self) -> None:
+    def test_combined_pilot_releases_only_rigid_drive_after_confirmed_grasp(self) -> None:
         env = self.make("pilot_combined_l1_nominal")
         try:
             env.reset(seed=46)
@@ -576,6 +693,44 @@ class EnvironmentScenarioTests(unittest.TestCase):
             for env in environments.values():
                 del env
 
+    def test_environment_force_has_no_table_boundary_component(self) -> None:
+        env = self.make("id_combined_nominal", seed=82)
+        try:
+            env.reset(seed=82)
+            env.data.xfrc_applied[:] = 0.0
+            env._apply_cable_disturbance()
+            expected = (
+                env._last_shape_acceleration
+                + env._last_rigid_translation_acceleration
+                + env._last_rigid_rotation_acceleration
+                + env._last_rigid_shape_hold_acceleration
+            )
+            applied = (
+                env.data.xfrc_applied[env.cable_ids, :3]
+                / env.cable_mass[:, None]
+            )
+            self.assertTrue(np.allclose(
+                applied, expected, rtol=0.0, atol=1e-12
+            ))
+            self.assertNotIn("boundary_acceleration_rms", env.info())
+        finally:
+            del env
+
+    def test_table_is_enlarged_without_edge_barrier(self) -> None:
+        env = self.make("id_static")
+        try:
+            self.assertTrue(np.array_equal(
+                env.model.geom_size[env.table_geom_id, :2], [1.20, 1.20]
+            ))
+            self.assertEqual(
+                mujoco.mj_name2id(
+                    env.model, mujoco.mjtObj.mjOBJ_GEOM, "table_edge"
+                ),
+                -1,
+            )
+        finally:
+            del env
+
     def test_disturbance_does_not_read_grasp_state(self) -> None:
         env = self.make("id_combined_nominal")
         try:
@@ -648,7 +803,6 @@ class MotionMetricTests(unittest.TestCase):
             "shape_acceleration_rms": 0.0,
             "rigid_translation_acceleration_rms": 1.0,
             "rigid_rotation_acceleration_rms": 1.0,
-            "boundary_acceleration_rms": 0.0,
         }
         tracker.record(0.1, current, info)
         summary = tracker.summary()

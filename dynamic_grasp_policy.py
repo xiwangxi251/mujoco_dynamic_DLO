@@ -36,9 +36,22 @@ class Phase(Enum):
 class PolicyConfig:
     """脚本基线的时间参数。论文方法可完全不用这个类。"""
 
-    prediction_horizon: float = 0.12
+    # 20260804--20260806配对扫描中，0.36 s能够补偿目标EMA与受加速度限制的
+    # Panda响应延迟；0.12 s明显滞后，0.44 s则开始过冲。
+    prediction_horizon: float = 0.36
+    approach_prediction_horizon: float = 0.36
+    close_prediction_horizon: float = 0.12
+    target_filter_alpha: float = 0.10
+    intercept_x_limits: tuple[float, float] = (0.30, 0.82)
+    intercept_y_limits: tuple[float, float] = (-0.43, 0.43)
+    intercept_z_limits: tuple[float, float] = (0.010, 0.18)
     settle_seconds: float = 0.8
     approach_timeout: float = 6.0
+    approach_position_tolerance: float = 0.035
+    approach_orientation_tolerance: float = math.radians(25.0)
+    intercept_orientation_limit: float = math.radians(35.0)
+    intercept_singularity_limit: float = 0.045
+    ik_target_horizon: float = 0.06
     intercept_timeout: float = 9.0
     close_timeout: float = 0.8
     close_hard_timeout: float = 3.0
@@ -54,6 +67,34 @@ class PolicyConfig:
     failure_observe_seconds: float = 0.6
     release_seconds: float = 1.2
     max_retries: int = 2
+
+    def __post_init__(self) -> None:
+        for name in (
+            "prediction_horizon", "approach_prediction_horizon",
+            "close_prediction_horizon", "approach_position_tolerance",
+            "approach_orientation_tolerance", "intercept_orientation_limit",
+            "intercept_singularity_limit", "ik_target_horizon",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if (
+            not math.isfinite(self.target_filter_alpha)
+            or not 0.0 < self.target_filter_alpha <= 1.0
+        ):
+            raise ValueError("target_filter_alpha must be in (0, 1]")
+        for name in (
+            "intercept_x_limits", "intercept_y_limits", "intercept_z_limits",
+        ):
+            limits = np.asarray(getattr(self, name), dtype=float)
+            if (
+                limits.shape != (2,)
+                or not np.all(np.isfinite(limits))
+                or limits[0] >= limits[1]
+            ):
+                raise ValueError(
+                    f"{name} must contain two finite increasing values"
+                )
 
 
 class DynamicCableGraspPolicy:
@@ -132,7 +173,9 @@ class DynamicCableGraspPolicy:
         value = float(np.clip(value, 0.0, 1.0))
         return value * value * (3.0 - 2.0 * value)
 
-    def _predicted_segment(self) -> np.ndarray:
+    def _predicted_segment(
+        self, prediction_horizon: float | None = None,
+    ) -> np.ndarray:
         """用当前位置加短时速度外推，得到脚本要追踪的目标点。"""
 
         if self.locked_segment_index is None:
@@ -152,12 +195,21 @@ class DynamicCableGraspPolicy:
                 + alpha * self.env.body_linear_velocity(body1)
             )
         velocity = np.clip(velocity, -0.8, 0.8)
-        predicted = position + self.config.prediction_horizon * velocity
-        predicted[0] = np.clip(predicted[0], 0.30, 0.82)
-        predicted[1] = np.clip(predicted[1], -0.43, 0.43)
-        predicted[2] = np.clip(predicted[2], 0.010, 0.18)
+        if prediction_horizon is None:
+            if self.phase in {Phase.SETTLE, Phase.APPROACH}:
+                prediction_horizon = self.config.approach_prediction_horizon
+            elif self.phase is Phase.CLOSE:
+                prediction_horizon = self.config.close_prediction_horizon
+            else:
+                prediction_horizon = self.config.prediction_horizon
+        predicted = position + prediction_horizon * velocity
+        predicted[0] = np.clip(predicted[0], *self.config.intercept_x_limits)
+        predicted[1] = np.clip(predicted[1], *self.config.intercept_y_limits)
+        predicted[2] = np.clip(predicted[2], *self.config.intercept_z_limits)
         # 对预测值而不是原始测量做低通滤波，既保留快速横向跟踪，也避免把接触抖动送入IK。
-        self.filtered_target += 0.10 * (predicted - self.filtered_target)
+        self.filtered_target += self.config.target_filter_alpha * (
+            predicted - self.filtered_target
+        )
         return self.filtered_target.copy()
 
     def _nearest_cable_point(self, point: np.ndarray) -> tuple[np.ndarray, float, int, float]:
@@ -183,32 +235,90 @@ class DynamicCableGraspPolicy:
         self.filtered_target = nearest.copy()
         return nearest
 
+    @staticmethod
+    def _limit_vector_norm(vector: np.ndarray, limit: float) -> np.ndarray:
+        norm = float(np.linalg.norm(vector))
+        if norm <= limit:
+            return vector
+        return vector * (limit / norm)
+
+    def _orientation_error(self) -> tuple[np.ndarray, float]:
+        rotation = self.env.data.xmat[self.env.hand_id].reshape(3, 3)
+        error = quat_error(rotation_to_quat(rotation), self.desired_quat)
+        # quat_error返回2*sin(theta/2)*axis；这里恢复真实转角用于阶段门控。
+        angle = 2.0 * math.asin(float(np.clip(0.5 * np.linalg.norm(error), 0.0, 1.0)))
+        return error, angle
+
+    def _task_jacobian(self) -> np.ndarray:
+        point_jac, jac_rot = point_jacobian(
+            self.env.model,
+            self.env.data,
+            self.env.hand_id,
+            self.env.GRASP_CENTER_LOCAL,
+        )
+        return np.vstack([point_jac, jac_rot])[:, self.env.arm_dof_adr]
+
+    def _minimum_task_singular_value(self) -> float:
+        return float(np.linalg.svd(self._task_jacobian(), compute_uv=False)[-1])
+
+    def _retry_from_unsafe_pose(self, hand: np.ndarray) -> np.ndarray:
+        """不安全或不可达时先竖直撤离，禁止直接向桌面下探。"""
+        if self.retry_count < self.config.max_retries:
+            self.retry_count += 1
+            self._begin_vertical_recovery(hand)
+            return self._ik_action(self.recover_start, 255.0)
+        self.result = "failed_no_contact"
+        self._transition(Phase.RELEASE)
+        return self._ik_action(hand, 255.0)
+
     def _ik_action(self, desired_position: np.ndarray, gripper: float) -> np.ndarray:
-        """用阻尼最小二乘逆运动学生成7个关节目标和1个夹爪命令。"""
+        """用姿态加权阻尼最小二乘IK生成关节目标和夹爪命令。"""
 
         model = self.env.model
         data = self.env.data
-        point_jac, jac_rot = point_jacobian(
-            model, data, self.env.hand_id, self.env.GRASP_CENTER_LOCAL
-        )
-        rotation = data.xmat[self.env.hand_id].reshape(3, 3)
         position_error = desired_position - self.env.hand_position
-        orientation_error = quat_error(rotation_to_quat(rotation), self.desired_quat)
-        task_velocity = np.concatenate([
-            8.0 * position_error,
-            0.9 * orientation_error,
+        orientation_error, _ = self._orientation_error()
+        linear_velocity = self._limit_vector_norm(6.0 * position_error, 0.65)
+        angular_velocity = self._limit_vector_norm(2.5 * orientation_error, 1.40)
+
+        # 姿态行加权后再求解；当位置与姿态无法同时满足时，避免夹爪朝向被位置追踪吞掉。
+        orientation_weight = 2.0
+        jacobian = self._task_jacobian()
+        weighted_jacobian = jacobian.copy()
+        weighted_jacobian[3:] *= orientation_weight
+        weighted_velocity = np.concatenate([
+            linear_velocity,
+            orientation_weight * angular_velocity,
         ])
-        # 任务空间误差(位置3维+旋转3维)通过6x7 Jacobian映射为关节速度。
-        jacobian = np.vstack([point_jac, jac_rot])[:, self.env.arm_dof_adr]
-        damping = 0.045
-        q_velocity = jacobian.T @ np.linalg.solve(
-            jacobian @ jacobian.T + damping**2 * np.eye(6), task_velocity
+        sigma_min = float(np.linalg.svd(weighted_jacobian, compute_uv=False)[-1])
+        singularity = float(np.clip((0.10 - sigma_min) / 0.10, 0.0, 1.0))
+        damping = 0.04 + 0.12 * singularity * singularity
+        inverse = np.linalg.solve(
+            weighted_jacobian @ weighted_jacobian.T + damping**2 * np.eye(6),
+            np.eye(6),
         )
-        q_velocity = np.clip(q_velocity, -3.0, 3.0)
+        pseudoinverse = weighted_jacobian.T @ inverse
+        q_velocity = pseudoinverse @ weighted_velocity
+
+        # 7自由度冗余只在任务零空间中回到ready姿态，避免肘部任意翻转和逼近关节限位。
         q_current = data.qpos[self.env.arm_qpos_adr]
+        nullspace = np.eye(7) - pseudoinverse @ weighted_jacobian
+        q_velocity += nullspace @ (0.8 * (self.env.ready_qpos[:7] - q_current))
+
+        # 整体缩放而非逐关节裁剪，保留IK求出的多关节运动方向。
+        velocity_limits = 0.85 * np.asarray(
+            self.env.config.arm_joint_velocity_limits, dtype=float
+        )
+        velocity_scale = min(
+            1.0,
+            float(np.min(
+                velocity_limits / np.maximum(np.abs(q_velocity), 1e-12)
+            )),
+        )
+        q_velocity *= velocity_scale
         # 位置执行器接收一个短时前瞻目标。关节范围使用 joint id 查询，只有访问
         # data.qpos 时才使用 qpos address。
-        q_target = q_current + 0.11 * q_velocity
+        q_target = q_current + self.config.ik_target_horizon * q_velocity
         q_target = np.clip(
             q_target,
             model.jnt_range[self.env.arm_joint_ids, 0],
@@ -239,33 +349,61 @@ class DynamicCableGraspPolicy:
         # 回合开始时选择的参考目标。这样不会夹到线后仍被远处目标节点拉走。
         if self.phase is Phase.CLOSE and self.env.grasp_state is not None:
             self._lock_segment_near(self.env.data.xpos[self.env.grasp_state.body_id])
-        target = self._predicted_segment()
+        close_contacts = (
+            self.env.finger_contacts() if self.phase is Phase.CLOSE else []
+        )
+        if close_contacts:
+            # 单侧指垫先接触时也应保持当前线段位于指间；这里仅改变机器人目标，
+            # 不会撤掉环境运动驱动，也不把单侧接触当作确认抓取。
+            self.filtered_target = self._lock_segment_near(hand)
+        target = self._predicted_segment(
+            prediction_horizon=0.0 if close_contacts else None
+        )
 
         if self.phase is Phase.SETTLE:
-            # 先让线缆自然运动0.8秒，机械臂保持ready姿态。
+            # 线缆自然运动期间保持夹持中心位置，同时先完成夹爪朝向对齐。
             if self.phase_time >= self.config.settle_seconds:
                 self._transition(Phase.APPROACH)
-            return self._home_action()
+            return self._ik_action(self.last_desired, 255.0)
 
         if self.phase is Phase.APPROACH:
             # 让实际两指夹持中心移动到预测线段上方20 cm，夹爪保持张开。
             desired = target + np.array([0.0, 0.0, 0.20])
-            if np.linalg.norm(hand - desired) < 0.035 or self.phase_time > self.config.approach_timeout:
+            _, orientation_angle = self._orientation_error()
+            position_ready = (
+                np.linalg.norm(hand - desired)
+                < self.config.approach_position_tolerance
+            )
+            orientation_ready = (
+                orientation_angle
+                < self.config.approach_orientation_tolerance
+            )
+            if position_ready and orientation_ready:
                 # Select one material segment when descent begins.  Re-selecting
                 # the globally nearest point every control step makes the goal
                 # jump between adjacent folds in a deforming cable.
                 self._lock_segment_near(hand)
                 self._transition(Phase.INTERCEPT)
+            elif self.phase_time > self.config.approach_timeout:
+                return self._retry_from_unsafe_pose(hand)
             return self._ik_action(desired, 255.0)
 
         if self.phase is Phase.INTERCEPT:
             # 实际两指夹持中心直接追踪目标线缆段中心，不再使用旧虚拟点的z补偿。
             desired = target.copy()
+            _, orientation_angle = self._orientation_error()
+            if (
+                orientation_angle > self.config.intercept_orientation_limit
+                or self._minimum_task_singular_value()
+                < self.config.intercept_singularity_limit
+            ):
+                return self._retry_from_unsafe_pose(hand)
             nearest, nearest_distance, _, _ = self._nearest_cable_point(hand)
             # 截获期间持续追踪进入该阶段时锁定的材料线段，避免在相邻弯折间
             # 跳变；但闭爪触发仍以任意真实线缆中心线进入夹持区域为准。
             if nearest_distance < self.config.close_capture_distance:
                 desired = self._lock_segment_near(nearest)
+                self.filtered_target = desired.copy()
                 self._transition(Phase.CLOSE)
                 self.last_close_contact_time = float(self.env.data.time)
                 return self._ik_action(desired, self.HOLD_GRIPPER_CTRL)

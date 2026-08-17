@@ -17,18 +17,18 @@ MENAGERIE = ROOT.parent / "mujoco_menagerie"
 XML_PATH = MENAGERIE / "franka_emika_panda" / "panda_cable_grasp.xml"
 
 RIGID_PILOT_START_TIME = 0.80
-RIGID_PILOT_START_Y = -0.25
-RIGID_PILOT_TRAVEL = 0.50
+RIGID_PILOT_START_Y = -0.70
+RIGID_PILOT_TRAVEL = 1.40
 RIGID_PILOT_ROTATION = math.radians(24.0)
 RIGID_PILOT_PROFILES = {
     "rigid_level1_single_pass_v2",
     "rigid_level2_single_pass_v2",
 }
-RIGID_PILOT_L2_CONTROL = np.array([
+RIGID_PILOT_L2_CONTROL = RIGID_PILOT_TRAVEL * np.array([
     [0.00, 0.00],
-    [0.08, 0.15],
-    [-0.08, 0.35],
-    [0.00, 0.50],
+    [0.16, 0.30],
+    [-0.16, 0.70],
+    [0.00, 1.00],
 ])
 
 
@@ -86,11 +86,13 @@ class EnvConfig:
     cable_stiffness_scale: float = 1.0
     cable_damping_scale: float = 1.0
     cable_friction_scale: float = 1.0
+    table_half_size: tuple[float, float] = (1.20, 1.20)
 
     # 抓取判断参数
     success_hold_seconds: float = 0.80  # 成功条件必须连续保持的时间
     grasp_confirm_seconds: float = 0.06 # 双侧内指垫接触保持多久才确认抓取
     grasp_candidate_gap_seconds: float = 0.02  # 确认前容忍求解器短暂接触/力波动
+    grasp_contact_index_radius: int = 2  # 弯曲线缆双侧接触允许跨越的离散节点数
     grasp_loss_seconds: float = 0.35    # 双指接触短暂中断的容忍时间
     max_grasp_aperture: float = 0.034  # 28 mm线缆被真正夹紧时允许的最大开口
     max_pad_distance: float = 0.055    # 接触线段中心到指垫中心的最大距离
@@ -114,11 +116,6 @@ class EnvConfig:
     gripper_finger_velocity_limit: float = 0.20
     arm_position_tracking_error_limit: float = 0.03
     low_level_velocity_guard_fraction: float = 0.65
-
-    # 桌面软边界
-    boundary_margin: float = 0.16       # 距桌边多远开始调整环境扰动力
-    boundary_stiffness: float = 180.0   # 软边界回正加速度系数，单位1/s²
-    boundary_damping: float = 28.0      # 只衰减朝桌外运动的速度，单位1/s
 
     # 合法性检查
     def __post_init__(self) -> None:
@@ -169,6 +166,14 @@ class EnvConfig:
             raise ValueError("frame_skip must be positive")
         if self.grasp_candidate_gap_seconds < 0.0:
             raise ValueError("grasp_candidate_gap_seconds must be non-negative")
+        if (
+            isinstance(self.grasp_contact_index_radius, bool)
+            or not isinstance(self.grasp_contact_index_radius, int)
+            or self.grasp_contact_index_radius < 0
+        ):
+            raise ValueError(
+                "grasp_contact_index_radius must be a non-negative integer"
+            )
         for name in (
             "arm_joint_velocity_limits", "arm_joint_acceleration_limits",
         ):
@@ -177,6 +182,15 @@ class EnvConfig:
                 raise ValueError(f"{name} must contain exactly 7 values")
             if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
                 raise ValueError(f"{name} values must be finite and positive")
+        table_half_size = np.asarray(self.table_half_size, dtype=float)
+        if (
+            table_half_size.shape != (2,)
+            or not np.all(np.isfinite(table_half_size))
+            or np.any(table_half_size <= 0.0)
+        ):
+            raise ValueError(
+                "table_half_size must contain exactly 2 finite positive values"
+            )
         for name in (
             "hand_linear_velocity_limit", "hand_angular_velocity_limit",
             "gripper_finger_velocity_limit", "arm_position_tracking_error_limit",
@@ -361,7 +375,6 @@ class CableGraspEnv:
         self._last_rigid_translation_acceleration = np.zeros((node_count, 3))
         self._last_rigid_rotation_acceleration = np.zeros((node_count, 3))
         self._last_rigid_shape_hold_acceleration = np.zeros((node_count, 3))
-        self._last_boundary_acceleration = np.zeros((node_count, 3))
         self.motion_profile_hash = ""
         self._rigid_reference_xy = np.zeros((node_count, 2))
         self._rigid_reference_com_xy = np.zeros(2)
@@ -537,7 +550,6 @@ class CableGraspEnv:
         self._last_rigid_translation_acceleration[:] = 0.0
         self._last_rigid_rotation_acceleration[:] = 0.0
         self._last_rigid_shape_hold_acceleration[:] = 0.0
-        self._last_boundary_acceleration[:] = 0.0
         self._previous_arm_command_velocity[:] = 0.0
         self._last_requested_action[:] = self.ready_ctrl
         self._last_applied_action[:] = self.ready_ctrl
@@ -594,12 +606,8 @@ class CableGraspEnv:
 
             # 更新抓取候选
             self._last_contact_count = len(self._finger_contact_pairs())
-            if (
-                self.config.motion_profile_version in RIGID_PILOT_PROFILES
-                and self._last_contact_count > 0
-            ):
-                self.rigid_pilot_contacted = True
             self._update_physical_grasp_state(gripper_closed)
+            self._update_rigid_pilot_contact_state()
 
             # 任务成功所要求的几何条件检查
             last_qualification = self._success_qualification(gripper_closed)
@@ -998,7 +1006,6 @@ class CableGraspEnv:
                 self._last_rigid_shape_hold_acceleration
             ),
             "intended_disturbance_acceleration_rms": rms(intended_acceleration),
-            "boundary_acceleration_rms": rms(self._last_boundary_acceleration),
             "initial_cable_dx": float(self.initial_cable_translation[0]),
             "initial_cable_dy": float(self.initial_cable_translation[1]),
             "disturbance_phase": float(self.phase_offset),
@@ -1069,6 +1076,14 @@ class CableGraspEnv:
             and self.data.time - self.grasp_state.last_bilateral_time
             <= self.config.grasp_loss_seconds
         )
+
+    def _update_rigid_pilot_contact_state(self) -> None:
+        """稳定双侧抓取确认后，锁存 pilot 整体运动的撤除状态。"""
+        if (
+            self.config.motion_profile_version in RIGID_PILOT_PROFILES
+            and self.grasp_confirmed
+        ):
+            self.rigid_pilot_contacted = True
 
     def _update_physical_grasp_state(self, gripper_closed: bool) -> None:
         """只根据内指垫接触、法向力和开口更新抓取状态。"""
@@ -1148,10 +1163,14 @@ class CableGraspEnv:
 
         contacted_bodies = {body_id for body_id, _, _ in samples}
         candidates: list[tuple[float, int]] = []
+        radius = self.config.grasp_contact_index_radius
         for body_id in contacted_bodies:
             index = self.cable_index[body_id]
             neighborhood = set(
-                self.cable_ids[max(0, index - 1):min(len(self.cable_ids), index + 2)]
+                self.cable_ids[
+                    max(0, index - radius):
+                    min(len(self.cable_ids), index + radius + 1)
+                ]
             )
             left_force = sum(
                 force for cable, finger, force in samples
@@ -1387,8 +1406,8 @@ class CableGraspEnv:
             shape = self._shape_acceleration(t, p)
         if self.config.motion_mode in {"rigid", "combined"}:
             if self.config.motion_profile_version in RIGID_PILOT_PROFILES:
-                # L1/L2整体运动只定义到首次物理接触。接触后撤掉平移、旋转及
-                # rigid专用构型保持力；shape分量独立计算，combined接触后仍继续。
+                # L1/L2整体运动只定义到稳定双侧抓取确认。确认后撤掉平移、旋转及
+                # rigid专用构型保持力；shape分量独立计算，combined确认后仍继续。
                 if not self.rigid_pilot_contacted:
                     velocity_xy = np.array([
                         self.body_linear_velocity(body_id)[:2]
@@ -1405,21 +1424,15 @@ class CableGraspEnv:
                 translation, rotation = self._rigid_acceleration(elapsed_time, p)
 
         intended = shape + translation + rotation + shape_hold
-        confined = (
-            intended
-            if self.config.motion_mode == "static"
-            else self._confine_environment_acceleration(intended)
-        )
 
         # 记录统计
         self._last_shape_acceleration[:] = shape
         self._last_rigid_translation_acceleration[:] = translation
         self._last_rigid_rotation_acceleration[:] = rotation
         self._last_rigid_shape_hold_acceleration[:] = shape_hold
-        self._last_boundary_acceleration[:] = confined - intended
         # 施加外力
         self.data.xfrc_applied[self.cable_ids, :3] += (
-            self.cable_mass[:, None] * confined
+            self.cable_mass[:, None] * intended
         )
 
     def _shape_acceleration(self, t: float, p: float) -> np.ndarray:
@@ -1837,57 +1850,6 @@ class CableGraspEnv:
         yaw = math.atan2(float(rotation[0, 1]), float(rotation[0, 0]))
         return current_com, yaw
 
-    def _confine_environment_acceleration(
-        self, acceleration: np.ndarray
-    ) -> np.ndarray:
-        """只修正环境力场，降低线缆自行越过桌边的概率。
-
-        这里不裁剪位置、不覆盖机器人动作，也不创建实体围栏。机械臂接触力由
-        MuJoCo 在之后单独计算，所以仍能克服这段有限软力把线缆推出桌外。
-        """
-        result = acceleration.copy()
-        position = self.data.xpos[self.cable_ids, :2]
-        margin = self.config.boundary_margin
-        soft_min = self.table_xy_min + margin
-        soft_max = self.table_xy_max - margin
-
-        # 以下位置、权重、反射和回正计算全部按Nx2数组批量完成。
-        low_penetration = np.maximum(soft_min - position, 0.0)
-        high_penetration = np.maximum(position - soft_max, 0.0)
-        low_weight = np.clip(low_penetration / margin, 0.0, 1.0)
-        high_weight = np.clip(high_penetration / margin, 0.0, 1.0)
-        horizontal = result[:, :2]
-
-        low_outward = (low_penetration > 0.0) & (horizontal < 0.0)
-        high_outward = (high_penetration > 0.0) & (horizontal > 0.0)
-        low_factor = 1.0 - 2.0 * low_weight
-        high_factor = 1.0 - 2.0 * high_weight
-        horizontal[low_outward] *= low_factor[low_outward]
-        horizontal[high_outward] *= high_factor[high_outward]
-        horizontal += self.config.boundary_stiffness * (
-            low_penetration - high_penetration
-        )
-
-        # 通常只有少数节点进入缓冲带；仅对这些节点查询精确世界坐标速度。
-        near_indices = np.flatnonzero(
-            np.any((low_penetration > 0.0) | (high_penetration > 0.0), axis=1)
-        )
-        if near_indices.size:
-            velocity = np.zeros((near_indices.size, 2))
-            for slot, index in enumerate(near_indices):
-                velocity[slot] = self.body_linear_velocity(self.cable_ids[index])[:2]
-            low_outward_velocity = (
-                (low_penetration[near_indices] > 0.0) & (velocity < 0.0)
-            )
-            high_outward_velocity = (
-                (high_penetration[near_indices] > 0.0) & (velocity > 0.0)
-            )
-            damping_velocity = np.where(
-                low_outward_velocity | high_outward_velocity, velocity, 0.0
-            )
-            horizontal[near_indices] -= self.config.boundary_damping * damping_velocity
-        return result
-
     def _reset_stochastic_motion(self, *, randomize: bool) -> None:
         """为一个 episode 冻结平滑带限随机运动谱。
 
@@ -2011,18 +1973,17 @@ class CableGraspEnv:
         if plugin.exists():
             mujoco.mj_loadPluginLibrary(str(plugin))
 
-        physical_scales = (
-            config.cable_length_scale,
-            config.cable_density_scale,
-            config.cable_stiffness_scale,
-            config.cable_damping_scale,
-            config.cable_friction_scale,
-        )
-        if all(math.isclose(value, 1.0) for value in physical_scales):
-            return mujoco.MjModel.from_xml_path(str(XML_PATH))
+        # 所有场景都从同一源模型编译，在编译阶段扩大真实碰撞桌面并删除旧的
+        # 单侧实体挡板。这样改动由仓库代码控制，不依赖外部menagerie副本。
+        spec = mujoco.MjSpec.from_file(str(XML_PATH))
+        table = next(geom for geom in spec.geoms if geom.name == "table")
+        table.size[:2] = config.table_half_size
+        for geom in list(spec.geoms):
+            if geom.name == "table_edge":
+                spec.delete(geom)
+        spec.stat.extent = max(float(spec.stat.extent), 1.80)
 
         # 修改线缆 OOD 属性
-        spec = mujoco.MjSpec.from_file(str(XML_PATH))
         # 长度
         for body in spec.bodies:
             if body.name.startswith("cableB") and body.name != "cableB_first":

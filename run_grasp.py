@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from datetime import datetime
+import json
 from pathlib import Path
+import platform
+import sys
 import time
 
 from cable_grasp_env import CableGraspEnv, EnvConfig, XML_PATH
@@ -44,11 +48,22 @@ def run_headless(args: argparse.Namespace) -> None:
     import mujoco
     import numpy as np
 
+    from benchmark import (
+        _base_row,
+        _distribution_version,
+        _git_text,
+        _sha256,
+        _summary,
+        _write_csv,
+    )
+
     """快速验证；使用与GUI模式完全相同的环境和策略。"""
     # 无界面模式不等待墙钟时间，因此适合批量统计成功率；物理与GUI模式完全相同。
     env = CableGraspEnv(env_config_from_args(args))
     policy = DynamicCableGraspPolicy(env)
+    scenario = None if args.scenario is None else get_scenario(args.scenario)
     successes = 0
+    rows: list[dict] = []
 
     # 先按场景分目录，再为每次运行建立独立子目录。批量运行所有场景时，
     # 无需额外指定 --video-dir，也能直接从路径判断视频属于哪个实验设置。
@@ -72,14 +87,14 @@ def run_headless(args: argparse.Namespace) -> None:
     renderer = mujoco.Renderer(
         env.model, height=args.video_height, width=args.video_width
     )
-    model_path = video_dir / "model.mjb"
+    model_path = video_dir / f"{env.config.scenario_name}.mjb"
     mujoco.mj_saveModel(env.model, str(model_path), None)
     state_spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
     state_size = mujoco.mj_stateSize(env.model, state_spec)
     camera = mujoco.MjvCamera()
     mujoco.mjv_defaultCamera(camera)
     camera.lookat[:] = [0.55, 0.0, 0.30]
-    camera.distance = 1.65
+    camera.distance = 2.10
     camera.azimuth = 135
     camera.elevation = -25
 
@@ -96,7 +111,7 @@ def run_headless(args: argparse.Namespace) -> None:
     print(f"headless_videos={video_dir.resolve()}", flush=True)
     for trial in range(args.trials):
         episode_seed = args.seed + trial
-        env.reset(seed=episode_seed)
+        _, initial_info = env.reset(seed=episode_seed)
         policy.reset()
         print_trial_start(env)
         video_path = video_dir / f"trial_{env.trial_index:03d}.mp4"
@@ -112,6 +127,8 @@ def run_headless(args: argparse.Namespace) -> None:
         previous_phase = policy.phase
         next_frame_time = 0.0
         recorded_states: list[np.ndarray] = []
+        min_target_distance = float("inf")
+        steps = 0
         # 保存重置后的初始画面；之后按仿真时间而不是计算耗时采样。
         write_frame(writer, recorded_states)
         next_frame_time += 1.0 / args.video_fps
@@ -119,6 +136,13 @@ def run_headless(args: argparse.Namespace) -> None:
             # 标准交互循环：策略产生动作 -> 环境执行动作并推进物理。
             action = policy.action()
             _, _, _, truncated, _ = env.step(action)
+            steps += 1
+            min_target_distance = min(
+                min_target_distance,
+                float(np.linalg.norm(
+                    env.target_position() - env.hand_position
+                )),
+            )
             if env.data.time + 1e-9 >= next_frame_time:
                 write_frame(writer, recorded_states)
                 next_frame_time += 1.0 / args.video_fps
@@ -157,12 +181,107 @@ def run_headless(args: argparse.Namespace) -> None:
             motion_profile_hash=np.asarray(env.motion_profile_hash),
             result=np.asarray(policy.result),
         )
+        info = env.info()
+        info["ever_pinched"] = env.last_grasped_body_id is not None
+        info["base_success"] = env.ever_success
+        info["success"] = policy.result == "success"
+        reached_time_limit = bool(
+            env.data.time >= env.config.episode_seconds - 1e-9
+        )
+        row = _base_row(
+            "scripted",
+            trial + 1,
+            episode_seed,
+            scenario,
+            initial_info,
+            info,
+            env.grasp_break_history,
+        )
+        row.update({
+            "steps": steps,
+            "sim_time": float(env.data.time),
+            "episode_return": np.nan,
+            "min_target_distance": min_target_distance,
+            "policy_result": policy.result,
+            "terminated": policy.result == "success",
+            "truncated": reached_time_limit,
+            "video_path": str(video_path.resolve()),
+            "states_path": str(states_path.resolve()),
+            "model_path": str(model_path.resolve()),
+        })
+        rows.append(row)
         successes += int(policy.result == "success")
         print(policy.summary(), flush=True)
         print(f"  video={video_path.resolve()}", flush=True)
         print(f"  states={states_path.resolve()}", flush=True)
 
     renderer.close()
+    summary = _summary(rows)
+    episodes_path = video_dir / "episodes.csv"
+    manifest_path = video_dir / "manifest.json"
+    _write_csv(episodes_path, rows)
+    git_status = _git_text("status", "--porcelain=v1")
+    manifest = {
+        "schema_version": 1,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "command": [sys.executable, *sys.argv],
+        "scenario": (
+            {"name": env.config.scenario_name, "legacy": True}
+            if scenario is None else scenario.asdict()
+        ),
+        "seeds": [args.seed + index for index in range(args.trials)],
+        "episode_seconds": args.episode_seconds,
+        "video": {
+            "fps": args.video_fps,
+            "width": args.video_width,
+            "height": args.video_height,
+        },
+        "artifacts": {
+            "model": {
+                "path": str(model_path.resolve()),
+                "sha256": _sha256(model_path),
+            },
+            "episodes_csv": str(episodes_path.resolve()),
+            "videos": [row["video_path"] for row in rows],
+            "states": [row["states_path"] for row in rows],
+        },
+        "source_xml": {
+            "path": str(XML_PATH.resolve()),
+            "sha256": _sha256(XML_PATH),
+        },
+        "source_files": {
+            name: {"path": str(path.resolve()), "sha256": _sha256(path)}
+            for name, path in {
+                "runner": Path(__file__),
+                "base_environment": Path(__file__).resolve().parent
+                / "cable_grasp_env.py",
+                "scripted_policy": Path(__file__).resolve().parent
+                / "dynamic_grasp_policy.py",
+                "scenario_registry": Path(__file__).resolve().parent
+                / "experiment_scenarios.py",
+                "benchmark_schema": Path(__file__).resolve().parent
+                / "benchmark.py",
+            }.items()
+        },
+        "configs": {
+            "environment": asdict(env.config),
+            "scripted_policy": asdict(policy.config),
+        },
+        "git_commit": _git_text("rev-parse", "HEAD"),
+        "git_dirty": bool(git_status),
+        "python": platform.python_version(),
+        "mujoco": mujoco.__version__,
+        "numpy": np.__version__,
+        "opencv": cv2.__version__,
+        "stable_baselines3": _distribution_version("stable-baselines3"),
+        "summary": summary,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    print(f"episodes={episodes_path.resolve()}", flush=True)
+    print(f"manifest={manifest_path.resolve()}", flush=True)
     print(f"completed={args.trials} successes={successes} rate={successes / args.trials:.1%}")
 
 
@@ -227,7 +346,7 @@ def run_viewer(args: argparse.Namespace) -> None:
         show_right_ui=False,
     ) as handle:
         handle.cam.lookat[:] = [0.55, 0.0, 0.30]
-        handle.cam.distance = 1.65
+        handle.cam.distance = 2.10
         handle.cam.azimuth = 135
         handle.cam.elevation = -25
         handle.sync()

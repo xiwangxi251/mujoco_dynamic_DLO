@@ -117,7 +117,6 @@ class MotionTracker:
         self.translation_force_rms: list[float] = []
         self.rotation_force_rms: list[float] = []
         self.rigid_shape_hold_force_rms: list[float] = []
-        self.boundary_force_rms: list[float] = []
         self.com_path_length = 0.0
 
     def record(self, time: float, positions: np.ndarray, info: dict[str, Any]) -> None:
@@ -140,7 +139,6 @@ class MotionTracker:
         self.rigid_shape_hold_force_rms.append(
             float(info.get("rigid_shape_hold_acceleration_rms", 0.0))
         )
-        self.boundary_force_rms.append(float(info["boundary_acceleration_rms"]))
         self.previous_com = com
         self.previous_time = float(time)
 
@@ -177,7 +175,6 @@ class MotionTracker:
             "rigid_shape_hold_acceleration_rms_m_s2": self._rms(
                 self.rigid_shape_hold_force_rms
             ),
-            "boundary_acceleration_rms_m_s2": self._rms(self.boundary_force_rms),
         }
 
 
