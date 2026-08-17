@@ -90,6 +90,7 @@ class EnvConfig:
     # 抓取判断参数
     success_hold_seconds: float = 0.80  # 成功条件必须连续保持的时间
     grasp_confirm_seconds: float = 0.06 # 双侧内指垫接触保持多久才确认抓取
+    grasp_candidate_gap_seconds: float = 0.02  # 确认前容忍求解器短暂接触/力波动
     grasp_loss_seconds: float = 0.35    # 双指接触短暂中断的容忍时间
     max_grasp_aperture: float = 0.034  # 28 mm线缆被真正夹紧时允许的最大开口
     max_pad_distance: float = 0.055    # 接触线段中心到指垫中心的最大距离
@@ -99,6 +100,20 @@ class EnvConfig:
     frame_skip: int = 10                # 一个50 Hz动作对应10个500 Hz物理步
     gripper_force_scale: float = 5.0    # 提高闭爪位置伺服刚度；执行器最大力范围保持不变
     pad_friction: tuple[float, float, float] = (4.0, 0.10, 0.05)
+
+    # 环境统一限制机器人能力，脚本、RL与后续VLA都不能绕过；数值为Panda官方上限的80%。
+    robot_motion_limit_profile: str = "panda_eval_80_v3"
+    arm_joint_velocity_limits: tuple[float, ...] = (
+        1.74, 1.74, 1.74, 1.74, 2.09, 2.09, 2.09,
+    )
+    arm_joint_acceleration_limits: tuple[float, ...] = (
+        12.0, 6.0, 8.0, 10.0, 12.0, 16.0, 16.0,
+    )
+    hand_linear_velocity_limit: float = 1.0
+    hand_angular_velocity_limit: float = 2.0
+    gripper_finger_velocity_limit: float = 0.20
+    arm_position_tracking_error_limit: float = 0.03
+    low_level_velocity_guard_fraction: float = 0.65
 
     # 桌面软边界
     boundary_margin: float = 0.16       # 距桌边多远开始调整环境扰动力
@@ -152,6 +167,27 @@ class EnvConfig:
                 raise ValueError(f"{name} must be positive")
         if self.frame_skip < 1:
             raise ValueError("frame_skip must be positive")
+        if self.grasp_candidate_gap_seconds < 0.0:
+            raise ValueError("grasp_candidate_gap_seconds must be non-negative")
+        for name in (
+            "arm_joint_velocity_limits", "arm_joint_acceleration_limits",
+        ):
+            values = np.asarray(getattr(self, name), dtype=float)
+            if values.shape != (7,):
+                raise ValueError(f"{name} must contain exactly 7 values")
+            if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+                raise ValueError(f"{name} values must be finite and positive")
+        for name in (
+            "hand_linear_velocity_limit", "hand_angular_velocity_limit",
+            "gripper_finger_velocity_limit", "arm_position_tracking_error_limit",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not 0.0 < self.low_level_velocity_guard_fraction <= 1.0:
+            raise ValueError(
+                "low_level_velocity_guard_fraction must be in (0, 1]"
+            )
 
 
 @dataclass
@@ -292,6 +328,22 @@ class CableGraspEnv:
         self.ready_ctrl[:7] = self.READY_ARM_QPOS
         self.ready_ctrl[7] = 255.0
 
+        self._arm_velocity_limits = np.asarray(
+            self.config.arm_joint_velocity_limits, dtype=float
+        )
+        self._arm_acceleration_limits = np.asarray(
+            self.config.arm_joint_acceleration_limits, dtype=float
+        )
+        self._hand_jacp = np.zeros((3, self.model.nv))
+        self._hand_jacr = np.zeros((3, self.model.nv))
+        gripper_bias = -float(self.model.actuator_biasprm[7, 1])
+        self._gripper_ctrl_to_finger_position = (
+            float(self.model.actuator_gainprm[7, 0]) / gripper_bias
+            if gripper_bias > 0.0 else 0.0
+        )
+        if self._gripper_ctrl_to_finger_position <= 0.0:
+            raise RuntimeError("Unable to derive gripper control-to-position scale")
+
         # 任务状态参数全部初始化
         self.trial_index = 0
 
@@ -334,6 +386,30 @@ class CableGraspEnv:
         self.episode_seed: int | None = None
         self.initial_cable_translation = np.zeros(2)
         self._last_contact_count = 0
+        self._previous_arm_command_velocity = np.zeros(7)
+        self._last_requested_action = self.ready_ctrl.copy()
+        self._last_applied_action = self.ready_ctrl.copy()
+        self._last_requested_arm_velocity = np.zeros(7)
+        self._last_applied_arm_velocity = np.zeros(7)
+        self._last_commanded_hand_velocity = np.zeros(6)
+        self._last_motion_limit_flags = {
+            "acceleration": False,
+            "joint_velocity": False,
+            "cartesian_velocity": False,
+            "gripper_velocity": False,
+        }
+        self._motion_limit_steps = 0
+        self._motion_limit_active_steps = 0
+        self._acceleration_limit_steps = 0
+        self._joint_velocity_limit_steps = 0
+        self._cartesian_velocity_limit_steps = 0
+        self._gripper_velocity_limit_steps = 0
+        self._physics_steps = 0
+        self._velocity_guard_steps = 0
+        self._actual_velocity_exceedance_steps = 0
+        self._max_abs_actual_arm_velocity = np.zeros(7)
+        self._max_actual_hand_linear_speed = 0.0
+        self._max_actual_hand_angular_speed = 0.0
         self.reset()
         # 上面的 reset 只用于让刚构造的对象拥有完整、可查询的初始物理状态，
         # 不是调用方实际运行的 episode。首次显式 reset 应编号为 trial=1。
@@ -462,6 +538,26 @@ class CableGraspEnv:
         self._last_rigid_rotation_acceleration[:] = 0.0
         self._last_rigid_shape_hold_acceleration[:] = 0.0
         self._last_boundary_acceleration[:] = 0.0
+        self._previous_arm_command_velocity[:] = 0.0
+        self._last_requested_action[:] = self.ready_ctrl
+        self._last_applied_action[:] = self.ready_ctrl
+        self._last_requested_arm_velocity[:] = 0.0
+        self._last_applied_arm_velocity[:] = 0.0
+        self._last_commanded_hand_velocity[:] = 0.0
+        for name in self._last_motion_limit_flags:
+            self._last_motion_limit_flags[name] = False
+        self._motion_limit_steps = 0
+        self._motion_limit_active_steps = 0
+        self._acceleration_limit_steps = 0
+        self._joint_velocity_limit_steps = 0
+        self._cartesian_velocity_limit_steps = 0
+        self._gripper_velocity_limit_steps = 0
+        self._physics_steps = 0
+        self._velocity_guard_steps = 0
+        self._actual_velocity_exceedance_steps = 0
+        self._max_abs_actual_arm_velocity[:] = 0.0
+        self._max_actual_hand_linear_speed = 0.0
+        self._max_actual_hand_angular_speed = 0.0
         self.trial_index += 1
         return self.observation(), self.info()
 
@@ -471,23 +567,30 @@ class CableGraspEnv:
         action = np.asarray(action, dtype=float)
         if action.shape != (8,):
             raise ValueError(f"Expected action shape (8,), got {action.shape}")
+        if not np.all(np.isfinite(action)):
+            raise ValueError("Action values must be finite")
         clipped_action = np.clip(
             action,
             self.model.actuator_ctrlrange[:, 0],
             self.model.actuator_ctrlrange[:, 1],
         )
+        applied_action = self._limit_robot_action(clipped_action)
 
         last_qualification = False
         truncated = False
-        gripper_closed = bool(clipped_action[7] < 100.0)
+        gripper_closed = bool(applied_action[7] < 100.0)
 
         for _ in range(max(1, self.config.frame_skip)):
             # 扰动线缆
             self.data.xfrc_applied[:] = 0.0
             self._apply_cable_disturbance()
             # 执行动作
-            self.data.ctrl[:] = clipped_action
+            guarded_action, velocity_guard_active = (
+                self._velocity_guarded_action(applied_action)
+            )
+            self.data.ctrl[:] = guarded_action
             mujoco.mj_step(self.model, self.data)
+            self._record_actual_robot_velocity(velocity_guard_active)
 
             # 更新抓取候选
             self._last_contact_count = len(self._finger_contact_pairs())
@@ -541,6 +644,202 @@ class CableGraspEnv:
         reward = float(last_qualification) + 5.0 * float(success)
         return self.observation(), reward, success, truncated, info
 
+    def _limit_robot_action(self, requested_action: np.ndarray) -> np.ndarray:
+        """在进入执行器前，按统一的50 Hz周期限制机器人运动命令。"""
+
+        control_dt = float(
+            self.model.opt.timestep * max(1, self.config.frame_skip)
+        )
+        previous_position_target = self._last_applied_action[:7]
+        requested_velocity = (
+            requested_action[:7] - previous_position_target
+        ) / control_dt
+
+        # Keep the requested multi-joint direction intact while limiting its
+        # change.  Independent component clipping can rotate a resolved-rate
+        # IK command substantially at phase changes (for example, turning a
+        # requested descent into an upward end-effector transient).
+        velocity_delta = (
+            requested_velocity - self._previous_arm_command_velocity
+        )
+        allowed_delta = self._arm_acceleration_limits * control_dt
+        acceleration_scale = min(
+            1.0,
+            float(np.min(
+                allowed_delta / np.maximum(np.abs(velocity_delta), 1e-12)
+            )),
+        )
+        acceleration_limited_velocity = (
+            self._previous_arm_command_velocity
+            + acceleration_scale * velocity_delta
+        )
+        acceleration_limited = not np.allclose(
+            acceleration_limited_velocity, requested_velocity,
+            rtol=0.0, atol=1e-12,
+        )
+
+        joint_limited_velocity = np.clip(
+            acceleration_limited_velocity,
+            -self._arm_velocity_limits,
+            self._arm_velocity_limits,
+        )
+        joint_velocity_limited = not np.allclose(
+            joint_limited_velocity, acceleration_limited_velocity,
+            rtol=0.0, atol=1e-12,
+        )
+
+        joint_range = self.model.jnt_range[self.arm_joint_ids]
+        position_target = np.clip(
+            previous_position_target + joint_limited_velocity * control_dt,
+            joint_range[:, 0], joint_range[:, 1],
+        )
+        bounded_velocity = (
+            position_target - previous_position_target
+        ) / control_dt
+
+        jacp, jacr = self._hand_jacobian()
+        linear_velocity = jacp[:, self.arm_dof_adr] @ bounded_velocity
+        angular_velocity = jacr[:, self.arm_dof_adr] @ bounded_velocity
+        linear_speed = float(np.linalg.norm(linear_velocity))
+        angular_speed = float(np.linalg.norm(angular_velocity))
+        cartesian_scale = min(
+            1.0,
+            self.config.hand_linear_velocity_limit / max(linear_speed, 1e-12),
+            self.config.hand_angular_velocity_limit / max(angular_speed, 1e-12),
+        )
+        cartesian_velocity_limited = cartesian_scale < 1.0 - 1e-12
+        applied_velocity = bounded_velocity * cartesian_scale
+        position_target = (
+            previous_position_target + applied_velocity * control_dt
+        )
+
+        max_gripper_delta = (
+            self.config.gripper_finger_velocity_limit
+            * control_dt
+            / self._gripper_ctrl_to_finger_position
+        )
+        previous_gripper_command = float(self._last_applied_action[7])
+        gripper_command = float(np.clip(
+            requested_action[7],
+            previous_gripper_command - max_gripper_delta,
+            previous_gripper_command + max_gripper_delta,
+        ))
+        gripper_velocity_limited = not math.isclose(
+            gripper_command, float(requested_action[7]),
+            rel_tol=0.0, abs_tol=1e-12,
+        )
+
+        applied_action = requested_action.copy()
+        applied_action[:7] = position_target
+        applied_action[7] = gripper_command
+
+        commanded_linear_velocity = (
+            jacp[:, self.arm_dof_adr] @ applied_velocity
+        )
+        commanded_angular_velocity = (
+            jacr[:, self.arm_dof_adr] @ applied_velocity
+        )
+        flags = {
+            "acceleration": acceleration_limited,
+            "joint_velocity": joint_velocity_limited,
+            "cartesian_velocity": cartesian_velocity_limited,
+            "gripper_velocity": gripper_velocity_limited,
+        }
+        self._previous_arm_command_velocity[:] = applied_velocity
+        self._last_requested_action[:] = requested_action
+        self._last_applied_action[:] = applied_action
+        self._last_requested_arm_velocity[:] = requested_velocity
+        self._last_applied_arm_velocity[:] = applied_velocity
+        self._last_commanded_hand_velocity[:3] = commanded_linear_velocity
+        self._last_commanded_hand_velocity[3:] = commanded_angular_velocity
+        self._last_motion_limit_flags = flags
+        self._motion_limit_steps += 1
+        self._motion_limit_active_steps += int(any(flags.values()))
+        self._acceleration_limit_steps += int(acceleration_limited)
+        self._joint_velocity_limit_steps += int(joint_velocity_limited)
+        self._cartesian_velocity_limit_steps += int(cartesian_velocity_limited)
+        self._gripper_velocity_limit_steps += int(gripper_velocity_limited)
+        return applied_action
+
+    def _hand_jacobian(self) -> tuple[np.ndarray, np.ndarray]:
+        mujoco.mj_jac(
+            self.model, self.data,
+            self._hand_jacp, self._hand_jacr,
+            self.hand_position, self.hand_id,
+        )
+        return self._hand_jacp, self._hand_jacr
+
+    def _velocity_guarded_action(
+        self, applied_action: np.ndarray,
+    ) -> tuple[np.ndarray, bool]:
+        """关节接近速度上限后停止同向驱动。
+
+        这里只改变执行器目标，由原有PD阻尼和力矩上限制动；不直接裁剪
+        ``data.qvel``或其他物理状态。
+        """
+
+        guarded_action = applied_action.copy()
+        current_qpos = self.data.qpos[self.arm_qpos_adr]
+        current_qvel = self.data.qvel[self.arm_dof_adr]
+        guarded_action[:7] = np.clip(
+            guarded_action[:7],
+            current_qpos - self.config.arm_position_tracking_error_limit,
+            current_qpos + self.config.arm_position_tracking_error_limit,
+        )
+        guard_limits = (
+            self.config.low_level_velocity_guard_fraction
+            * self._arm_velocity_limits
+        )
+        positive = (
+            current_qvel >= guard_limits
+        ) & (guarded_action[:7] > current_qpos)
+        negative = (
+            current_qvel <= -guard_limits
+        ) & (guarded_action[:7] < current_qpos)
+        active = positive | negative
+        guarded_action[:7][active] = current_qpos[active]
+
+        # Joint-wise limits do not guarantee a Cartesian angular-speed limit:
+        # several sub-limit joint velocities can add constructively through the
+        # Jacobian.  Apply a whole-arm damping command before either Cartesian
+        # speed reaches its limit.  This changes only the actuator target; the
+        # simulator remains responsible for the physical deceleration.
+        jacp, jacr = self._hand_jacobian()
+        hand_linear_speed = float(np.linalg.norm(jacp @ self.data.qvel))
+        hand_angular_speed = float(np.linalg.norm(jacr @ self.data.qvel))
+        cartesian_guard_active = bool(
+            hand_linear_speed
+            >= self.config.low_level_velocity_guard_fraction
+            * self.config.hand_linear_velocity_limit
+            or hand_angular_speed
+            >= self.config.low_level_velocity_guard_fraction
+            * self.config.hand_angular_velocity_limit
+        )
+        if cartesian_guard_active:
+            guarded_action[:7] = current_qpos
+        return guarded_action, bool(np.any(active) or cartesian_guard_active)
+
+    def _record_actual_robot_velocity(self, velocity_guard_active: bool) -> None:
+        actual_arm_velocity = self.data.qvel[self.arm_dof_adr]
+        jacp, jacr = self._hand_jacobian()
+        actual_linear_speed = float(np.linalg.norm(jacp @ self.data.qvel))
+        actual_angular_speed = float(np.linalg.norm(jacr @ self.data.qvel))
+        self._physics_steps += 1
+        self._velocity_guard_steps += int(velocity_guard_active)
+        self._actual_velocity_exceedance_steps += int(np.any(
+            np.abs(actual_arm_velocity) > 1.05 * self._arm_velocity_limits
+        ))
+        self._max_abs_actual_arm_velocity[:] = np.maximum(
+            self._max_abs_actual_arm_velocity,
+            np.abs(actual_arm_velocity),
+        )
+        self._max_actual_hand_linear_speed = max(
+            self._max_actual_hand_linear_speed, actual_linear_speed
+        )
+        self._max_actual_hand_angular_speed = max(
+            self._max_actual_hand_angular_speed, actual_angular_speed
+        )
+
     # -------------------------------------------------------------------------
     # 2. 对外观测与诊断接口
     # -------------------------------------------------------------------------
@@ -576,6 +875,12 @@ class CableGraspEnv:
             + self._last_rigid_rotation_acceleration
             + self._last_rigid_shape_hold_acceleration
         )
+        actual_arm_velocity = self.data.qvel[self.arm_dof_adr].copy()
+        jacp, jacr = self._hand_jacobian()
+        actual_hand_linear_velocity = jacp @ self.data.qvel
+        actual_hand_angular_velocity = jacr @ self.data.qvel
+        motion_limit_denominator = max(1, self._motion_limit_steps)
+        physics_step_denominator = max(1, self._physics_steps)
         rms = lambda values: float(np.sqrt(np.mean(np.square(values))))
         is_rigid_pilot = self.config.motion_profile_version in RIGID_PILOT_PROFILES
         return {
@@ -616,6 +921,72 @@ class CableGraspEnv:
             "cable_stiffness_scale": self.config.cable_stiffness_scale,
             "cable_damping_scale": self.config.cable_damping_scale,
             "cable_friction_scale": self.config.cable_friction_scale,
+            "robot_motion_limit_profile": self.config.robot_motion_limit_profile,
+            "arm_joint_velocity_limits": self._arm_velocity_limits.copy(),
+            "arm_joint_acceleration_limits": self._arm_acceleration_limits.copy(),
+            "hand_linear_velocity_limit": (
+                self.config.hand_linear_velocity_limit
+            ),
+            "hand_angular_velocity_limit": (
+                self.config.hand_angular_velocity_limit
+            ),
+            "gripper_finger_velocity_limit": (
+                self.config.gripper_finger_velocity_limit
+            ),
+            "arm_position_tracking_error_limit": (
+                self.config.arm_position_tracking_error_limit
+            ),
+            "low_level_velocity_guard_fraction": (
+                self.config.low_level_velocity_guard_fraction
+            ),
+            "requested_action": self._last_requested_action.copy(),
+            "applied_action": self._last_applied_action.copy(),
+            "requested_arm_velocity": (
+                self._last_requested_arm_velocity.copy()
+            ),
+            "applied_arm_velocity": self._last_applied_arm_velocity.copy(),
+            "actual_arm_velocity": actual_arm_velocity,
+            "commanded_hand_linear_velocity": (
+                self._last_commanded_hand_velocity[:3].copy()
+            ),
+            "commanded_hand_angular_velocity": (
+                self._last_commanded_hand_velocity[3:].copy()
+            ),
+            "actual_hand_linear_velocity": actual_hand_linear_velocity.copy(),
+            "actual_hand_angular_velocity": actual_hand_angular_velocity.copy(),
+            "max_abs_actual_arm_velocity": (
+                self._max_abs_actual_arm_velocity.copy()
+            ),
+            "max_actual_hand_linear_speed": (
+                self._max_actual_hand_linear_speed
+            ),
+            "max_actual_hand_angular_speed": (
+                self._max_actual_hand_angular_speed
+            ),
+            "motion_limit_active": any(self._last_motion_limit_flags.values()),
+            "motion_limit_flags": self._last_motion_limit_flags.copy(),
+            "motion_limit_active_ratio": (
+                self._motion_limit_active_steps / motion_limit_denominator
+            ),
+            "acceleration_limit_ratio": (
+                self._acceleration_limit_steps / motion_limit_denominator
+            ),
+            "joint_velocity_limit_ratio": (
+                self._joint_velocity_limit_steps / motion_limit_denominator
+            ),
+            "cartesian_velocity_limit_ratio": (
+                self._cartesian_velocity_limit_steps / motion_limit_denominator
+            ),
+            "gripper_velocity_limit_ratio": (
+                self._gripper_velocity_limit_steps / motion_limit_denominator
+            ),
+            "low_level_velocity_guard_ratio": (
+                self._velocity_guard_steps / physics_step_denominator
+            ),
+            "actual_joint_velocity_exceedance_ratio": (
+                self._actual_velocity_exceedance_steps
+                / physics_step_denominator
+            ),
             "shape_acceleration_rms": rms(self._last_shape_acceleration),
             "rigid_translation_acceleration_rms": rms(
                 self._last_rigid_translation_acceleration
@@ -725,8 +1096,16 @@ class CableGraspEnv:
                 return
             self.grasp_state.lost_contact_time += timestep
             if (
-                not self.grasp_state.bilateral_confirmed
-                or self.grasp_state.lost_contact_time >= self.config.grasp_loss_seconds
+                (
+                    not self.grasp_state.bilateral_confirmed
+                    and self.grasp_state.lost_contact_time
+                    >= self.config.grasp_candidate_gap_seconds
+                )
+                or (
+                    self.grasp_state.bilateral_confirmed
+                    and self.grasp_state.lost_contact_time
+                    >= self.config.grasp_loss_seconds
+                )
             ):
                 self._clear_grasp_with_reason("lost_physical_pad_contact")
             return

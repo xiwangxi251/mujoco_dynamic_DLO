@@ -69,6 +69,160 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
+    def test_environment_limits_arm_and_gripper_commands(self) -> None:
+        env = self.make("id_static")
+        try:
+            observation, _ = env.reset(randomize=False, seed=1003)
+            requested = env.model.actuator_ctrlrange[:, 1].copy()
+            requested[3] = env.model.actuator_ctrlrange[3, 0]
+            requested[7] = 0.0
+            _, _, _, _, info = env.step(requested)
+
+            control_dt = env.model.opt.timestep * env.config.frame_skip
+            applied_velocity = info["applied_arm_velocity"]
+            self.assertTrue(np.all(
+                np.abs(applied_velocity)
+                <= np.asarray(env.config.arm_joint_velocity_limits) + 1e-12
+            ))
+            self.assertTrue(np.all(
+                np.abs(applied_velocity)
+                <= np.asarray(env.config.arm_joint_acceleration_limits)
+                * control_dt + 1e-12
+            ))
+            self.assertTrue(np.allclose(
+                info["applied_action"][:7],
+                observation["arm_qpos"] + applied_velocity * control_dt,
+                rtol=0.0,
+                atol=1e-12,
+            ))
+            self.assertLessEqual(
+                np.linalg.norm(info["commanded_hand_linear_velocity"]),
+                env.config.hand_linear_velocity_limit + 1e-12,
+            )
+            self.assertLessEqual(
+                np.linalg.norm(info["commanded_hand_angular_velocity"]),
+                env.config.hand_angular_velocity_limit + 1e-12,
+            )
+            finger_target_change = (
+                255.0 - info["applied_action"][7]
+            ) * env._gripper_ctrl_to_finger_position
+            self.assertLessEqual(
+                finger_target_change / control_dt,
+                env.config.gripper_finger_velocity_limit + 1e-12,
+            )
+            self.assertTrue(info["motion_limit_active"])
+            self.assertTrue(info["motion_limit_flags"]["acceleration"])
+            self.assertTrue(info["motion_limit_flags"]["gripper_velocity"])
+        finally:
+            del env
+
+    def test_reset_clears_motion_limiter_history(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1004)
+            requested = env.model.actuator_ctrlrange[:, 1].copy()
+            requested[7] = 0.0
+            env.step(requested)
+            _, info = env.reset(randomize=False, seed=1004)
+            self.assertEqual(info["motion_limit_active_ratio"], 0.0)
+            self.assertTrue(np.array_equal(
+                info["applied_arm_velocity"], np.zeros(7)
+            ))
+            self.assertTrue(np.array_equal(
+                info["applied_action"], env.ready_ctrl
+            ))
+        finally:
+            del env
+
+    def test_low_level_guard_brakes_without_clipping_state_velocity(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1006)
+            action = env.ready_ctrl.copy()
+            action[0] += 0.2
+            original_velocity = 1.1 * env._arm_velocity_limits[0]
+            env.data.qvel[env.arm_dof_adr[0]] = original_velocity
+            guarded, active = env._velocity_guarded_action(action)
+            self.assertTrue(active)
+            self.assertEqual(
+                guarded[0], env.data.qpos[env.arm_qpos_adr[0]]
+            )
+            self.assertEqual(
+                env.data.qvel[env.arm_dof_adr[0]], original_velocity
+            )
+        finally:
+            del env
+
+    def test_low_level_guard_brakes_on_cartesian_speed(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1008)
+            action = env.ready_ctrl.copy()
+            action[:7] += 0.05
+            original_velocity = np.zeros(7)
+            original_velocity[4] = env._arm_velocity_limits[4] * 0.70
+            env.data.qvel[env.arm_dof_adr] = original_velocity
+
+            original_jacobian = env._hand_jacobian
+            env._hand_jacobian = lambda: (
+                np.zeros((3, env.model.nv)),
+                np.vstack((
+                    np.zeros(env.model.nv),
+                    np.zeros(env.model.nv),
+                    np.eye(1, env.model.nv, env.arm_dof_adr[4])[0] * 2.0,
+                )),
+            )
+            try:
+                guarded, active = env._velocity_guarded_action(action)
+            finally:
+                env._hand_jacobian = original_jacobian
+
+            self.assertTrue(active)
+            self.assertTrue(np.array_equal(
+                guarded[:7], env.data.qpos[env.arm_qpos_adr]
+            ))
+            self.assertTrue(np.array_equal(
+                env.data.qvel[env.arm_dof_adr], original_velocity
+            ))
+        finally:
+            del env
+
+    def test_unconfirmed_grasp_tolerates_brief_candidate_dropout(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1007)
+            env.grasp_state = GraspState(
+                body_id=env.target_body_id,
+                candidate_time=float(env.data.time),
+                bilateral_confirmed=False,
+                last_bilateral_time=float(env.data.time),
+                lost_contact_time=0.0,
+            )
+            env._physical_grasp_candidate = lambda: None
+            env._update_physical_grasp_state(gripper_closed=True)
+            self.assertIsNotNone(env.grasp_state)
+
+            steps = math.ceil(
+                env.config.grasp_candidate_gap_seconds
+                / env.model.opt.timestep
+            )
+            for _ in range(steps):
+                env._update_physical_grasp_state(gripper_closed=True)
+            self.assertIsNone(env.grasp_state)
+        finally:
+            del env
+
+    def test_environment_rejects_nonfinite_actions(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1005)
+            action = env.ready_ctrl.copy()
+            action[0] = math.nan
+            with self.assertRaisesRegex(ValueError, "finite"):
+                env.step(action)
+        finally:
+            del env
+
     def test_seed_reproduces_initial_scene_and_motion_profile(self) -> None:
         env = self.make("ood_dynamics_high_stochastic")
         try:

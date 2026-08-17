@@ -36,11 +36,12 @@ class Phase(Enum):
 class PolicyConfig:
     """脚本基线的时间参数。论文方法可完全不用这个类。"""
 
-    prediction_horizon: float = 0.22
+    prediction_horizon: float = 0.12
     settle_seconds: float = 0.8
     approach_timeout: float = 6.0
     intercept_timeout: float = 9.0
     close_timeout: float = 0.8
+    close_hard_timeout: float = 3.0
     close_capture_distance: float = 0.018
     close_contact_grace: float = 0.35
     lift_seconds: float = 2.4
@@ -250,6 +251,10 @@ class DynamicCableGraspPolicy:
             # 让实际两指夹持中心移动到预测线段上方20 cm，夹爪保持张开。
             desired = target + np.array([0.0, 0.0, 0.20])
             if np.linalg.norm(hand - desired) < 0.035 or self.phase_time > self.config.approach_timeout:
+                # Select one material segment when descent begins.  Re-selecting
+                # the globally nearest point every control step makes the goal
+                # jump between adjacent folds in a deforming cable.
+                self._lock_segment_near(hand)
                 self._transition(Phase.INTERCEPT)
             return self._ik_action(desired, 255.0)
 
@@ -257,8 +262,8 @@ class DynamicCableGraspPolicy:
             # 实际两指夹持中心直接追踪目标线缆段中心，不再使用旧虚拟点的z补偿。
             desired = target.copy()
             nearest, nearest_distance, _, _ = self._nearest_cable_point(hand)
-            # 原参考节点可能已因弯折远离，但只要任意真实线缆中心线进入夹持中心，
-            # 就应闭爪并锁定该线段，不能继续等待远处节点。
+            # 截获期间持续追踪进入该阶段时锁定的材料线段，避免在相邻弯折间
+            # 跳变；但闭爪触发仍以任意真实线缆中心线进入夹持区域为准。
             if nearest_distance < self.config.close_capture_distance:
                 desired = self._lock_segment_near(nearest)
                 self._transition(Phase.CLOSE)
@@ -281,9 +286,12 @@ class DynamicCableGraspPolicy:
                 self.lift_goal = hand + np.array([0.0, 0.0, self.config.lift_distance])
                 self._transition(Phase.LIFT)
             elif (
-                self.phase_time > self.config.close_timeout
-                and self.env.data.time - self.last_close_contact_time
-                > self.config.close_contact_grace
+                self.phase_time > self.config.close_hard_timeout
+                or (
+                    self.phase_time > self.config.close_timeout
+                    and self.env.data.time - self.last_close_contact_time
+                    > self.config.close_contact_grace
+                )
             ):
                 if self.retry_count < self.config.max_retries:
                     self.retry_count += 1

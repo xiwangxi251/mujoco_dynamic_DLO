@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -148,6 +149,34 @@ def _base_row(
         "cable_friction_scale": float(
             initial_info.get("cable_friction_scale", 1.0)
         ),
+        "robot_motion_limit_profile": initial_info.get(
+            "robot_motion_limit_profile", "unspecified"
+        ),
+        "arm_joint_velocity_limits": json.dumps(
+            np.asarray(initial_info.get(
+                "arm_joint_velocity_limits", [],
+            )).tolist()
+        ),
+        "arm_joint_acceleration_limits": json.dumps(
+            np.asarray(initial_info.get(
+                "arm_joint_acceleration_limits", [],
+            )).tolist()
+        ),
+        "hand_linear_velocity_limit": float(initial_info.get(
+            "hand_linear_velocity_limit", np.nan
+        )),
+        "hand_angular_velocity_limit": float(initial_info.get(
+            "hand_angular_velocity_limit", np.nan
+        )),
+        "gripper_finger_velocity_limit": float(initial_info.get(
+            "gripper_finger_velocity_limit", np.nan
+        )),
+        "arm_position_tracking_error_limit": float(initial_info.get(
+            "arm_position_tracking_error_limit", np.nan
+        )),
+        "low_level_velocity_guard_fraction": float(initial_info.get(
+            "low_level_velocity_guard_fraction", np.nan
+        )),
         "cable_length_ood": bool(scenario and scenario.cable_length_ood),
         "cable_material_profile": (
             "nominal" if scenario is None else scenario.cable_material_profile
@@ -204,6 +233,36 @@ def _base_row(
         "success_hold": float(
             info.get("strict_success_hold", info.get("success_hold", 0.0))
         ),
+        "motion_limit_active_ratio": float(info.get(
+            "motion_limit_active_ratio", 0.0
+        )),
+        "acceleration_limit_ratio": float(info.get(
+            "acceleration_limit_ratio", 0.0
+        )),
+        "joint_velocity_limit_ratio": float(info.get(
+            "joint_velocity_limit_ratio", 0.0
+        )),
+        "cartesian_velocity_limit_ratio": float(info.get(
+            "cartesian_velocity_limit_ratio", 0.0
+        )),
+        "gripper_velocity_limit_ratio": float(info.get(
+            "gripper_velocity_limit_ratio", 0.0
+        )),
+        "low_level_velocity_guard_ratio": float(info.get(
+            "low_level_velocity_guard_ratio", 0.0
+        )),
+        "actual_joint_velocity_exceedance_ratio": float(info.get(
+            "actual_joint_velocity_exceedance_ratio", 0.0
+        )),
+        "max_abs_actual_arm_velocity": json.dumps(
+            np.asarray(info.get("max_abs_actual_arm_velocity", [])).tolist()
+        ),
+        "max_actual_hand_linear_speed": float(info.get(
+            "max_actual_hand_linear_speed", 0.0
+        )),
+        "max_actual_hand_angular_speed": float(info.get(
+            "max_actual_hand_angular_speed", 0.0
+        )),
     }
     row["task_failure_type"] = classify_task_outcome(
         task_success=task_success,
@@ -264,6 +323,22 @@ def _run_scripted(
         })
         rows.append(row)
     return rows
+
+
+def _run_scripted_episode(
+    episode: int,
+    seed: int,
+    scenario: ScenarioConfig | None,
+    disturbance: float,
+    episode_seconds: float,
+) -> dict[str, Any]:
+    """Run one isolated scripted episode for parallel matrix evaluation."""
+
+    row = _run_scripted(
+        [seed], scenario, disturbance, episode_seconds,
+    )[0]
+    row["episode"] = episode
+    return row
 
 
 def _run_ppo(
@@ -444,16 +519,22 @@ def parse_args() -> argparse.Namespace:
     selection.add_argument("--scenario", choices=list_scenario_names())
     selection.add_argument("--suite", choices=SCENARIO_SUITE_NAMES)
     parser.add_argument("--episode-seconds", type=float, default=28.0)
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="parallel isolated environments (scripted method only)",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output", type=Path, default=Path("benchmark_runs"))
     args = parser.parse_args()
     args.methods = list(dict.fromkeys(args.methods))
-    if args.episodes < 1 or args.episode_seconds <= 0.0:
-        parser.error("--episodes and --episode-seconds must be positive")
+    if args.episodes < 1 or args.episode_seconds <= 0.0 or args.workers < 1:
+        parser.error("--episodes, --episode-seconds, and --workers must be positive")
     if args.disturbance < 0.0 or not math.isfinite(args.disturbance):
         parser.error("--disturbance must be finite and non-negative")
     if "ppo" in args.methods and args.ppo_model is None:
         parser.error("--ppo-model is required when evaluating PPO")
+    if args.workers > 1 and args.methods != ["scripted"]:
+        parser.error("--workers > 1 currently supports --methods scripted only")
     if args.ppo_model is not None and not args.ppo_model.is_file():
         parser.error(f"PPO model not found: {args.ppo_model}")
     return args
@@ -472,17 +553,48 @@ def main() -> None:
     output_dir.mkdir(parents=True)
 
     rows: list[dict[str, Any]] = []
-    for scenario in scenarios:
-        for method in args.methods:
-            if method == "scripted":
-                rows.extend(_run_scripted(
-                    seeds, scenario, args.disturbance, args.episode_seconds,
-                ))
-            else:
-                rows.extend(_run_ppo(
-                    seeds, scenario, args.disturbance, args.episode_seconds,
-                    args.ppo_model, args.device,
-                ))
+    if args.workers > 1:
+        jobs = [
+            (episode, seed, scenario)
+            for scenario in scenarios
+            for episode, seed in enumerate(seeds, start=1)
+        ]
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            pending = {
+                executor.submit(
+                    _run_scripted_episode,
+                    episode,
+                    seed,
+                    scenario,
+                    args.disturbance,
+                    args.episode_seconds,
+                ): (scenario, episode)
+                for episode, seed, scenario in jobs
+            }
+            completed = 0
+            for future in as_completed(pending):
+                rows.append(future.result())
+                completed += 1
+                if completed % args.workers == 0 or completed == len(jobs):
+                    print(
+                        f"completed_episodes={completed}/{len(jobs)}",
+                        flush=True,
+                    )
+        rows.sort(key=lambda row: (
+            str(row["scenario_name"]), int(row["episode"]), str(row["method"])
+        ))
+    else:
+        for scenario in scenarios:
+            for method in args.methods:
+                if method == "scripted":
+                    rows.extend(_run_scripted(
+                        seeds, scenario, args.disturbance, args.episode_seconds,
+                    ))
+                else:
+                    rows.extend(_run_ppo(
+                        seeds, scenario, args.disturbance, args.episode_seconds,
+                        args.ppo_model, args.device,
+                    ))
 
     fingerprints: dict[str, set[str]] = {}
     methods: dict[str, list[str]] = {}

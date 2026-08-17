@@ -50,12 +50,14 @@ def run_headless(args: argparse.Namespace) -> None:
     policy = DynamicCableGraspPolicy(env)
     successes = 0
 
-    # 每次运行使用独立子目录，避免覆盖之前各回合的视频。
+    # 先按场景分目录，再为每次运行建立独立子目录。批量运行所有场景时，
+    # 无需额外指定 --video-dir，也能直接从路径判断视频属于哪个实验设置。
+    scenario_dir = args.video_dir / env.config.scenario_name
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
-    video_dir = args.video_dir / run_name
+    video_dir = scenario_dir / run_name
     suffix = 1
     while video_dir.exists():
-        video_dir = args.video_dir / f"{run_name}_{suffix:02d}"
+        video_dir = scenario_dir / f"{run_name}_{suffix:02d}"
         suffix += 1
     video_dir.mkdir(parents=True)
 
