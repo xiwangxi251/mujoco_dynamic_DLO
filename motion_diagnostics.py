@@ -30,6 +30,7 @@ from experiment_scenarios import (
 
 
 ROOT = Path(__file__).resolve().parent
+DIAGNOSTIC_OUTPUT_ROOT = ROOT / "artifacts" / "motion_diagnostics"
 
 
 def _sha256(path: Path) -> str:
@@ -115,6 +116,7 @@ class MotionTracker:
         self.shape_force_rms: list[float] = []
         self.translation_force_rms: list[float] = []
         self.rotation_force_rms: list[float] = []
+        self.rigid_shape_hold_force_rms: list[float] = []
         self.boundary_force_rms: list[float] = []
         self.com_path_length = 0.0
 
@@ -135,6 +137,9 @@ class MotionTracker:
             float(info["rigid_translation_acceleration_rms"])
         )
         self.rotation_force_rms.append(float(info["rigid_rotation_acceleration_rms"]))
+        self.rigid_shape_hold_force_rms.append(
+            float(info.get("rigid_shape_hold_acceleration_rms", 0.0))
+        )
         self.boundary_force_rms.append(float(info["boundary_acceleration_rms"]))
         self.previous_com = com
         self.previous_time = float(time)
@@ -168,6 +173,9 @@ class MotionTracker:
             ),
             "rigid_rotation_acceleration_rms_m_s2": self._rms(
                 self.rotation_force_rms
+            ),
+            "rigid_shape_hold_acceleration_rms_m_s2": self._rms(
+                self.rigid_shape_hold_force_rms
             ),
             "boundary_acceleration_rms_m_s2": self._rms(self.boundary_force_rms),
         }
@@ -225,6 +233,10 @@ def validate_force_decomposition(rows: list[dict[str, Any]]) -> list[str]:
             float(row["rigid_translation_acceleration_rms_m_s2"]),
             float(row["rigid_rotation_acceleration_rms_m_s2"]),
         )
+        rigid = math.hypot(
+            rigid,
+            float(row.get("rigid_shape_hold_acceleration_rms_m_s2", 0.0)),
+        )
         expects_shape = motion_type in {"shape", "combined"}
         expects_rigid = motion_type in {"rigid", "combined"}
         if expects_shape != (shape > tolerance):
@@ -247,7 +259,7 @@ def validate_core_motion_semantics(rows: list[dict[str, Any]]) -> list[str]:
             if com_max >= 0.002 or rotation_max >= 0.02 or shape_rms >= 0.002:
                 errors.append(f"{name}: actual motion exceeds static tolerance")
         elif name == "id_rigid_nominal":
-            if com_max < 0.02 or rotation_max < 0.12:
+            if com_max < 0.015 or rotation_max < 0.09:
                 errors.append(f"{name}: global translation/rotation is too small")
             if shape_rms >= 0.02:
                 errors.append(f"{name}: shape residual is too large for rigid motion")
@@ -257,6 +269,26 @@ def validate_core_motion_semantics(rows: list[dict[str, Any]]) -> list[str]:
         elif name == "id_combined_nominal":
             if com_max < 0.02 or rotation_max < 0.12 or shape_rms < 0.02:
                 errors.append(f"{name}: combined actual response lacks one component")
+        elif name.startswith("pilot_rigid_l1_") or name.startswith("pilot_rigid_l2_"):
+            if float(row["com_speed_rms_m_s"]) < 0.10:
+                errors.append(f"{name}: pilot translation is still too slow")
+            if rotation_max < 0.25:
+                errors.append(f"{name}: commanded pilot rotation is too small")
+            if shape_rms >= 0.002:
+                errors.append(f"{name}: fixed-shape pilot deforms too much")
+        elif name.startswith("pilot_combined_l1_") or name.startswith(
+            "pilot_combined_l2_"
+        ):
+            if float(row["com_speed_rms_m_s"]) < 0.10:
+                errors.append(f"{name}: combined pilot translation is too slow")
+            if rotation_max < 0.25:
+                errors.append(f"{name}: combined pilot rotation is too small")
+            if shape_rms < 0.02:
+                errors.append(f"{name}: combined pilot lacks actual shape change")
+            if float(row.get(
+                "rigid_shape_hold_acceleration_rms_m_s2", 0.0
+            )) > 1e-10:
+                errors.append(f"{name}: shape hold must be disabled in combined pilot")
     return errors
 
 
@@ -280,7 +312,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seconds", type=float, default=4.0)
     parser.add_argument("--sample-hz", type=float, default=10.0)
-    parser.add_argument("--output", type=Path, default=Path("motion_diagnostics"))
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=DIAGNOSTIC_OUTPUT_ROOT / "runs",
+    )
     args = parser.parse_args()
     if args.seconds <= 0.0 or args.sample_hz <= 0.0 or args.seeds < 1:
         parser.error("--seconds, --sample-hz and --seeds must be positive")

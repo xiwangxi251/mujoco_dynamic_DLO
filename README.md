@@ -286,7 +286,7 @@ CSV同时记录公共任务成功、PPO内部严格成功、场景指纹、动�
 不是简单看小样本点估计。
 
 现有PPO checkpoint只对应旧`legacy_v1`形变场。正式矩阵使用严格去除shape净力/净力矩的
-`factorized_v1`，必须从头覆盖ID场景训练：
+`factorized_v2`（随机弯曲初态），必须从头覆盖ID场景训练：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `

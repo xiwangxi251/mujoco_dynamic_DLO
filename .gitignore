@@ -5,4 +5,4 @@ rl/runs/
 headless_videos/
 rl_test_videos*/
 benchmark_runs/
-
+/artifacts/motion_diagnostics/

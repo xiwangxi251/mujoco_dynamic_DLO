@@ -512,6 +512,48 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `
 并完整报告所有互斥失败类型。真机环境的XY台/转台、局部形变驱动、同步相机和力传感规划见
 `EXPERIMENT_PROTOCOL.md`第7节。
 
+### 14.6 2026-08-16 L1/L2整体运动pilot
+
+- 独立`pilot` suite保留6个候选：L1从`y=-0.25 m`到`+0.25 m`单程匀速直线运动；L2使用
+  同起终点、同平均目标速度的单段三次Bézier曲线。各有low/nominal/high，约
+  `0.167/0.25/0.375 m/s`，不折返、不循环。
+- 2026-08-17将profile升级为`rigid_level{1,2}_single_pass_v2`：每轮直接通过球关节生成C/S/低频
+  样条型随机弯曲初始构型，保持相邻节点长度；平移期间同时绕质心完成seed决定方向的`±24°`
+  有限旋转。相同seed的L1/L2逐节点初始构型、目标段和旋转方向完全配对；reset预检完整SE(2)
+  扫掠范围并只收紧X起点，避免线缆出桌。
+- 整体运动pilot在0.8 s settle后开始，首次夹爪物理接触后释放平移、旋转和构型保持力；正确原因
+  是防止接触后环境驱动力继续改变线缆形状、污染固定形状条件，不是为了避免滑脱。普通`shape`
+  及`combined`场景接触后仍继续施加局部形变；到终点仍未接触才失败。
+- 旋转阻尼使用所有节点的世界速度计算质心速度和角速度，不能直接使用free joint局部角速度；后者
+  曾在特定C形seed产生符号错误和正反馈。16项场景单测已通过。标称档6个配对seed诊断归档在
+  `artifacts/motion_diagnostics/rigid_l1_l2_curved_se2_v2/run_20260817_101105/`：L1/L2速度RMS均值
+  `0.203/0.202 m/s`，最大转角均值`23.80°/23.81°`，形状RMS最坏值`0.643/0.621 mm`，
+  单帧最大残差最坏值`0.980/0.940 mm`，边界修正均为0，语义检查通过。
+- 旧直线、无旋转的视频和3/5对2/5抓取结果均已失效，不得用于选择L1/L2。v2只完成1个同seed
+  端到端smoke，L1/L2都成功，视频分别位于`headless_videos/run_20260817_101202_seed20260804/`
+  和`headless_videos/run_20260817_101234_seed20260804/`；该样本不能用于选择。pilot仍不进入
+  `paper`，最终整体运动只会从L1/L2中冻结一种，正式研究重点仍是独立的形状变化实验。
+
+### 14.7 2026-08-17 combined与随机弯曲初态同步
+
+- 注册场景默认profile升级为`factorized_v2`：`static / rigid / shape / combined`全部从按seed生成的
+  C形、S形或低频样条型随机弯曲构型开始；相同seed逐节点初始形状配对。`legacy_v1`以及仅为读取
+  旧manifest保留的`factorized_v1`仍是直线，旧checkpoint兼容入口没有被暗中改变。
+- `pilot`从6个扩为12个：除`pilot_rigid_l1/l2_{low,nominal,high}`外，新增
+  `pilot_combined_l1/l2_{low,nominal,high}`。combined直接使用相同L1/L2平移和`±24°`旋转，逐物理
+  步叠加去净力、去净力矩的shape分量，不使用会抵消形变的构型保持力。
+- 首次夹爪—线缆物理接触后，combined只撤掉整体平移和旋转；shape分量继续施加。rigid场景则
+  同时撤掉其专用构型保持力。17项单元测试覆盖随机曲线配对、节点长度、combined叠加、接触后
+  分量开关和rigid构型保持的零净力/零净转矩。
+- 标称combined的3个配对seed诊断归档在
+  `artifacts/motion_diagnostics/combined_l1_l2_curved_v2/run_20260817_110122/`，力场分解与运动语义检查均
+  通过：L1/L2质心速度RMS约`0.207–0.216 m/s`，shape残差RMS约`0.165–0.218 m`，构型保持
+  加速度严格为0，边界修正为0。combined发生大形变后，Kabsch“整体转角”会混入形变造成的主轴
+  改变，不能把该数值直接当作L1/L2命令转角；命令本身仍是配对的`±24°`。
+- L1/L2尚未冻结，所以新增combined仍属于dev pilot。旧`id_combined_*`的有界准周期整体轨迹只
+  保留作历史矩阵兼容，不能作为最终combined定义；选定L1或L2后必须用胜出轨迹替换正式combined
+  场景并更新scenario ID，再进行训练或论文统计。
+
 ## 15. 给新会话的建议开场提示
 
 可以把下面内容与本文档一起发给新会话：

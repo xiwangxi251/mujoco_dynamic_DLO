@@ -59,6 +59,7 @@ class ScenarioSuite(str, Enum):
 
     CORE = "core"
     MOTION_SWEEP = "motion_sweep"
+    PILOT = "pilot"
     OOD = "ood"
     PAPER = "paper"
     ALL = "all"
@@ -124,7 +125,7 @@ class ScenarioConfig:
     amplitude_level: FactorLevel = FactorLevel.NOMINAL
     frequency_level: FactorLevel = FactorLevel.NOMINAL
     regularity: MotionRegularity = MotionRegularity.QUASIPERIODIC
-    motion_profile_version: str = "factorized_v1"
+    motion_profile_version: str = "factorized_v2"
     disturbance_strength: float = 1.50
     frequency_scale: float = 1.0
 
@@ -164,10 +165,23 @@ class ScenarioConfig:
             )
         if not isinstance(self.description, str):
             raise TypeError("description must be a string")
-        if self.motion_profile_version != "factorized_v1":
+        allowed_profiles = {
+            "factorized_v1",
+            "factorized_v2",
+            "rigid_level1_single_pass_v2",
+            "rigid_level2_single_pass_v2",
+        }
+        if self.motion_profile_version not in allowed_profiles:
             raise ValueError(
-                "registered experiment scenarios require motion_profile_version="
-                "'factorized_v1'"
+                "unsupported registered motion_profile_version: "
+                f"{self.motion_profile_version!r}"
+            )
+        if self.motion_profile_version not in {"factorized_v1", "factorized_v2"} and (
+            self.motion_type not in {MotionType.RIGID, MotionType.COMBINED}
+            or self.split is not ScenarioSplit.DEV
+        ):
+            raise ValueError(
+                "Level-1/Level-2 trajectories are DEV rigid/combined pilots only"
             )
         if not isinstance(self.cable_material_profile, str) or not _NAME_PATTERN.fullmatch(
             self.cable_material_profile
@@ -486,6 +500,70 @@ def _registered_scenarios() -> list[ScenarioConfig]:
             ))
 
     scenarios.extend([
+        *[
+            _scenario(
+                f"pilot_rigid_l1_{level.value}",
+                ScenarioSplit.DEV,
+                MotionType.RIGID,
+                frequency=level,
+                motion_profile_version="rigid_level1_single_pass_v2",
+                description=(
+                    "Fixed random-curved-shape Level-1 pilot: one-way "
+                    "constant-speed straight translation plus finite rotation "
+                    f"at {level.value} speed."
+                ),
+                tags=("pilot", "rigid_level1"),
+            )
+            for level in FactorLevel
+        ],
+        *[
+            _scenario(
+                f"pilot_rigid_l2_{level.value}",
+                ScenarioSplit.DEV,
+                MotionType.RIGID,
+                frequency=level,
+                motion_profile_version="rigid_level2_single_pass_v2",
+                description=(
+                    "Fixed random-curved-shape Level-2 pilot: one-way cubic "
+                    "Bezier translation plus finite rotation "
+                    f"at {level.value} speed."
+                ),
+                tags=("pilot", "rigid_level2"),
+            )
+            for level in FactorLevel
+        ],
+        *[
+            _scenario(
+                f"pilot_combined_l1_{level.value}",
+                ScenarioSplit.DEV,
+                MotionType.COMBINED,
+                frequency=level,
+                motion_profile_version="rigid_level1_single_pass_v2",
+                description=(
+                    "Random-curved-shape Level-1 combined pilot: factorized "
+                    "shape deformation overlaid on one-way straight "
+                    f"translation and finite rotation at {level.value} speed."
+                ),
+                tags=("pilot", "combined_level1"),
+            )
+            for level in FactorLevel
+        ],
+        *[
+            _scenario(
+                f"pilot_combined_l2_{level.value}",
+                ScenarioSplit.DEV,
+                MotionType.COMBINED,
+                frequency=level,
+                motion_profile_version="rigid_level2_single_pass_v2",
+                description=(
+                    "Random-curved-shape Level-2 combined pilot: factorized "
+                    "shape deformation overlaid on one-way cubic Bezier "
+                    f"translation and finite rotation at {level.value} speed."
+                ),
+                tags=("pilot", "combined_level2"),
+            )
+            for level in FactorLevel
+        ],
         _scenario(
             "dev_combined_amplitude_low", ScenarioSplit.DEV, MotionType.COMBINED,
             amplitude=FactorLevel.LOW,
@@ -618,23 +696,34 @@ def list_suite_scenarios(
 ) -> tuple[ScenarioConfig, ...]:
     """Return a deterministic named experiment suite.
 
-    ``core``, ``motion_sweep`` and ``ood`` are disjoint.  ``paper`` and
-    ``all`` both return their union; the two names let paper scripts state
-    intent without giving up the conventional ``all`` CLI spelling.
+    ``core``, ``motion_sweep``, ``pilot`` and ``ood`` are disjoint. ``paper``
+    excludes pilot-only model-selection scenes, while ``all`` returns every
+    registered scenario.
     """
     selected = parse_scenario_suite(suite)
     core_names = set(CORE_SCENARIO_NAMES)
     if selected is ScenarioSuite.CORE:
         names = core_names
+    elif selected is ScenarioSuite.PILOT:
+        names = {
+            scenario.name for scenario in registry.list()
+            if "pilot" in scenario.tags
+        }
     elif selected is ScenarioSuite.MOTION_SWEEP:
         names = {
             scenario.name
             for scenario in registry.list()
             if scenario.split is not ScenarioSplit.OOD
             and scenario.name not in core_names
+            and "pilot" not in scenario.tags
         }
     elif selected is ScenarioSuite.OOD:
         names = set(registry.names(ScenarioSplit.OOD))
+    elif selected is ScenarioSuite.PAPER:
+        names = {
+            scenario.name for scenario in registry.list()
+            if "pilot" not in scenario.tags
+        }
     else:
         names = set(registry)
     missing = names - set(registry)
@@ -691,15 +780,19 @@ def validate_registry(registry: ScenarioRegistry = SCENARIO_REGISTRY) -> None:
 
     core = set(list_suite_names(ScenarioSuite.CORE, registry))
     sweep = set(list_suite_names(ScenarioSuite.MOTION_SWEEP, registry))
+    pilot = set(list_suite_names(ScenarioSuite.PILOT, registry))
     ood = set(list_suite_names(ScenarioSuite.OOD, registry))
     if core != set(CORE_SCENARIO_NAMES):
         raise ValueError("core suite does not match CORE_SCENARIO_NAMES")
-    if core & sweep or core & ood or sweep & ood:
-        raise ValueError("core, motion_sweep and OOD suites must be disjoint")
-    if core | sweep | ood != set(registry):
+    suites = (core, sweep, pilot, ood)
+    if any(left & right for index, left in enumerate(suites) for right in suites[index + 1:]):
+        raise ValueError("core, motion_sweep, pilot and OOD suites must be disjoint")
+    if core | sweep | pilot | ood != set(registry):
         raise ValueError("named suites do not cover the complete registry")
-    if set(list_suite_names(ScenarioSuite.PAPER, registry)) != set(registry):
-        raise ValueError("paper suite must cover the complete registry")
+    if set(list_suite_names(ScenarioSuite.PAPER, registry)) != core | sweep | ood:
+        raise ValueError("paper suite must exclude pilot and cover formal scenarios")
+    if set(list_suite_names(ScenarioSuite.ALL, registry)) != set(registry):
+        raise ValueError("all suite must cover the complete registry")
 
 
 def _self_test() -> None:
