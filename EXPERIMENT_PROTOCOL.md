@@ -22,29 +22,30 @@
 直线初态。初始曲线随机性与后续shape动态形变是两个独立因子，不能把“初始是弯的”记为发生了
 形状变化。
 
-### 1.2 L1/L2整体运动pilot（不进入正式paper suite）
+### 1.2 ID中的L1/L2整体运动
 
 每个episode的随机曲线保持所有相邻节点间距不变，并把实际初始节点构型记为本轮模板。
-`pilot_rigid_l1_{low,nominal,high}`从`y=-0.25 m`沿直线单程
-匀速运动到`y=+0.25 m`；`pilot_rigid_l2_{low,nominal,high}`使用相同起终点，沿单段三次
+`id_rigid_l1_{low,nominal,high}`从`y=-0.70 m`沿直线单程
+匀速运动到`y=+0.70 m`；`id_rigid_l2_{low,nominal,high}`使用相同起终点，沿单段三次
 Bézier S形曲线运动，并按曲线弧长设置持续时间，使平均目标速度与L1相同。两者同时绕质心完成
 seed决定方向的`±24°`有限旋转；相同seed的L1/L2共享逐节点完全相同的初始曲线、目标段和旋转
-方向。`pilot_combined_l1_{low,nominal,high}`和`pilot_combined_l2_{low,nominal,high}`分别在
+方向。`id_combined_l1_{low,nominal,high}`和`id_combined_l2_{low,nominal,high}`分别在
 完全相同的L1/L2平移、旋转上直接叠加shape力场；combined中禁止启用固定构型保持力，否则会
 抵消要研究的动态形变。运动在`SETTLE=0.8 s`后开始，low/nominal/high目标速度约为
 `0.167/0.25/0.375 m/s`，轨迹不折返、不循环。
 
-L1/L2的平移、旋转和rigid专用构型保持力只在首次夹爪—线缆物理接触前施加；接触后立即释放，
+L1/L2的平移、旋转和rigid专用构型保持力只在稳定双指抓取确认前施加；确认后立即释放，
 原因是防止环境驱动力继续作用并改变线缆形状，从而破坏“固定形状整体运动”的实验定义，而不是
 为了消除或掩盖真实滑脱。`shape`和`combined`实验的局部形变指令不采用此释放条件，接触后仍
 继续施加。因此combined接触后的总环境指令严格只剩shape分量。到达单程终点仍从未接触则本轮失败。
 
-旧的直线、无旋转pilot结果已经失效，不能与新版混用。当前profile版本为
+旧的有界准周期整体平移/旋转实现已经删除，原`id_rigid_*`、`id_combined_*`和`pilot_*`名称均不再
+注册，不能与新版混用。当前profile版本为
 `rigid_level{1,2}_single_pass_v2`。标称档6个配对seed的无策略诊断中，L1/L2实际RMS速度均值为
 `0.203/0.202 m/s`（含0.8 s静止），最大转角均值为`23.80°/23.81°`；形状RMS的最坏值为
 `0.643/0.621 mm`，单帧最大残差的最坏值为`0.980/0.940 mm`，所有seed的边界修正力均为0。
-诊断只验证运动语义，进入L1/L2选择前仍须重新做配对端到端抓取。12个候选场景只属于`pilot`
-suite，不进入`paper`，最终整体运动只从L1/L2中冻结一种。
+诊断只验证运动语义，进入L1/L2选择前仍须重新做配对端到端抓取。12个候选场景现在是显式ID
+条件并进入`paper`；完成选择后，最终协议仍只从L1/L2中冻结一种，并删除另一组条件。
 
 兼容场景`id_shape_nominal_current`复现旧环境的准周期、去均值形变力场，`disturbance_strength=1.5`。它用于旧代码和checkpoint回归，不代表完整实验矩阵。
 
@@ -72,15 +73,15 @@ suite，不进入`paper`，最终整体运动只从L1/L2中冻结一种。
 
 长度OOD直接改变编译前的线缆节段长度：
 
-- `ood_length_short`：0.80倍，即0.64 m；
-- `ood_length_long`：1.20倍，即0.96 m。
+- `ood_combined_l{1,2}_length_short`：0.80倍，即0.64 m；
+- `ood_combined_l{1,2}_length_long`：1.20倍，即0.96 m。
 
 材质OOD直接改变编译前的密度、弯曲/扭转刚度、关节阻尼和三类接触摩擦：
 
 | 场景 | 密度 | 弯曲/扭转刚度 | 阻尼 | 摩擦 |
 | --- | ---: | ---: | ---: | ---: |
-| `ood_material_soft` | 0.80倍 | 0.50倍 | 0.72倍 | 0.70倍 |
-| `ood_material_stiff` | 1.20倍 | 2.00倍 | 1.60倍 | 1.30倍 |
+| `ood_combined_l{1,2}_material_soft` | 0.80倍 | 0.50倍 | 0.72倍 | 0.70倍 |
+| `ood_combined_l{1,2}_material_stiff` | 1.20倍 | 2.00倍 | 1.60倍 | 1.30倍 |
 
 这些必须是通过MjSpec进入编译模型、质量矩阵、弹性插件和接触参数的真实变化，不是只写入CSV的标签。每种配置都应保存实际编译的MJB及参数哈希。真机实验应测量所用线缆的长度、直径、线密度、准静态弯曲响应和表面摩擦代理量，并按实测值建立映射，而不是仅用“软/硬”名称对齐。
 
@@ -90,16 +91,15 @@ suite，不进入`paper`，最终整体运动只从L1/L2中冻结一种。
 - `dev`：只用于环境校准、超参数与checkpoint选择。开发集结果不能作为最终泛化结论。
 - `OOD`：训练和模型选择期间完全不可见，包括带限随机运动、高幅高频组合、长度变化和材质变化。
 
-`experiment_scenarios.py`为每个场景生成稳定的`scenario_id`与完整哈希，并提供四组实验套件：
+`experiment_scenarios.py`为每个场景生成稳定的`scenario_id`与完整哈希，并提供五组实验套件：
 
 | suite | 内容 | 用途 |
 | --- | --- | --- |
-| `core` | `static`、标称`rigid`、兼容标称`shape`、标称`combined`，共4个场景 | 最小端到端回归、pilot和真机核心集 |
-| `motion_sweep` | 除core与OOD外的ID难度网格及dev单因子扫描，共11个场景 | 幅度、频率、规律性和运动类型分析 |
-| `pilot` | rigid与combined各含L1/L2三个速度档，共12个场景 | 选择最终唯一的整体运动轨迹并验证直接叠加 |
-| `ood` | 随机高动态、短/长线缆、软/硬材质，共5个场景 | 冻结模型后的泛化测试 |
-| `paper` | `core + motion_sweep + ood`，共20个场景 | 正式论文全量仿真，不含pilot |
-| `all` | 正式20个场景加12个pilot，共32个 | 全部注册场景，仅用于开发检查 |
+| `core` | `static`、兼容标称`shape`及L1/L2标称`rigid/combined`，共6个场景 | 最小端到端回归和真机核心集 |
+| `motion_sweep` | 除core与OOD外的ID难度网格及dev纯形变单因子扫描，共15个场景 | 幅度、频率、规律性和运动类型分析 |
+| `ood` | L1/L2配对的随机高动态、短/长线缆、软/硬材质，共10个场景 | 冻结模型后的泛化测试 |
+| `paper` | `core + motion_sweep + ood`，共31个场景 | 当前正式论文全量仿真；冻结轨迹后再缩减 |
+| `all` | 与当前`paper`相同，共31个场景 | 全部注册场景，用于开发检查 |
 
 正式表格必须保留`split`、`scenario_name`和`scenario_id`三列。不能把所有场景直接合并成一个平均成功率而不报告分层结果。
 

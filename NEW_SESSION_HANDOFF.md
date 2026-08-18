@@ -554,6 +554,19 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `
   保留作历史矩阵兼容，不能作为最终combined定义；选定L1或L2后必须用胜出轨迹替换正式combined
   场景并更新scenario ID，再进行训练或论文统计。
 
+### 14.8 2026-08-18 L1/L2迁入正式ID
+
+- 删除旧的有界准周期整体平移/旋转执行路径；`rigid`和`combined`现在必须显式选择
+  `rigid_level1_single_pass_v2`或`rigid_level2_single_pass_v2`，不再允许回退到`factorized_v2`
+  整体轨迹。`factorized_v2`只继续承担shape生成和随机弯曲初态。
+- 原12个DEV `pilot_*`场景迁为ID：`id_rigid_l{1,2}_{low,nominal,high}`与
+  `id_combined_l{1,2}_{low,nominal,high}`。旧`id_rigid_{level}`、`id_combined_{level}`和
+  `pilot_*`名称均不再注册。
+- DEV改为5个纯shape单因子校准场景；OOD在冻结最终轨迹前显式保留L1/L2配对名称，禁止暗中
+  选取某一轨迹。冻结L1或L2后，应删除另一组ID/OOD场景并重新冻结scenario ID。
+- 环境内部及info/manifest字段从`rigid_pilot_*`改名为`rigid_motion_*`。确认双指稳定抓取后撤除
+  整体驱动的规则保持不变；combined的shape驱动继续。32项单元测试通过。
+
 ## 15. 给新会话的建议开场提示
 
 可以把下面内容与本文档一起发给新会话：

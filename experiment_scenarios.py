@@ -59,7 +59,6 @@ class ScenarioSuite(str, Enum):
 
     CORE = "core"
     MOTION_SWEEP = "motion_sweep"
-    PILOT = "pilot"
     OOD = "ood"
     PAPER = "paper"
     ALL = "all"
@@ -176,12 +175,19 @@ class ScenarioConfig:
                 "unsupported registered motion_profile_version: "
                 f"{self.motion_profile_version!r}"
             )
-        if self.motion_profile_version not in {"factorized_v1", "factorized_v2"} and (
-            self.motion_type not in {MotionType.RIGID, MotionType.COMBINED}
-            or self.split is not ScenarioSplit.DEV
+        uses_rigid_trajectory = self.motion_profile_version.startswith("rigid_level")
+        if uses_rigid_trajectory and self.motion_type not in {
+            MotionType.RIGID, MotionType.COMBINED,
+        }:
+            raise ValueError(
+                "Level-1/Level-2 trajectories require rigid or combined motion"
+            )
+        if (
+            self.motion_type in {MotionType.RIGID, MotionType.COMBINED}
+            and not uses_rigid_trajectory
         ):
             raise ValueError(
-                "Level-1/Level-2 trajectories are DEV rigid/combined pilots only"
+                "rigid and combined scenarios must explicitly select Level-1 or Level-2"
             )
         if not isinstance(self.cable_material_profile, str) or not _NAME_PATTERN.fullmatch(
             self.cable_material_profile
@@ -476,169 +482,151 @@ def _registered_scenarios() -> list[ScenarioConfig]:
         )
     ]
 
-    # Main ID grid: the three difficulty levels jointly scale amplitude and
-    # frequency; dev scenes below isolate the two factors.
-    for motion_type in (MotionType.RIGID, MotionType.SHAPE, MotionType.COMBINED):
-        for level in FactorLevel:
-            if motion_type is MotionType.SHAPE and level is FactorLevel.NOMINAL:
-                name = "id_shape_nominal_current"
-                description = (
-                    "Current EnvConfig compatibility scene: mean-removed shape motion, "
-                    "quasiperiodic, disturbance_strength=1.5."
-                )
-            else:
-                name = f"id_{motion_type.value}_{level.value}"
-                description = f"{motion_type.value} ID scene at {level.value} difficulty."
-            scenarios.append(_scenario(
-                name,
-                ScenarioSplit.ID,
-                motion_type,
-                amplitude=level,
-                frequency=level,
-                description=description,
-                tags=("main_grid",),
-            ))
+    for level in FactorLevel:
+        shape_name = (
+            "id_shape_nominal_current"
+            if level is FactorLevel.NOMINAL
+            else f"id_shape_{level.value}"
+        )
+        scenarios.append(_scenario(
+            shape_name,
+            ScenarioSplit.ID,
+            MotionType.SHAPE,
+            amplitude=level,
+            frequency=level,
+            description=(
+                "Mean-removed quasiperiodic shape motion at "
+                f"{level.value} difficulty."
+            ),
+            tags=("main_grid", "shape"),
+        ))
+
+    # L1/L2 are formal ID factors.  Every rigid component is explicit in the
+    # scenario name; no registered scenario can fall back to the removed
+    # bounded quasiperiodic whole-object trajectory.
+    for trajectory, profile in (
+        ("l1", "rigid_level1_single_pass_v2"),
+        ("l2", "rigid_level2_single_pass_v2"),
+    ):
+        for motion_type in (MotionType.RIGID, MotionType.COMBINED):
+            for level in FactorLevel:
+                scenarios.append(_scenario(
+                    f"id_{motion_type.value}_{trajectory}_{level.value}",
+                    ScenarioSplit.ID,
+                    motion_type,
+                    amplitude=level,
+                    frequency=level,
+                    motion_profile_version=profile,
+                    description=(
+                        f"{motion_type.value} ID scene with one-way "
+                        f"{trajectory.upper()} translation and finite rotation "
+                        f"at {level.value} speed."
+                    ),
+                    tags=("main_grid", f"rigid_{trajectory}"),
+                ))
 
     scenarios.extend([
-        *[
-            _scenario(
-                f"pilot_rigid_l1_{level.value}",
-                ScenarioSplit.DEV,
-                MotionType.RIGID,
-                frequency=level,
-                motion_profile_version="rigid_level1_single_pass_v2",
-                description=(
-                    "Fixed random-curved-shape Level-1 pilot: one-way "
-                    "constant-speed straight translation plus finite rotation "
-                    f"at {level.value} speed."
-                ),
-                tags=("pilot", "rigid_level1"),
-            )
-            for level in FactorLevel
-        ],
-        *[
-            _scenario(
-                f"pilot_rigid_l2_{level.value}",
-                ScenarioSplit.DEV,
-                MotionType.RIGID,
-                frequency=level,
-                motion_profile_version="rigid_level2_single_pass_v2",
-                description=(
-                    "Fixed random-curved-shape Level-2 pilot: one-way cubic "
-                    "Bezier translation plus finite rotation "
-                    f"at {level.value} speed."
-                ),
-                tags=("pilot", "rigid_level2"),
-            )
-            for level in FactorLevel
-        ],
-        *[
-            _scenario(
-                f"pilot_combined_l1_{level.value}",
-                ScenarioSplit.DEV,
-                MotionType.COMBINED,
-                frequency=level,
-                motion_profile_version="rigid_level1_single_pass_v2",
-                description=(
-                    "Random-curved-shape Level-1 combined pilot: factorized "
-                    "shape deformation overlaid on one-way straight "
-                    f"translation and finite rotation at {level.value} speed."
-                ),
-                tags=("pilot", "combined_level1"),
-            )
-            for level in FactorLevel
-        ],
-        *[
-            _scenario(
-                f"pilot_combined_l2_{level.value}",
-                ScenarioSplit.DEV,
-                MotionType.COMBINED,
-                frequency=level,
-                motion_profile_version="rigid_level2_single_pass_v2",
-                description=(
-                    "Random-curved-shape Level-2 combined pilot: factorized "
-                    "shape deformation overlaid on one-way cubic Bezier "
-                    f"translation and finite rotation at {level.value} speed."
-                ),
-                tags=("pilot", "combined_level2"),
-            )
-            for level in FactorLevel
-        ],
         _scenario(
-            "dev_combined_amplitude_low", ScenarioSplit.DEV, MotionType.COMBINED,
+            "dev_shape_amplitude_low", ScenarioSplit.DEV, MotionType.SHAPE,
             amplitude=FactorLevel.LOW,
-            description="Low-amplitude single-factor development scene.",
+            description="Low-amplitude shape-only development scene.",
             tags=("amplitude_sweep",),
         ),
         _scenario(
-            "dev_combined_amplitude_high", ScenarioSplit.DEV, MotionType.COMBINED,
+            "dev_shape_amplitude_high", ScenarioSplit.DEV, MotionType.SHAPE,
             amplitude=FactorLevel.HIGH,
-            description="High-amplitude single-factor development scene.",
+            description="High-amplitude shape-only development scene.",
             tags=("amplitude_sweep",),
         ),
         _scenario(
-            "dev_combined_frequency_low", ScenarioSplit.DEV, MotionType.COMBINED,
+            "dev_shape_frequency_low", ScenarioSplit.DEV, MotionType.SHAPE,
             frequency=FactorLevel.LOW,
-            description="Low-frequency single-factor development scene.",
+            description="Low-frequency shape-only development scene.",
             tags=("frequency_sweep",),
         ),
         _scenario(
-            "dev_combined_frequency_high", ScenarioSplit.DEV, MotionType.COMBINED,
+            "dev_shape_frequency_high", ScenarioSplit.DEV, MotionType.SHAPE,
             frequency=FactorLevel.HIGH,
-            description="High-frequency single-factor development scene.",
+            description="High-frequency shape-only development scene.",
             tags=("frequency_sweep",),
         ),
         _scenario(
-            "dev_combined_regular", ScenarioSplit.DEV, MotionType.COMBINED,
+            "dev_shape_regular", ScenarioSplit.DEV, MotionType.SHAPE,
             regularity=MotionRegularity.REGULAR,
-            description="Regular combined-motion development scene.",
+            description="Regular shape-only development scene.",
             tags=("regularity_sweep",),
         ),
-        _scenario(
-            "ood_dynamics_high_stochastic", ScenarioSplit.OOD, MotionType.COMBINED,
-            amplitude=FactorLevel.HIGH,
-            frequency=FactorLevel.HIGH,
-            regularity=MotionRegularity.STOCHASTIC,
-            description="Held-out compound dynamics stress test.",
-            tags=("dynamics_ood",),
-        ),
-        _scenario(
-            "ood_length_short", ScenarioSplit.OOD, MotionType.COMBINED,
-            cable_length_scale=0.80,
-            cable_length_ood=True,
-            description="Held-out 20 percent shorter cable.",
-            tags=("length_ood",),
-        ),
-        _scenario(
-            "ood_length_long", ScenarioSplit.OOD, MotionType.COMBINED,
-            cable_length_scale=1.20,
-            cable_length_ood=True,
-            description="Held-out 20 percent longer cable.",
-            tags=("length_ood",),
-        ),
-        _scenario(
-            "ood_material_soft", ScenarioSplit.OOD, MotionType.COMBINED,
-            cable_material_profile="soft",
-            cable_material_ood=True,
-            cable_density_scale=0.80,
-            cable_stiffness_scale=0.50,
-            cable_damping_scale=0.72,
-            cable_friction_scale=0.70,
-            description="Held-out softer, lighter and lower-friction cable.",
-            tags=("material_ood",),
-        ),
-        _scenario(
-            "ood_material_stiff", ScenarioSplit.OOD, MotionType.COMBINED,
-            cable_material_profile="stiff",
-            cable_material_ood=True,
-            cable_density_scale=1.20,
-            cable_stiffness_scale=2.00,
-            cable_damping_scale=1.60,
-            cable_friction_scale=1.30,
-            description="Held-out stiffer, heavier and higher-friction cable.",
-            tags=("material_ood",),
-        ),
     ])
+
+    # Until L1/L2 selection is frozen, OOD variants remain paired.  The
+    # trajectory is encoded in every name instead of silently choosing one.
+    for trajectory, profile in (
+        ("l1", "rigid_level1_single_pass_v2"),
+        ("l2", "rigid_level2_single_pass_v2"),
+    ):
+        prefix = f"ood_combined_{trajectory}"
+        common = dict(
+            split=ScenarioSplit.OOD,
+            motion_type=MotionType.COMBINED,
+            motion_profile_version=profile,
+        )
+        scenarios.extend([
+            _scenario(
+                f"{prefix}_dynamics_high_stochastic",
+                amplitude=FactorLevel.HIGH,
+                frequency=FactorLevel.HIGH,
+                regularity=MotionRegularity.STOCHASTIC,
+                description=(
+                    f"Held-out compound dynamics stress test with {trajectory.upper()}."
+                ),
+                tags=("dynamics_ood", f"rigid_{trajectory}"),
+                **common,
+            ),
+            _scenario(
+                f"{prefix}_length_short",
+                cable_length_scale=0.80,
+                cable_length_ood=True,
+                description=f"Held-out 20 percent shorter cable with {trajectory.upper()}.",
+                tags=("length_ood", f"rigid_{trajectory}"),
+                **common,
+            ),
+            _scenario(
+                f"{prefix}_length_long",
+                cable_length_scale=1.20,
+                cable_length_ood=True,
+                description=f"Held-out 20 percent longer cable with {trajectory.upper()}.",
+                tags=("length_ood", f"rigid_{trajectory}"),
+                **common,
+            ),
+            _scenario(
+                f"{prefix}_material_soft",
+                cable_material_profile="soft",
+                cable_material_ood=True,
+                cable_density_scale=0.80,
+                cable_stiffness_scale=0.50,
+                cable_damping_scale=0.72,
+                cable_friction_scale=0.70,
+                description=(
+                    f"Held-out softer, lighter and lower-friction cable with {trajectory.upper()}."
+                ),
+                tags=("material_ood", f"rigid_{trajectory}"),
+                **common,
+            ),
+            _scenario(
+                f"{prefix}_material_stiff",
+                cable_material_profile="stiff",
+                cable_material_ood=True,
+                cable_density_scale=1.20,
+                cable_stiffness_scale=2.00,
+                cable_damping_scale=1.60,
+                cable_friction_scale=1.30,
+                description=(
+                    f"Held-out stiffer, heavier and higher-friction cable with {trajectory.upper()}."
+                ),
+                tags=("material_ood", f"rigid_{trajectory}"),
+                **common,
+            ),
+        ])
     return scenarios
 
 
@@ -649,9 +637,11 @@ DEFAULT_SCENARIO = SCENARIO_REGISTRY[DEFAULT_SCENARIO_NAME]
 
 CORE_SCENARIO_NAMES = (
     "id_static",
-    "id_rigid_nominal",
     "id_shape_nominal_current",
-    "id_combined_nominal",
+    "id_rigid_l1_nominal",
+    "id_rigid_l2_nominal",
+    "id_combined_l1_nominal",
+    "id_combined_l2_nominal",
 )
 SCENARIO_SUITE_NAMES = tuple(suite.value for suite in ScenarioSuite)
 
@@ -696,34 +686,24 @@ def list_suite_scenarios(
 ) -> tuple[ScenarioConfig, ...]:
     """Return a deterministic named experiment suite.
 
-    ``core``, ``motion_sweep``, ``pilot`` and ``ood`` are disjoint. ``paper``
-    excludes pilot-only model-selection scenes, while ``all`` returns every
-    registered scenario.
+    ``core``, ``motion_sweep`` and ``ood`` are disjoint. ``paper`` and ``all``
+    both return the full registry now that L1/L2 are explicit ID factors.
     """
     selected = parse_scenario_suite(suite)
     core_names = set(CORE_SCENARIO_NAMES)
     if selected is ScenarioSuite.CORE:
         names = core_names
-    elif selected is ScenarioSuite.PILOT:
-        names = {
-            scenario.name for scenario in registry.list()
-            if "pilot" in scenario.tags
-        }
     elif selected is ScenarioSuite.MOTION_SWEEP:
         names = {
             scenario.name
             for scenario in registry.list()
             if scenario.split is not ScenarioSplit.OOD
             and scenario.name not in core_names
-            and "pilot" not in scenario.tags
         }
     elif selected is ScenarioSuite.OOD:
         names = set(registry.names(ScenarioSplit.OOD))
     elif selected is ScenarioSuite.PAPER:
-        names = {
-            scenario.name for scenario in registry.list()
-            if "pilot" not in scenario.tags
-        }
+        names = set(registry)
     else:
         names = set(registry)
     missing = names - set(registry)
@@ -780,17 +760,16 @@ def validate_registry(registry: ScenarioRegistry = SCENARIO_REGISTRY) -> None:
 
     core = set(list_suite_names(ScenarioSuite.CORE, registry))
     sweep = set(list_suite_names(ScenarioSuite.MOTION_SWEEP, registry))
-    pilot = set(list_suite_names(ScenarioSuite.PILOT, registry))
     ood = set(list_suite_names(ScenarioSuite.OOD, registry))
     if core != set(CORE_SCENARIO_NAMES):
         raise ValueError("core suite does not match CORE_SCENARIO_NAMES")
-    suites = (core, sweep, pilot, ood)
+    suites = (core, sweep, ood)
     if any(left & right for index, left in enumerate(suites) for right in suites[index + 1:]):
-        raise ValueError("core, motion_sweep, pilot and OOD suites must be disjoint")
-    if core | sweep | pilot | ood != set(registry):
+        raise ValueError("core, motion_sweep and OOD suites must be disjoint")
+    if core | sweep | ood != set(registry):
         raise ValueError("named suites do not cover the complete registry")
     if set(list_suite_names(ScenarioSuite.PAPER, registry)) != core | sweep | ood:
-        raise ValueError("paper suite must exclude pilot and cover formal scenarios")
+        raise ValueError("paper suite must cover all formal scenarios")
     if set(list_suite_names(ScenarioSuite.ALL, registry)) != set(registry):
         raise ValueError("all suite must cover the complete registry")
 

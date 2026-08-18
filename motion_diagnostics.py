@@ -244,7 +244,7 @@ def validate_force_decomposition(rows: list[dict[str, Any]]) -> list[str]:
 
 
 def validate_core_motion_semantics(rows: list[dict[str, Any]]) -> list[str]:
-    """用保守pilot阈值检查core场景的实际响应，而不只检查施力标签。"""
+    """用保守阈值检查正式L1/L2场景的实际响应，而不只检查施力标签。"""
 
     errors: list[str] = []
     for row in rows:
@@ -252,40 +252,31 @@ def validate_core_motion_semantics(rows: list[dict[str, Any]]) -> list[str]:
         com_max = float(row["com_displacement_max_m"])
         rotation_max = float(row["rigid_rotation_max_rad"])
         shape_rms = float(row["shape_change_rms_m"])
+        motion_type = str(row["motion_type"])
         if name == "id_static":
             if com_max >= 0.002 or rotation_max >= 0.02 or shape_rms >= 0.002:
                 errors.append(f"{name}: actual motion exceeds static tolerance")
-        elif name == "id_rigid_nominal":
-            if com_max < 0.015 or rotation_max < 0.09:
-                errors.append(f"{name}: global translation/rotation is too small")
-            if shape_rms >= 0.02:
-                errors.append(f"{name}: shape residual is too large for rigid motion")
-        elif name == "id_shape_nominal_current":
+        elif motion_type == "shape":
             if shape_rms < 0.02:
                 errors.append(f"{name}: actual shape change is too small")
-        elif name == "id_combined_nominal":
-            if com_max < 0.02 or rotation_max < 0.12 or shape_rms < 0.02:
-                errors.append(f"{name}: combined actual response lacks one component")
-        elif name.startswith("pilot_rigid_l1_") or name.startswith("pilot_rigid_l2_"):
+        elif motion_type == "rigid":
             if float(row["com_speed_rms_m_s"]) < 0.10:
-                errors.append(f"{name}: pilot translation is still too slow")
+                errors.append(f"{name}: L1/L2 translation is still too slow")
             if rotation_max < 0.25:
-                errors.append(f"{name}: commanded pilot rotation is too small")
+                errors.append(f"{name}: commanded L1/L2 rotation is too small")
             if shape_rms >= 0.002:
-                errors.append(f"{name}: fixed-shape pilot deforms too much")
-        elif name.startswith("pilot_combined_l1_") or name.startswith(
-            "pilot_combined_l2_"
-        ):
+                errors.append(f"{name}: fixed-shape rigid motion deforms too much")
+        elif motion_type == "combined":
             if float(row["com_speed_rms_m_s"]) < 0.10:
-                errors.append(f"{name}: combined pilot translation is too slow")
+                errors.append(f"{name}: combined L1/L2 translation is too slow")
             if rotation_max < 0.25:
-                errors.append(f"{name}: combined pilot rotation is too small")
+                errors.append(f"{name}: combined L1/L2 rotation is too small")
             if shape_rms < 0.02:
-                errors.append(f"{name}: combined pilot lacks actual shape change")
+                errors.append(f"{name}: combined L1/L2 lacks actual shape change")
             if float(row.get(
                 "rigid_shape_hold_acceleration_rms_m_s2", 0.0
             )) > 1e-10:
-                errors.append(f"{name}: shape hold must be disabled in combined pilot")
+                errors.append(f"{name}: shape hold must be disabled in combined motion")
     return errors
 
 

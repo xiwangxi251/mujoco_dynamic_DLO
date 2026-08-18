@@ -11,10 +11,10 @@ from cable_grasp_env import (
     CableGraspEnv,
     EnvConfig,
     GraspState,
-    RIGID_PILOT_START_TIME,
-    RIGID_PILOT_START_Y,
-    RIGID_PILOT_TRAVEL,
-    RIGID_PILOT_ROTATION,
+    RIGID_MOTION_START_TIME,
+    RIGID_MOTION_START_Y,
+    RIGID_MOTION_TRAVEL,
+    RIGID_MOTION_ROTATION,
     rotation_to_quat,
 )
 from experiment_scenarios import (
@@ -30,24 +30,60 @@ class ScenarioRegistryTests(unittest.TestCase):
     def test_suites_are_complete_and_default_is_legacy_compatible_shape(self) -> None:
         core = {item.name for item in list_suite_scenarios("core")}
         sweep = {item.name for item in list_suite_scenarios("motion_sweep")}
-        pilot = {item.name for item in list_suite_scenarios("pilot")}
         ood = {item.name for item in list_suite_scenarios("ood")}
         paper = {item.name for item in list_suite_scenarios("paper")}
         self.assertFalse(core & sweep)
         self.assertFalse(core & ood)
         self.assertFalse(sweep & ood)
-        self.assertFalse(pilot & (core | sweep | ood))
         self.assertEqual(core | sweep | ood, paper)
         self.assertEqual(
-            paper | pilot, {item.name for item in list_scenarios()}
+            paper, {item.name for item in list_scenarios()}
         )
-        self.assertEqual(len(pilot), 12)
+        self.assertEqual(len(core), 6)
         self.assertEqual(DEFAULT_SCENARIO.motion_type.value, "shape")
         self.assertEqual(DEFAULT_SCENARIO.disturbance_strength, 1.5)
         self.assertEqual(
             DEFAULT_SCENARIO.to_env_overrides()["motion_profile_version"],
             "factorized_v2",
         )
+
+    def test_all_registered_rigid_motion_is_explicit_l1_or_l2_id(self) -> None:
+        scenarios = list_scenarios()
+        rigid_scenarios = [
+            item for item in scenarios
+            if item.motion_type.value in {"rigid", "combined"}
+        ]
+        self.assertTrue(rigid_scenarios)
+        self.assertTrue(all(
+            item.motion_profile_version in {
+                "rigid_level1_single_pass_v2",
+                "rigid_level2_single_pass_v2",
+            }
+            for item in rigid_scenarios
+        ))
+        id_names = {item.name for item in list_scenarios("id")}
+        expected = {
+            f"id_{motion}_l{trajectory}_{level}"
+            for motion in ("rigid", "combined")
+            for trajectory in (1, 2)
+            for level in ("low", "nominal", "high")
+        }
+        self.assertTrue(expected <= id_names)
+        self.assertFalse(any(name.startswith("pilot_") for name in id_names))
+        self.assertNotIn("id_rigid_nominal", id_names)
+        self.assertNotIn("id_combined_nominal", id_names)
+
+    def test_environment_rejects_removed_quasiperiodic_rigid_path(self) -> None:
+        with self.assertRaises(ValueError):
+            EnvConfig(
+                motion_mode="rigid",
+                motion_profile_version="factorized_v2",
+            )
+        with self.assertRaises(ValueError):
+            EnvConfig(
+                motion_mode="combined",
+                motion_profile_version="factorized_v2",
+            )
 
 
 class EnvironmentScenarioTests(unittest.TestCase):
@@ -220,7 +256,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-negative integer"):
             EnvConfig(grasp_contact_index_radius=-1)
 
-    def test_scripted_policy_uses_measured_pilot_delay_compensation(self) -> None:
+    def test_scripted_policy_uses_measured_motion_delay_compensation(self) -> None:
         config = PolicyConfig()
         self.assertEqual(config.prediction_horizon, 0.36)
         self.assertEqual(config.approach_prediction_horizon, 0.36)
@@ -296,7 +332,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             del env
 
     def test_seed_reproduces_initial_scene_and_motion_profile(self) -> None:
-        env = self.make("ood_dynamics_high_stochastic")
+        env = self.make("ood_combined_l1_dynamics_high_stochastic")
         try:
             _, first = env.reset(seed=9001)
             _, second = env.reset(seed=9001)
@@ -315,15 +351,17 @@ class EnvironmentScenarioTests(unittest.TestCase):
     def test_core_force_components_switch_exactly(self) -> None:
         expected = {
             "id_static": (False, False),
-            "id_rigid_nominal": (False, True),
+            "id_rigid_l1_nominal": (False, True),
             "id_shape_nominal_current": (True, False),
-            "id_combined_nominal": (True, True),
+            "id_combined_l1_nominal": (True, True),
         }
         for name, (shape_expected, rigid_expected) in expected.items():
             with self.subTest(name=name):
                 env = self.make(name)
                 try:
                     env.reset(seed=17)
+                    if env.config.motion_mode in {"rigid", "combined"}:
+                        env.data.time = RIGID_MOTION_START_TIME + 0.2
                     env.data.xfrc_applied[:] = 0.0
                     env._apply_cable_disturbance()
                     shape = np.linalg.norm(env._last_shape_acceleration) > 1e-10
@@ -360,48 +398,48 @@ class EnvironmentScenarioTests(unittest.TestCase):
             del env
 
     def test_level1_target_is_straight_and_constant_speed_between_turns(self) -> None:
-        env = self.make("pilot_rigid_l1_nominal")
+        env = self.make("id_rigid_l1_nominal")
         try:
             env.reset(seed=42)
             dt = 1e-4
-            time = RIGID_PILOT_START_TIME + 0.20
-            before = env._rigid_pilot_target(time - dt)
-            after = env._rigid_pilot_target(time + dt)
+            time = RIGID_MOTION_START_TIME + 0.20
+            before = env._rigid_motion_target(time - dt)
+            after = env._rigid_motion_target(time + dt)
             velocity = (after - before) / (2.0 * dt)
             self.assertAlmostEqual(velocity[0], 0.0, delta=1e-10)
             self.assertAlmostEqual(
                 np.linalg.norm(velocity),
-                env.config.rigid_pilot_nominal_speed,
+                env.config.rigid_motion_nominal_speed,
                 delta=1e-8,
             )
             times = np.linspace(
-                RIGID_PILOT_START_TIME,
-                RIGID_PILOT_START_TIME + env._rigid_pilot_duration(),
+                RIGID_MOTION_START_TIME,
+                RIGID_MOTION_START_TIME + env._rigid_motion_duration(),
                 101,
             )
-            positions = np.array([env._rigid_pilot_target(t) for t in times])
+            positions = np.array([env._rigid_motion_target(t) for t in times])
             self.assertTrue(np.all(np.diff(positions[:, 1]) >= -1e-12))
             self.assertTrue(np.allclose(positions[0], [0.0, 0.0]))
             self.assertTrue(np.allclose(
-                positions[-1], [0.0, RIGID_PILOT_TRAVEL]
+                positions[-1], [0.0, RIGID_MOTION_TRAVEL]
             ))
             initial_com = np.average(
                 env.data.xpos[env.cable_ids, :2],
                 axis=0,
                 weights=env.cable_mass,
             )
-            self.assertAlmostEqual(initial_com[1], RIGID_PILOT_START_Y)
+            self.assertAlmostEqual(initial_com[1], RIGID_MOTION_START_Y)
         finally:
             del env
 
     def test_level2_target_has_curvature_and_matches_nominal_speed_scale(self) -> None:
-        env = self.make("pilot_rigid_l2_nominal")
+        env = self.make("id_rigid_l2_nominal")
         try:
             env.reset(seed=43)
             dt = 1e-3
             positions = np.array([
-                env._rigid_pilot_target(
-                    RIGID_PILOT_START_TIME + 0.30 + offset * dt
+                env._rigid_motion_target(
+                    RIGID_MOTION_START_TIME + 0.30 + offset * dt
                 )
                 for offset in (-1, 0, 1)
             ])
@@ -410,13 +448,13 @@ class EnvironmentScenarioTests(unittest.TestCase):
             cross = velocity[0] * acceleration[1] - velocity[1] * acceleration[0]
             self.assertGreater(abs(cross), 1e-3)
             self.assertTrue(np.allclose(
-                env._rigid_pilot_target(
-                    RIGID_PILOT_START_TIME + env._rigid_pilot_duration() + 1.0
+                env._rigid_motion_target(
+                    RIGID_MOTION_START_TIME + env._rigid_motion_duration() + 1.0
                 ),
-                [0.0, RIGID_PILOT_TRAVEL],
+                [0.0, RIGID_MOTION_TRAVEL],
             ))
-            low = self.make("pilot_rigid_l2_low")
-            high = self.make("pilot_rigid_l2_high")
+            low = self.make("id_rigid_l2_low")
+            high = self.make("id_rigid_l2_high")
             try:
                 self.assertAlmostEqual(
                     high.config.motion_frequency_scale
@@ -428,28 +466,28 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_long_pilot_path_keeps_no_contact_termination(self) -> None:
-        level1 = self.make("pilot_rigid_l1_high")
-        level2 = self.make("pilot_rigid_l2_high")
+    def test_long_l1_l2_path_keeps_no_contact_termination(self) -> None:
+        level1 = self.make("id_rigid_l1_high")
+        level2 = self.make("id_rigid_l2_high")
         try:
-            self.assertEqual(RIGID_PILOT_TRAVEL, 1.4)
-            self.assertGreater(level1._rigid_pilot_duration(), 3.6)
-            self.assertGreater(level2._rigid_pilot_duration(), 3.6)
+            self.assertEqual(RIGID_MOTION_TRAVEL, 1.4)
+            self.assertGreater(level1._rigid_motion_duration(), 3.6)
+            self.assertGreater(level2._rigid_motion_duration(), 3.6)
 
             level1.reset(seed=43)
             level1.data.time = (
-                RIGID_PILOT_START_TIME + level1._rigid_pilot_duration()
+                RIGID_MOTION_START_TIME + level1._rigid_motion_duration()
             )
             _, _, _, truncated, info = level1.step(level1.ready_ctrl)
-            self.assertTrue(info["rigid_pilot_finished"])
-            self.assertFalse(info["rigid_pilot_contacted"])
+            self.assertTrue(info["rigid_motion_finished"])
+            self.assertFalse(info["rigid_motion_released"])
             self.assertTrue(truncated)
         finally:
             del level1, level2
 
-    def test_rigid_pilot_uses_paired_curved_shape_and_rotation(self) -> None:
-        level1 = self.make("pilot_rigid_l1_nominal", seed=45)
-        level2 = self.make("pilot_rigid_l2_nominal", seed=45)
+    def test_rigid_motion_uses_paired_curved_shape_and_rotation(self) -> None:
+        level1 = self.make("id_rigid_l1_nominal", seed=45)
+        level2 = self.make("id_rigid_l2_nominal", seed=45)
         try:
             _, info1 = level1.reset(seed=45)
             _, info2 = level2.reset(seed=45)
@@ -471,17 +509,17 @@ class EnvironmentScenarioTests(unittest.TestCase):
             )
             self.assertIn(info1["rigid_initial_shape_family"], {"c", "s", "spline"})
             self.assertEqual(
-                info1["rigid_pilot_rotation_sign"],
-                info2["rigid_pilot_rotation_sign"],
+                info1["rigid_motion_rotation_sign"],
+                info2["rigid_motion_rotation_sign"],
             )
-            start = RIGID_PILOT_START_TIME
-            end = start + level1._rigid_pilot_duration()
-            self.assertEqual(level1._rigid_pilot_rotation_target(start), 0.0)
+            start = RIGID_MOTION_START_TIME
+            end = start + level1._rigid_motion_duration()
+            self.assertEqual(level1._rigid_motion_rotation_target(start), 0.0)
             self.assertAlmostEqual(
-                abs(level1._rigid_pilot_rotation_target(end)),
-                RIGID_PILOT_ROTATION,
+                abs(level1._rigid_motion_rotation_target(end)),
+                RIGID_MOTION_ROTATION,
             )
-            level1.data.time = start + 0.5 * level1._rigid_pilot_duration()
+            level1.data.time = start + 0.5 * level1._rigid_motion_duration()
             level1._apply_cable_disturbance()
             self.assertGreater(
                 np.linalg.norm(level1._last_rigid_rotation_acceleration), 0.0
@@ -491,9 +529,9 @@ class EnvironmentScenarioTests(unittest.TestCase):
 
     def test_all_new_scenarios_share_curved_initial_distribution(self) -> None:
         names = (
-            "id_static", "id_rigid_nominal", "id_shape_nominal_current",
-            "id_combined_nominal", "pilot_rigid_l1_nominal",
-            "pilot_combined_l1_nominal",
+            "id_static", "id_rigid_l1_nominal", "id_shape_nominal_current",
+            "id_combined_l1_nominal", "id_rigid_l2_nominal",
+            "id_combined_l2_nominal",
         )
         environments = [self.make(name, seed=46) for name in names]
         try:
@@ -526,7 +564,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 del env
 
     def test_rigid_shape_hold_has_zero_net_force_and_torque(self) -> None:
-        env = self.make("pilot_rigid_l1_nominal", seed=47)
+        env = self.make("id_rigid_l1_nominal", seed=47)
         try:
             env.reset(seed=47)
             address = int(env.cable_ball_qadr[len(env.cable_ball_qadr) // 2])
@@ -535,7 +573,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             angle += math.radians(3.0)
             quaternion[:] = [math.cos(0.5 * angle), 0.0, 0.0, math.sin(0.5 * angle)]
             mujoco.mj_forward(env.model, env.data)
-            env.data.time = RIGID_PILOT_START_TIME + 0.3
+            env.data.time = RIGID_MOTION_START_TIME + 0.3
             env._apply_cable_disturbance()
             acceleration = env._last_rigid_shape_hold_acceleration
             force = env.cable_mass[:, None] * acceleration
@@ -548,8 +586,8 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_rigid_pilot_waits_for_confirmed_grasp_before_releasing_drive(self) -> None:
-        env = self.make("pilot_rigid_l1_nominal")
+    def test_rigid_motion_waits_for_confirmed_grasp_before_releasing_drive(self) -> None:
+        env = self.make("id_rigid_l1_nominal")
         try:
             env.reset(seed=47)
             env._last_contact_count = 1
@@ -560,30 +598,30 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 last_bilateral_time=float(env.data.time),
                 lost_contact_time=0.0,
             )
-            env._update_rigid_pilot_contact_state()
-            self.assertFalse(env.rigid_pilot_contacted)
+            env._update_rigid_motion_release_state()
+            self.assertFalse(env.rigid_motion_released)
 
             env.grasp_state.bilateral_confirmed = True
-            env._update_rigid_pilot_contact_state()
-            self.assertTrue(env.rigid_pilot_contacted)
+            env._update_rigid_motion_release_state()
+            self.assertTrue(env.rigid_motion_released)
 
             # 该状态需要锁存，防止抓取后的短暂接触抖动重新启动整体驱动。
             env.grasp_state = None
-            env._update_rigid_pilot_contact_state()
-            self.assertTrue(env.rigid_pilot_contacted)
+            env._update_rigid_motion_release_state()
+            self.assertTrue(env.rigid_motion_released)
         finally:
             del env
 
-    def test_rigid_pilot_releases_environment_drive_after_confirmed_grasp(self) -> None:
-        env = self.make("pilot_rigid_l1_nominal")
+    def test_rigid_motion_releases_environment_drive_after_confirmed_grasp(self) -> None:
+        env = self.make("id_rigid_l1_nominal")
         try:
             env.reset(seed=44)
-            env.data.time = RIGID_PILOT_START_TIME + 0.2
+            env.data.time = RIGID_MOTION_START_TIME + 0.2
             env._apply_cable_disturbance()
             self.assertGreater(
                 np.linalg.norm(env._last_rigid_translation_acceleration), 0.0
             )
-            env.rigid_pilot_contacted = True
+            env.rigid_motion_released = True
             env.data.xfrc_applied[:] = 0.0
             env._apply_cable_disturbance()
             self.assertTrue(np.array_equal(
@@ -601,11 +639,11 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_combined_pilot_releases_only_rigid_drive_after_confirmed_grasp(self) -> None:
-        env = self.make("pilot_combined_l1_nominal")
+    def test_combined_motion_releases_only_rigid_drive_after_confirmed_grasp(self) -> None:
+        env = self.make("id_combined_l1_nominal")
         try:
             env.reset(seed=46)
-            env.data.time = RIGID_PILOT_START_TIME + 0.2
+            env.data.time = RIGID_MOTION_START_TIME + 0.2
             env._apply_cable_disturbance()
             self.assertGreater(np.linalg.norm(env._last_shape_acceleration), 0.0)
             self.assertGreater(
@@ -618,7 +656,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 env._last_rigid_shape_hold_acceleration,
                 np.zeros_like(env._last_rigid_shape_hold_acceleration),
             ))
-            env.rigid_pilot_contacted = True
+            env.rigid_motion_released = True
             env._apply_cable_disturbance()
             self.assertGreater(np.linalg.norm(env._last_shape_acceleration), 0.0)
             self.assertTrue(np.array_equal(
@@ -667,8 +705,8 @@ class EnvironmentScenarioTests(unittest.TestCase):
         environments = {
             name: self.make(name, seed=81)
             for name in (
-                "id_shape_nominal_current", "id_rigid_nominal",
-                "id_combined_nominal",
+                "id_shape_nominal_current", "id_rigid_l1_nominal",
+                "id_combined_l1_nominal",
             )
         }
         try:
@@ -676,8 +714,8 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 env.reset(seed=81)
                 env._apply_cable_disturbance()
             shape = environments["id_shape_nominal_current"]
-            rigid = environments["id_rigid_nominal"]
-            combined = environments["id_combined_nominal"]
+            rigid = environments["id_rigid_l1_nominal"]
+            combined = environments["id_combined_l1_nominal"]
             expected = (
                 shape._last_shape_acceleration
                 + rigid._last_rigid_translation_acceleration
@@ -694,7 +732,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 del env
 
     def test_environment_force_has_no_table_boundary_component(self) -> None:
-        env = self.make("id_combined_nominal", seed=82)
+        env = self.make("id_combined_l1_nominal", seed=82)
         try:
             env.reset(seed=82)
             env.data.xfrc_applied[:] = 0.0
@@ -732,7 +770,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             del env
 
     def test_disturbance_does_not_read_grasp_state(self) -> None:
-        env = self.make("id_combined_nominal")
+        env = self.make("id_combined_l1_nominal")
         try:
             env.reset(seed=52)
             env._apply_cable_disturbance()
@@ -760,9 +798,9 @@ class EnvironmentScenarioTests(unittest.TestCase):
             del env
 
     def test_ood_length_and_material_change_compiled_physics(self) -> None:
-        nominal = self.make("id_combined_nominal")
-        short = self.make("ood_length_short")
-        soft = self.make("ood_material_soft")
+        nominal = self.make("id_combined_l1_nominal")
+        short = self.make("ood_combined_l1_length_short")
+        soft = self.make("ood_combined_l1_material_soft")
         try:
             nominal_span = np.linalg.norm(
                 nominal.data.xpos[nominal.cable_ids[-1]]

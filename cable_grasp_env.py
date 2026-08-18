@@ -16,15 +16,15 @@ ROOT = Path(__file__).resolve().parent
 MENAGERIE = ROOT.parent / "mujoco_menagerie"
 XML_PATH = MENAGERIE / "franka_emika_panda" / "panda_cable_grasp.xml"
 
-RIGID_PILOT_START_TIME = 0.80
-RIGID_PILOT_START_Y = -0.70
-RIGID_PILOT_TRAVEL = 1.40
-RIGID_PILOT_ROTATION = math.radians(24.0)
-RIGID_PILOT_PROFILES = {
+RIGID_MOTION_START_TIME = 0.80
+RIGID_MOTION_START_Y = -0.70
+RIGID_MOTION_TRAVEL = 1.40
+RIGID_MOTION_ROTATION = math.radians(24.0)
+RIGID_MOTION_PROFILES = {
     "rigid_level1_single_pass_v2",
     "rigid_level2_single_pass_v2",
 }
-RIGID_PILOT_L2_CONTROL = RIGID_PILOT_TRAVEL * np.array([
+RIGID_MOTION_L2_CONTROL = RIGID_MOTION_TRAVEL * np.array([
     [0.00, 0.00],
     [0.16, 0.30],
     [-0.16, 0.70],
@@ -46,9 +46,9 @@ def _cubic_bezier(control: np.ndarray, u: float | np.ndarray) -> np.ndarray:
 
 
 _L2_ARC_SAMPLES = _cubic_bezier(
-    RIGID_PILOT_L2_CONTROL, np.linspace(0.0, 1.0, 1001)
+    RIGID_MOTION_L2_CONTROL, np.linspace(0.0, 1.0, 1001)
 )
-RIGID_PILOT_L2_ARC_LENGTH = float(np.linalg.norm(
+RIGID_MOTION_L2_ARC_LENGTH = float(np.linalg.norm(
     np.diff(_L2_ARC_SAMPLES, axis=0), axis=1
 ).sum())
 
@@ -75,9 +75,9 @@ class EnvConfig:
     shape_motion_scale: float = 1.0
     rigid_translation_scale: float = 1.0
     rigid_rotation_scale: float = 1.0
-    rigid_pilot_nominal_speed: float = 0.25  # L1/L2标称平均速度，单位m/s
-    rigid_shape_stiffness: float = 1000.0    # pilot中保持初始平面构型，单位1/s²
-    rigid_shape_damping: float = 68.0        # pilot相对运动阻尼，单位1/s
+    rigid_motion_nominal_speed: float = 0.25 # L1/L2标称平均速度，单位m/s
+    rigid_shape_stiffness: float = 1000.0    # rigid中保持初始平面构型，单位1/s²
+    rigid_shape_damping: float = 68.0        # rigid相对运动阻尼，单位1/s
     rigid_shape_max_acceleration: float = 45.0
 
     # 线缆 OOD 参数相对 XML 标称值缩放（改变长度、质量、弹性、阻尼和摩擦）
@@ -135,13 +135,22 @@ class EnvConfig:
                 "unsupported motion_profile_version: "
                 f"{self.motion_profile_version!r}"
             )
+        uses_rigid_trajectory = self.motion_profile_version in RIGID_MOTION_PROFILES
+        if self.motion_mode in {"rigid", "combined"} and not uses_rigid_trajectory:
+            raise ValueError(
+                "rigid and combined motion must explicitly select Level-1 or Level-2"
+            )
+        if uses_rigid_trajectory and self.motion_mode not in {"rigid", "combined"}:
+            raise ValueError(
+                "Level-1/Level-2 profiles require rigid or combined motion"
+            )
         nonnegative = (
             "disturbance_strength",
             "motion_frequency_scale",
             "shape_motion_scale",
             "rigid_translation_scale",
             "rigid_rotation_scale",
-            "rigid_pilot_nominal_speed",
+            "rigid_motion_nominal_speed",
             "rigid_shape_stiffness",
             "rigid_shape_damping",
             "rigid_shape_max_acceleration",
@@ -366,10 +375,6 @@ class CableGraspEnv:
         self._stochastic_shape_frequency = np.ones(8)
         self._stochastic_shape_direction = np.ones(8)
         self._stochastic_shape_phase = np.zeros(8)
-        self._stochastic_rigid_frequency = np.ones((3, 4))
-        self._stochastic_rigid_phase = np.zeros((3, 4))
-        self._stochastic_rigid_weight = np.ones((3, 4)) / 2.0
-
         node_count = len(self.cable_ids)
         self._last_shape_acceleration = np.zeros((node_count, 3))
         self._last_rigid_translation_acceleration = np.zeros((node_count, 3))
@@ -380,7 +385,7 @@ class CableGraspEnv:
         self._rigid_reference_com_xy = np.zeros(2)
         self._rigid_initial_shape_family = "none"
         self._rigid_initial_tangent_angles = np.zeros(node_count - 1)
-        self._rigid_pilot_rotation_sign = 1.0
+        self._rigid_motion_rotation_sign = 1.0
 
         self.target_body_id = self.cable_ids[len(self.cable_ids) // 2]
 
@@ -395,7 +400,7 @@ class CableGraspEnv:
         self.grasp_break_history: list[dict] = []
         self.ever_bilateral_candidate = False
         self.ever_confirmed_grasp = False
-        self.rigid_pilot_contacted = False
+        self.rigid_motion_released = False
         self.episode_seed: int | None = None
         self.initial_cable_translation = np.zeros(2)
         self._last_contact_count = 0
@@ -453,10 +458,10 @@ class CableGraspEnv:
         self.data.ctrl[:8] = self.ready_ctrl
         mujoco.mj_forward(self.model, self.data)
 
-        is_rigid_pilot = self.config.motion_profile_version in RIGID_PILOT_PROFILES
+        uses_rigid_motion = self.config.motion_profile_version in RIGID_MOTION_PROFILES
         uses_curved_initial_shape = (
             self.config.motion_profile_version == "factorized_v2"
-            or is_rigid_pilot
+            or uses_rigid_motion
         )
         base_cable_xy = self.data.xpos[self.cable_ids, :2].copy()
         base_com_xy = np.average(base_cable_xy, axis=0, weights=self.cable_mass)
@@ -480,13 +485,13 @@ class CableGraspEnv:
         if uses_curved_initial_shape:
             # 所有新实验场景共享随机弯曲初始分布；相同seed可配对比较。
             # L1/L2另外固定从同一Y入口开始，并预检完整SE(2)扫掠范围。
-            if is_rigid_pilot:
-                dy = RIGID_PILOT_START_Y - float(base_com_xy[1])
+            if uses_rigid_motion:
+                dy = RIGID_MOTION_START_Y - float(base_com_xy[1])
             self.initial_cable_translation[:] = [dx, dy]
             self._set_curved_initial_shape(
                 desired_com_xy=base_com_xy + np.array([dx, dy]),
                 randomize=randomize,
-                check_rigid_pilot_sweep=is_rigid_pilot,
+                check_rigid_motion_sweep=uses_rigid_motion,
             )
         else:
             # 长线缆OOD的初始端点仍放在桌面内，避免长度变化被初始坠桌混淆。
@@ -505,7 +510,7 @@ class CableGraspEnv:
             ] += [dx, dy, 0.0]
             self._rigid_initial_shape_family = "none"
             self._rigid_initial_tangent_angles[:] = 0.0
-            self._rigid_pilot_rotation_sign = 1.0
+            self._rigid_motion_rotation_sign = 1.0
 
         self._reset_stochastic_motion(randomize=randomize)
         profile_header = (
@@ -525,12 +530,9 @@ class CableGraspEnv:
             self._stochastic_shape_frequency.tobytes(),
             self._stochastic_shape_direction.tobytes(),
             self._stochastic_shape_phase.tobytes(),
-            self._stochastic_rigid_frequency.tobytes(),
-            self._stochastic_rigid_phase.tobytes(),
-            self._stochastic_rigid_weight.tobytes(),
             self._rigid_reference_xy.tobytes(),
             self._rigid_initial_shape_family.encode("ascii"),
-            np.asarray([self._rigid_pilot_rotation_sign]).tobytes(),
+            np.asarray([self._rigid_motion_rotation_sign]).tobytes(),
         ))
         self.motion_profile_hash = hashlib.sha256(profile_bytes).hexdigest()
 
@@ -544,7 +546,7 @@ class CableGraspEnv:
         self.grasp_break_history = []
         self.ever_bilateral_candidate = False
         self.ever_confirmed_grasp = False
-        self.rigid_pilot_contacted = False
+        self.rigid_motion_released = False
         self._last_contact_count = 0
         self._last_shape_acceleration[:] = 0.0
         self._last_rigid_translation_acceleration[:] = 0.0
@@ -607,7 +609,7 @@ class CableGraspEnv:
             # 更新抓取候选
             self._last_contact_count = len(self._finger_contact_pairs())
             self._update_physical_grasp_state(gripper_closed)
-            self._update_rigid_pilot_contact_state()
+            self._update_rigid_motion_release_state()
 
             # 任务成功所要求的几何条件检查
             last_qualification = self._success_qualification(gripper_closed)
@@ -636,13 +638,13 @@ class CableGraspEnv:
                     "max_z": current_info["max_z"],
                     "success_hold": self.success_hold,
                 }
-            pilot_timeout = (
-                self.rigid_pilot_finished
-                and not self.rigid_pilot_contacted
+            rigid_motion_timeout = (
+                self.rigid_motion_finished
+                and not self.rigid_motion_released
             )
             truncated = (
                 self.data.time >= self.config.episode_seconds
-                or pilot_timeout
+                or rigid_motion_timeout
             )
             if truncated:
                 break
@@ -890,7 +892,7 @@ class CableGraspEnv:
         motion_limit_denominator = max(1, self._motion_limit_steps)
         physics_step_denominator = max(1, self._physics_steps)
         rms = lambda values: float(np.sqrt(np.mean(np.square(values))))
-        is_rigid_pilot = self.config.motion_profile_version in RIGID_PILOT_PROFILES
+        uses_rigid_motion = self.config.motion_profile_version in RIGID_MOTION_PROFILES
         return {
             "trial": self.trial_index,
             "episode_seed": self.episode_seed,
@@ -906,23 +908,23 @@ class CableGraspEnv:
             "rigid_translation_scale": self.config.rigid_translation_scale,
             "rigid_rotation_scale": self.config.rigid_rotation_scale,
             "motion_profile_hash": self.motion_profile_hash,
-            "rigid_pilot_duration": (
-                self._rigid_pilot_duration() if is_rigid_pilot else None
+            "rigid_motion_duration": (
+                self._rigid_motion_duration() if uses_rigid_motion else None
             ),
-            "rigid_pilot_finished": self.rigid_pilot_finished,
-            "rigid_pilot_motion_active": bool(
-                is_rigid_pilot
-                and not self.rigid_pilot_finished
-                and not self.rigid_pilot_contacted
+            "rigid_motion_finished": self.rigid_motion_finished,
+            "rigid_motion_active": bool(
+                uses_rigid_motion
+                and not self.rigid_motion_finished
+                and not self.rigid_motion_released
             ),
-            "rigid_pilot_contacted": self.rigid_pilot_contacted,
+            "rigid_motion_released": self.rigid_motion_released,
             "initial_shape_family": self._rigid_initial_shape_family,
             "rigid_initial_shape_family": self._rigid_initial_shape_family,
-            "rigid_pilot_rotation_sign": self._rigid_pilot_rotation_sign,
-            "rigid_pilot_rotation_total_rad": (
-                self._rigid_pilot_rotation_target(
-                    RIGID_PILOT_START_TIME + self._rigid_pilot_duration()
-                ) if is_rigid_pilot else None
+            "rigid_motion_rotation_sign": self._rigid_motion_rotation_sign,
+            "rigid_motion_rotation_total_rad": (
+                self._rigid_motion_rotation_target(
+                    RIGID_MOTION_START_TIME + self._rigid_motion_duration()
+                ) if uses_rigid_motion else None
             ),
             "cable_length_scale": self.config.cable_length_scale,
             "cable_density_scale": self.config.cable_density_scale,
@@ -1077,13 +1079,13 @@ class CableGraspEnv:
             <= self.config.grasp_loss_seconds
         )
 
-    def _update_rigid_pilot_contact_state(self) -> None:
-        """稳定双侧抓取确认后，锁存 pilot 整体运动的撤除状态。"""
+    def _update_rigid_motion_release_state(self) -> None:
+        """稳定双侧抓取确认后，锁存L1/L2整体运动的撤除状态。"""
         if (
-            self.config.motion_profile_version in RIGID_PILOT_PROFILES
+            self.config.motion_profile_version in RIGID_MOTION_PROFILES
             and self.grasp_confirmed
         ):
-            self.rigid_pilot_contacted = True
+            self.rigid_motion_released = True
 
     def _update_physical_grasp_state(self, gripper_closed: bool) -> None:
         """只根据内指垫接触、法向力和开口更新抓取状态。"""
@@ -1313,7 +1315,7 @@ class CableGraspEnv:
             rotation_sign = float(self.rng.choice((-1.0, 1.0)))
 
         self._rigid_initial_shape_family = family
-        self._rigid_pilot_rotation_sign = rotation_sign
+        self._rigid_motion_rotation_sign = rotation_sign
         self._rigid_initial_tangent_angles[:] = tangents
         return tangents
 
@@ -1322,7 +1324,7 @@ class CableGraspEnv:
         *,
         desired_com_xy: np.ndarray,
         randomize: bool,
-        check_rigid_pilot_sweep: bool,
+        check_rigid_motion_sweep: bool,
     ) -> None:
         """直接设置球关节得到弯曲构型，并确保所需扫掠范围位于桌内。"""
 
@@ -1351,15 +1353,15 @@ class CableGraspEnv:
         margin = self.cable_radius + 0.01
         minimum_offset = np.full(2, math.inf)
         maximum_offset = np.full(2, -math.inf)
-        if check_rigid_pilot_sweep:
-            duration = self._rigid_pilot_duration()
+        if check_rigid_motion_sweep:
+            duration = self._rigid_motion_duration()
             for time_value in np.linspace(
-                RIGID_PILOT_START_TIME,
-                RIGID_PILOT_START_TIME + duration,
+                RIGID_MOTION_START_TIME,
+                RIGID_MOTION_START_TIME + duration,
                 101,
             ):
-                path = self._rigid_pilot_target(float(time_value))
-                yaw = self._rigid_pilot_rotation_target(float(time_value))
+                path = self._rigid_motion_target(float(time_value))
+                yaw = self._rigid_motion_rotation_target(float(time_value))
                 swept = path + relative @ self._planar_rotation(yaw)
                 minimum_offset = np.minimum(minimum_offset, swept.min(axis=0))
                 maximum_offset = np.maximum(maximum_offset, swept.max(axis=0))
@@ -1372,11 +1374,11 @@ class CableGraspEnv:
         if np.any(feasible_min > feasible_max):
             raise ValueError("sampled curved cable does not fit on the table")
         start_com = np.clip(desired_com_xy, feasible_min, feasible_max)
-        if check_rigid_pilot_sweep and not math.isclose(
-            float(start_com[1]), RIGID_PILOT_START_Y, abs_tol=1e-12
+        if check_rigid_motion_sweep and not math.isclose(
+            float(start_com[1]), RIGID_MOTION_START_Y, abs_tol=1e-12
         ):
             raise ValueError(
-                "sampled rigid-pilot curve does not fit the Y sweep on the table"
+                "sampled L1/L2 curve does not fit the Y sweep on the table"
             )
         self.initial_cable_translation[:] += start_com - desired_com_xy
         self.data.qpos[
@@ -1405,23 +1407,20 @@ class CableGraspEnv:
         if self.config.motion_mode in {"shape", "combined"}:
             shape = self._shape_acceleration(t, p)
         if self.config.motion_mode in {"rigid", "combined"}:
-            if self.config.motion_profile_version in RIGID_PILOT_PROFILES:
-                # L1/L2整体运动只定义到稳定双侧抓取确认。确认后撤掉平移、旋转及
-                # rigid专用构型保持力；shape分量独立计算，combined确认后仍继续。
-                if not self.rigid_pilot_contacted:
-                    velocity_xy = np.array([
-                        self.body_linear_velocity(body_id)[:2]
-                        for body_id in self.cable_ids
-                    ])
-                    translation, rotation = self._rigid_pilot_acceleration(
+            # All rigid motion is now an explicit L1/L2 single pass.  It stops
+            # after confirmed bilateral grasp; combined shape motion continues.
+            if not self.rigid_motion_released:
+                velocity_xy = np.array([
+                    self.body_linear_velocity(body_id)[:2]
+                    for body_id in self.cable_ids
+                ])
+                translation, rotation = self._rigid_motion_acceleration(
+                    elapsed_time, velocity_xy
+                )
+                if self.config.motion_mode == "rigid":
+                    shape_hold = self._rigid_shape_hold_acceleration(
                         elapsed_time, velocity_xy
                     )
-                    if self.config.motion_mode == "rigid":
-                        shape_hold = self._rigid_shape_hold_acceleration(
-                            elapsed_time, velocity_xy
-                        )
-            else:
-                translation, rotation = self._rigid_acceleration(elapsed_time, p)
 
         intended = shape + translation + rotation + shape_hold
 
@@ -1555,72 +1554,15 @@ class CableGraspEnv:
         shape -= np.average(shape, axis=0, weights=self.cable_mass)
         return shape
 
-    def _rigid_acceleration(
-        self, time_value: float, p: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """用外力跟踪有界整体轨迹；不写 qpos、不创建隐藏约束。"""
-
-        h = 1e-3
-        desired = self._rigid_motion_target(time_value, p)
-        before = self._rigid_motion_target(time_value - h, p)
-        after = self._rigid_motion_target(time_value + h, p)
-        desired_velocity = (after - before) / (2.0 * h)
-        desired_acceleration = (after - 2.0 * desired + before) / (h * h)
-
-        current_com, current_yaw = self._current_rigid_pose()
-        # composite 的根 free joint 直接给出整体平动/转动速度；使用它保持该
-        # 力场是当前物理状态的纯函数，且避免每个500 Hz子步查询40个body速度。
-        current_velocity = self.data.qvel[
-            self.cable_free_dadr:self.cable_free_dadr + 2
-        ]
-        current_yaw_rate = float(self.data.qvel[self.cable_free_dadr + 5])
-
-        current_offset = current_com - self._rigid_reference_com_xy
-        translation_xy = (
-            desired_acceleration[:2]
-            + 30.0 * (desired[:2] - current_offset)
-            + 8.0 * (desired_velocity[:2] - current_velocity)
-        )
-        translation_norm = float(np.linalg.norm(translation_xy))
-        if translation_norm > 8.0:
-            translation_xy *= 8.0 / translation_norm
-        translation_xy *= self.config.rigid_translation_scale
-        translation = np.broadcast_to(
-            np.r_[translation_xy, 0.0], (len(self.cable_ids), 3)
-        ).copy()
-
-        angular_acceleration = (
-            desired_acceleration[2]
-            + 24.0 * (desired[2] - current_yaw)
-            + 7.0 * (desired_velocity[2] - current_yaw_rate)
-        )
-        angular_acceleration = float(np.clip(angular_acceleration, -18.0, 18.0))
-        angular_acceleration *= self.config.rigid_rotation_scale
-        angular_velocity = desired_velocity[2] * self.config.rigid_rotation_scale
-        positions = self.data.xpos[self.cable_ids]
-        center = np.average(positions, axis=0, weights=self.cable_mass)
-        relative = positions - center
-        alpha = np.array([0.0, 0.0, angular_acceleration])
-        omega = np.array([0.0, 0.0, angular_velocity])
-        rotation = (
-            np.cross(np.broadcast_to(alpha, relative.shape), relative)
-            + np.cross(
-                np.broadcast_to(omega, relative.shape),
-                np.cross(np.broadcast_to(omega, relative.shape), relative),
-            )
-        )
-        rotation -= np.average(rotation, axis=0, weights=self.cable_mass)
-        return translation, rotation
-
-    def _rigid_pilot_acceleration(
+    def _rigid_motion_acceleration(
         self, time_value: float, velocity_xy: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         """分别返回L1/L2平移和整体旋转的刚体加速度场。"""
 
         h = 1e-3
-        desired = self._rigid_pilot_target(time_value)
-        before = self._rigid_pilot_target(time_value - h)
-        after = self._rigid_pilot_target(time_value + h)
+        desired = self._rigid_motion_target(time_value)
+        before = self._rigid_motion_target(time_value - h)
+        after = self._rigid_motion_target(time_value + h)
         desired_velocity = (after - before) / (2.0 * h)
         desired_acceleration = (after - 2.0 * desired + before) / (h * h)
 
@@ -1642,9 +1584,9 @@ class CableGraspEnv:
             np.r_[acceleration_xy, 0.0], (len(self.cable_ids), 3)
         ).copy()
 
-        desired_yaw = self._rigid_pilot_rotation_target(time_value)
-        yaw_before = self._rigid_pilot_rotation_target(time_value - h)
-        yaw_after = self._rigid_pilot_rotation_target(time_value + h)
+        desired_yaw = self._rigid_motion_rotation_target(time_value)
+        yaw_before = self._rigid_motion_rotation_target(time_value - h)
+        yaw_after = self._rigid_motion_rotation_target(time_value + h)
         desired_yaw_rate = (yaw_after - yaw_before) / (2.0 * h)
         desired_yaw_acceleration = (
             yaw_after - 2.0 * desired_yaw + yaw_before
@@ -1685,56 +1627,56 @@ class CableGraspEnv:
         rotation -= np.average(rotation, axis=0, weights=self.cable_mass)
         return translation, rotation
 
-    def _rigid_pilot_target(self, time_value: float) -> np.ndarray:
+    def _rigid_motion_target(self, time_value: float) -> np.ndarray:
         """返回同起终点、无折返的L1直线或L2三次曲线质心位移。"""
 
-        elapsed = max(0.0, float(time_value) - RIGID_PILOT_START_TIME)
+        elapsed = max(0.0, float(time_value) - RIGID_MOTION_START_TIME)
         speed = (
-            self.config.rigid_pilot_nominal_speed
+            self.config.rigid_motion_nominal_speed
             * self.config.motion_frequency_scale
         )
         x_sign = 1.0 if math.cos(self.phase_offset) >= 0.0 else -1.0
 
         if self.config.motion_profile_version == "rigid_level1_single_pass_v2":
-            progress = min(speed * elapsed, RIGID_PILOT_TRAVEL)
+            progress = min(speed * elapsed, RIGID_MOTION_TRAVEL)
             return np.array([0.0, progress])
 
-        duration = RIGID_PILOT_L2_ARC_LENGTH / speed
+        duration = RIGID_MOTION_L2_ARC_LENGTH / speed
         u = float(np.clip(elapsed / duration, 0.0, 1.0))
-        control = RIGID_PILOT_L2_CONTROL * np.array([x_sign, 1.0])
+        control = RIGID_MOTION_L2_CONTROL * np.array([x_sign, 1.0])
         return _cubic_bezier(control, u)
 
-    def _rigid_pilot_rotation_target(self, time_value: float) -> float:
+    def _rigid_motion_rotation_target(self, time_value: float) -> float:
         """返回与单程平移同步、起止角速度为零的有限整体转角。"""
 
-        elapsed = max(0.0, float(time_value) - RIGID_PILOT_START_TIME)
-        progress = float(np.clip(elapsed / self._rigid_pilot_duration(), 0.0, 1.0))
+        elapsed = max(0.0, float(time_value) - RIGID_MOTION_START_TIME)
+        progress = float(np.clip(elapsed / self._rigid_motion_duration(), 0.0, 1.0))
         smooth_progress = progress * progress * (3.0 - 2.0 * progress)
         return (
-            self._rigid_pilot_rotation_sign
+            self._rigid_motion_rotation_sign
             * self.config.rigid_rotation_scale
-            * RIGID_PILOT_ROTATION
+            * RIGID_MOTION_ROTATION
             * smooth_progress
         )
 
-    def _rigid_pilot_duration(self) -> float:
+    def _rigid_motion_duration(self) -> float:
         speed = (
-            self.config.rigid_pilot_nominal_speed
+            self.config.rigid_motion_nominal_speed
             * self.config.motion_frequency_scale
         )
         path_length = (
-            RIGID_PILOT_TRAVEL
+            RIGID_MOTION_TRAVEL
             if self.config.motion_profile_version == "rigid_level1_single_pass_v2"
-            else RIGID_PILOT_L2_ARC_LENGTH
+            else RIGID_MOTION_L2_ARC_LENGTH
         )
         return path_length / speed
 
     @property
-    def rigid_pilot_finished(self) -> bool:
+    def rigid_motion_finished(self) -> bool:
         return bool(
-            self.config.motion_profile_version in RIGID_PILOT_PROFILES
+            self.config.motion_profile_version in RIGID_MOTION_PROFILES
             and self.data.time
-            >= RIGID_PILOT_START_TIME + self._rigid_pilot_duration()
+            >= RIGID_MOTION_START_TIME + self._rigid_motion_duration()
         )
 
     def _rigid_shape_hold_acceleration(
@@ -1745,7 +1687,7 @@ class CableGraspEnv:
         current_xy = self.data.xpos[self.cable_ids, :2]
         current_com = np.average(current_xy, axis=0, weights=self.cable_mass)
         reference_relative = self._rigid_reference_xy - self._rigid_reference_com_xy
-        target_yaw = self._rigid_pilot_rotation_target(time_value)
+        target_yaw = self._rigid_motion_rotation_target(time_value)
         target_relative = reference_relative @ self._planar_rotation(target_yaw)
         current_relative = current_xy - current_com
         position_error = target_relative - current_relative
@@ -1754,8 +1696,8 @@ class CableGraspEnv:
         relative_velocity = velocity_xy - com_velocity
         h = 1e-3
         target_yaw_rate = (
-            self._rigid_pilot_rotation_target(time_value + h)
-            - self._rigid_pilot_rotation_target(time_value - h)
+            self._rigid_motion_rotation_target(time_value + h)
+            - self._rigid_motion_rotation_target(time_value - h)
         ) / (2.0 * h)
         target_relative_velocity = target_yaw_rate * np.column_stack((
             -target_relative[:, 1], target_relative[:, 0],
@@ -1791,50 +1733,6 @@ class CableGraspEnv:
         result[:, :2] = correction_xy
         return result
 
-    def _rigid_motion_target(self, time_value: float, p: float) -> np.ndarray:
-        """给出从静止平滑启动的有界 [x, y, yaw] 整体轨迹。"""
-
-        t = float(time_value)
-        frequency_scale = self.config.motion_frequency_scale
-        phase = self.phase_offset
-        envelope = 1.0 - math.exp(-((t / 0.35) ** 2))
-        if self.config.motion_regularity == "regular":
-            omega = 1.20 * frequency_scale
-            signals = np.array([
-                math.sin(omega * t + phase),
-                math.sin(omega * t + phase + 0.5 * math.pi),
-                math.sin(0.75 * omega * t + 0.5 * p),
-            ])
-        elif self.config.motion_regularity == "quasiperiodic":
-            signals = np.array([
-                0.70 * math.sin(0.85 * frequency_scale * t + phase)
-                + 0.30 * math.sin(1.45 * frequency_scale * t - 0.2 * p),
-                0.65 * math.sin(0.70 * frequency_scale * t - 0.3 * phase)
-                + 0.35 * math.sin(1.30 * frequency_scale * t + p),
-                0.70 * math.sin(0.60 * frequency_scale * t + 0.4 * p)
-                + 0.30 * math.sin(1.10 * frequency_scale * t - phase),
-            ])
-        else:
-            signals = np.sum(
-                self._stochastic_rigid_weight
-                * np.sin(
-                    self._stochastic_rigid_frequency * frequency_scale * t
-                    + self._stochastic_rigid_phase
-                ),
-                axis=1,
-            )
-            normalizer = np.maximum(
-                np.sum(np.abs(self._stochastic_rigid_weight), axis=1), 1e-9
-            )
-            signals /= normalizer
-
-        level_scale = self.config.disturbance_strength / 1.5
-        return envelope * level_scale * np.array([
-            0.045 * signals[0],
-            0.065 * signals[1],
-            0.45 * signals[2],
-        ])
-
     def _current_rigid_pose(self) -> tuple[np.ndarray, float]:
         current_xy = self.data.xpos[self.cable_ids, :2]
         current_com = np.average(current_xy, axis=0, weights=self.cable_mass)
@@ -1861,9 +1759,6 @@ class CableGraspEnv:
             self._stochastic_shape_frequency[:] = 1.0
             self._stochastic_shape_direction[:] = 1.0
             self._stochastic_shape_phase[:] = 0.0
-            self._stochastic_rigid_frequency[:] = 1.0
-            self._stochastic_rigid_phase[:] = 0.0
-            self._stochastic_rigid_weight[:] = 0.5
             return
 
         generator = self.rng if randomize else np.random.default_rng(0)
@@ -1875,17 +1770,6 @@ class CableGraspEnv:
         )
         self._stochastic_shape_direction[:] = generator.choice((-1.0, 1.0), 8)
         self._stochastic_shape_phase[:] = generator.uniform(0.0, 2.0 * math.pi, 8)
-
-        base_rigid_frequency = np.array([0.75, 1.20, 1.85, 2.70])
-        self._stochastic_rigid_frequency[:] = (
-            base_rigid_frequency[None, :] * generator.uniform(0.70, 1.30, (3, 4))
-        )
-        self._stochastic_rigid_phase[:] = generator.uniform(
-            0.0, 2.0 * math.pi, (3, 4)
-        )
-        weights = generator.normal(size=(3, 4))
-        norms = np.linalg.norm(weights, axis=1, keepdims=True)
-        self._stochastic_rigid_weight[:] = weights / np.maximum(norms, 1e-9)
 
     # -------------------------------------------------------------------------
     # 5. 常用状态查询接口
