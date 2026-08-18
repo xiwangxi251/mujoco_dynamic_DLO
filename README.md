@@ -66,7 +66,9 @@ powershell -ExecutionPolicy Bypass -File .\run_demo.ps1 --speed 2 --trials 0 --d
 ```
 
 无界面模式会同步离屏渲染，每个 trial 单独保存一个 MP4。默认输出到
-`headless_videos/run_时间_seed随机种子/trial_001.mp4`。可通过参数修改目录、帧率和分辨率：
+`headless_videos/run_时间_seed随机种子/<场景名>/trial_001.mp4`。每次命令对应一个独立
+`run_*`目录，场景是该运行目录下的子目录。批量启动多个场景时可给每条命令传入相同的
+`--run-name`，把它们汇总到同一个run目录。可通过参数修改输出根目录、帧率和分辨率：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run_demo.ps1 --headless --trials 3 `
@@ -74,14 +76,37 @@ powershell -ExecutionPolicy Bypass -File .\run_demo.ps1 --headless --trials 3 `
   --video-width 960 --video-height 540
 ```
 
-每个视频同时生成同名的 `trial_XXX_states.npz`，运行目录还包含对应的编译模型
-`model.mjb`。状态与视频帧一一对应，可以不重新运行物理和策略，从任意视角离线渲染：
+多个场景归入同一次实验运行：
+
+```powershell
+$runName = "run_$(Get-Date -Format 'yyyyMMdd_HHmmss')_seed20260804"
+$scenarios = @("id_static", "id_shape_nominal_current", "id_rigid_l1_nominal")
+foreach ($scenario in $scenarios) {
+  python run_grasp.py --scenario $scenario --trials 20 --headless `
+    --seed 20260804 --run-name $runName
+}
+```
+
+每个回合会同步保存两路视频：`trial_XXX.mp4` 是便于人工诊断的总览视角，
+`trial_XXX_global.mp4` 是供视觉方法使用的固定全局相机视角。全局相机默认输出
+`320 x 240` RGB；两路视频与 `trial_XXX_states.npz` 的帧数、帧率和仿真时间一致。
+`episodes.csv` 的 `global_video_path` 以及 `manifest.json` 的
+`artifacts.global_videos` 会记录对应文件。
+
+`CableGraspEnv.reset()` 和 `step()` 返回的 observation 现在包含
+`camera_rgb`，其形状为 `(240, 320, 3)`、类型为 `uint8`、通道顺序为 RGB。
+无需图像的状态诊断、基准测试和现有 48 维 RL 包装器会显式关闭相机渲染，以保持原有
+观测协议和运行速度。
+
+每个视频同时生成同名的 `trial_XXX_states.npz`，场景目录还包含对应的编译模型
+`<场景名>.mjb`、`episodes.csv`和`manifest.json`。状态与视频帧一一对应，可以不重新运行
+物理和策略，从任意视角离线渲染：
 
 推荐使用交互式回放窗口：
 
 ```powershell
 & C:\ProgramData\anaconda3\envs\dynamic\python.exe .\replay_recording.py `
-  --states .\headless_videos\run_时间_seed20260804\trial_001_states.npz
+  --states .\headless_videos\run_时间_seed20260804\id_static\trial_001_states.npz
 ```
 
 窗口内直接使用MuJoCo原生鼠标操作旋转、平移和缩放相机。按键如下：
@@ -100,10 +125,10 @@ powershell -ExecutionPolicy Bypass -File .\run_demo.ps1 --headless --trials 3 `
 
 ```powershell
 & C:\ProgramData\anaconda3\envs\dynamic\python.exe .\render_recording.py `
-  --states .\headless_videos\run_时间_seed20260804\trial_001_states.npz `
+  --states .\headless_videos\run_时间_seed20260804\id_static\trial_001_states.npz `
   --azimuth 45 --elevation -15 --distance 1.8 `
   --lookat 0.55 0 0.30 `
-  --output .\headless_videos\run_时间_seed20260804\trial_001_side.mp4
+  --output .\headless_videos\run_时间_seed20260804\id_static\trial_001_side.mp4
 ```
 
 也可以用 `--width`、`--height` 和 `--fps` 修改二次渲染的视频规格。离线渲染默认使用

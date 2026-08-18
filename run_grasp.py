@@ -65,15 +65,22 @@ def run_headless(args: argparse.Namespace) -> None:
     successes = 0
     rows: list[dict] = []
 
-    # 先按场景分目录，再为每次运行建立独立子目录。批量运行所有场景时，
-    # 无需额外指定 --video-dir，也能直接从路径判断视频属于哪个实验设置。
-    scenario_dir = args.video_dir / env.config.scenario_name
-    run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
-    video_dir = scenario_dir / run_name
-    suffix = 1
-    while video_dir.exists():
-        video_dir = scenario_dir / f"{run_name}_{suffix:02d}"
-        suffix += 1
+    # 先为本次命令建立独立运行目录，再按场景分目录。这样一次运行的参数、
+    # seed与产物天然聚合在同一run下，同时仍可从子目录名直接识别场景。
+    run_name = args.run_name or (
+        f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
+    )
+    run_dir = args.video_dir / run_name
+    if args.run_name is None:
+        suffix = 1
+        while run_dir.exists():
+            run_dir = args.video_dir / f"{run_name}_{suffix:02d}"
+            suffix += 1
+    video_dir = run_dir / env.config.scenario_name
+    if video_dir.exists():
+        raise FileExistsError(
+            f"场景输出目录已存在，拒绝覆盖: {video_dir.resolve()}"
+        )
     video_dir.mkdir(parents=True)
 
     # MuJoCo默认离屏 framebuffer 只有640x480；按请求尺寸自动扩展后再创建渲染器。
@@ -98,23 +105,33 @@ def run_headless(args: argparse.Namespace) -> None:
     camera.azimuth = 135
     camera.elevation = -25
 
-    def write_frame(writer: cv2.VideoWriter, recorded_states: list[np.ndarray]) -> None:
-        """渲染当前物理状态，并写入本回合的视频。"""
+    def write_frame(
+        writer: cv2.VideoWriter,
+        global_writer: cv2.VideoWriter,
+        recorded_states: list[np.ndarray],
+    ) -> None:
+        """同步保存物理状态、诊断总览画面和固定全局相机画面。"""
         state = np.empty(state_size, dtype=np.float64)
         mujoco.mj_getState(env.model, env.data, state, state_spec)
         recorded_states.append(state)
         renderer.update_scene(env.data, camera=camera)
         rgb = renderer.render()
         writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        global_rgb = env.camera_rgb()
+        global_writer.write(cv2.cvtColor(global_rgb, cv2.COLOR_RGB2BGR))
 
     print(f"model={XML_PATH}", flush=True)
-    print(f"headless_videos={video_dir.resolve()}", flush=True)
+    print(f"headless_run={run_dir.resolve()}", flush=True)
+    print(f"scenario_outputs={video_dir.resolve()}", flush=True)
     for trial in range(args.trials):
         episode_seed = args.seed + trial
         _, initial_info = env.reset(seed=episode_seed)
         policy.reset()
         print_trial_start(env)
         video_path = video_dir / f"trial_{env.trial_index:03d}.mp4"
+        global_video_path = (
+            video_dir / f"trial_{env.trial_index:03d}_global.mp4"
+        )
         writer = cv2.VideoWriter(
             str(video_path),
             cv2.VideoWriter_fourcc(*"mp4v"),
@@ -123,19 +140,35 @@ def run_headless(args: argparse.Namespace) -> None:
         )
         if not writer.isOpened():
             renderer.close()
+            env.close()
             raise RuntimeError(f"无法创建视频文件: {video_path}")
+        global_writer = cv2.VideoWriter(
+            str(global_video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            args.video_fps,
+            (
+                env.config.global_camera_width,
+                env.config.global_camera_height,
+            ),
+        )
+        if not global_writer.isOpened():
+            writer.release()
+            renderer.close()
+            env.close()
+            raise RuntimeError(f"无法创建固定全局相机视频文件: {global_video_path}")
         previous_phase = policy.phase
         next_frame_time = 0.0
         recorded_states: list[np.ndarray] = []
         min_target_distance = float("inf")
         steps = 0
+        termination_reason: str | None = None
         # 保存重置后的初始画面；之后按仿真时间而不是计算耗时采样。
-        write_frame(writer, recorded_states)
+        write_frame(writer, global_writer, recorded_states)
         next_frame_time += 1.0 / args.video_fps
         while not policy.finished and env.data.time < env.config.episode_seconds:
             # 标准交互循环：策略产生动作 -> 环境执行动作并推进物理。
             action = policy.action()
-            _, _, _, truncated, _ = env.step(action)
+            _, _, _, truncated, step_info = env.step(action)
             steps += 1
             min_target_distance = min(
                 min_target_distance,
@@ -144,7 +177,7 @@ def run_headless(args: argparse.Namespace) -> None:
                 )),
             )
             if env.data.time + 1e-9 >= next_frame_time:
-                write_frame(writer, recorded_states)
+                write_frame(writer, global_writer, recorded_states)
                 next_frame_time += 1.0 / args.video_fps
             if policy.phase is not previous_phase:
                 tracking_error = ((env.hand_position - policy.last_desired) ** 2).sum() ** 0.5
@@ -159,9 +192,15 @@ def run_headless(args: argparse.Namespace) -> None:
                     print(f"    {break_diagnostics}", flush=True)
                 previous_phase = policy.phase
             if truncated:
-                policy.result = "failed_timeout"
+                termination_reason = step_info.get("termination_reason")
+                policy.result = (
+                    "failed_motion_boundary"
+                    if termination_reason == "rigid_motion_boundary_crossed"
+                    else "failed_timeout"
+                )
                 policy.finished = True
         writer.release()
+        global_writer.release()
         states_path = video_dir / f"trial_{env.trial_index:03d}_states.npz"
         np.savez_compressed(
             states_path,
@@ -171,6 +210,13 @@ def run_headless(args: argparse.Namespace) -> None:
             fps=np.float64(args.video_fps),
             width=np.int64(args.video_width),
             height=np.int64(args.video_height),
+            global_camera_name=np.asarray(env.config.global_camera_name),
+            global_camera_width=np.int64(env.config.global_camera_width),
+            global_camera_height=np.int64(env.config.global_camera_height),
+            global_camera_fovy=np.float64(env.config.global_camera_fovy),
+            global_camera_pos=np.asarray(env.config.global_camera_pos),
+            global_camera_quat=np.asarray(env.config.global_camera_quat),
+            global_video_file=np.asarray(global_video_path.name),
             model_file=np.asarray(model_path.name),
             source_xml=np.asarray(str(XML_PATH.resolve())),
             mujoco_version=np.asarray(mujoco.__version__),
@@ -180,14 +226,12 @@ def run_headless(args: argparse.Namespace) -> None:
             scenario_id=np.asarray(env.config.scenario_id or ""),
             motion_profile_hash=np.asarray(env.motion_profile_hash),
             result=np.asarray(policy.result),
+            termination_reason=np.asarray(termination_reason or ""),
         )
         info = env.info()
         info["ever_pinched"] = env.last_grasped_body_id is not None
         info["base_success"] = env.ever_success
         info["success"] = policy.result == "success"
-        reached_time_limit = bool(
-            env.data.time >= env.config.episode_seconds - 1e-9
-        )
         row = _base_row(
             "scripted",
             trial + 1,
@@ -204,8 +248,9 @@ def run_headless(args: argparse.Namespace) -> None:
             "min_target_distance": min_target_distance,
             "policy_result": policy.result,
             "terminated": policy.result == "success",
-            "truncated": reached_time_limit,
+            "truncated": termination_reason is not None,
             "video_path": str(video_path.resolve()),
+            "global_video_path": str(global_video_path.resolve()),
             "states_path": str(states_path.resolve()),
             "model_path": str(model_path.resolve()),
         })
@@ -213,9 +258,11 @@ def run_headless(args: argparse.Namespace) -> None:
         successes += int(policy.result == "success")
         print(policy.summary(), flush=True)
         print(f"  video={video_path.resolve()}", flush=True)
+        print(f"  global_video={global_video_path.resolve()}", flush=True)
         print(f"  states={states_path.resolve()}", flush=True)
 
     renderer.close()
+    env.close()
     summary = _summary(rows)
     episodes_path = video_dir / "episodes.csv"
     manifest_path = video_dir / "manifest.json"
@@ -225,6 +272,10 @@ def run_headless(args: argparse.Namespace) -> None:
         "schema_version": 1,
         "created_at": datetime.now().astimezone().isoformat(),
         "command": [sys.executable, *sys.argv],
+        "output": {
+            "run_dir": str(run_dir.resolve()),
+            "scenario_dir": str(video_dir.resolve()),
+        },
         "scenario": (
             {"name": env.config.scenario_name, "legacy": True}
             if scenario is None else scenario.asdict()
@@ -235,6 +286,14 @@ def run_headless(args: argparse.Namespace) -> None:
             "fps": args.video_fps,
             "width": args.video_width,
             "height": args.video_height,
+            "global_camera": {
+                "name": env.config.global_camera_name,
+                "width": env.config.global_camera_width,
+                "height": env.config.global_camera_height,
+                "fovy": env.config.global_camera_fovy,
+                "pos_in_world": env.config.global_camera_pos,
+                "quat_in_world": env.config.global_camera_quat,
+            },
         },
         "artifacts": {
             "model": {
@@ -243,6 +302,7 @@ def run_headless(args: argparse.Namespace) -> None:
             },
             "episodes_csv": str(episodes_path.resolve()),
             "videos": [row["video_path"] for row in rows],
+            "global_videos": [row["global_video_path"] for row in rows],
             "states": [row["states_path"] for row in rows],
         },
         "source_xml": {
@@ -401,7 +461,7 @@ def run_viewer(args: argparse.Namespace) -> None:
                     break
                 # 同一GUI帧内可推进多个50 Hz动作，viewer仍按约60 FPS刷新。
                 action = policy.action()
-                _, _, _, truncated, _ = env.step(action)
+                _, _, _, truncated, step_info = env.step(action)
                 steps += 1
 
                 if policy.phase is not previous_phase:
@@ -418,7 +478,12 @@ def run_viewer(args: argparse.Namespace) -> None:
                     previous_phase = policy.phase
 
                 if truncated and not policy.finished:
-                    policy.result = "failed_timeout"
+                    policy.result = (
+                        "failed_motion_boundary"
+                        if step_info.get("termination_reason")
+                        == "rigid_motion_boundary_crossed"
+                        else "failed_timeout"
+                    )
                     policy.finished = True
 
                 if policy.finished and not trial_reported:
@@ -478,6 +543,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260804)
     parser.add_argument("--video-dir", type=Path, default=Path("headless_videos"),
                         help="headless视频根目录；每次运行会建立独立子目录")
+    parser.add_argument(
+        "--run-name",
+        help=(
+            "可选运行目录名；批量运行多个场景时传入同一个名称，"
+            "将它们保存到同一个run目录"
+        ),
+    )
     parser.add_argument("--video-fps", type=float, default=25.0,
                         help="headless视频帧率")
     parser.add_argument("--video-width", type=int, default=960,
@@ -492,6 +564,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--video-fps must be greater than zero")
     if args.video_width <= 0 or args.video_height <= 0:
         parser.error("--video-width and --video-height must be greater than zero")
+    if args.run_name is not None:
+        run_name_path = Path(args.run_name)
+        if (
+            not args.run_name.strip()
+            or run_name_path.name != args.run_name
+            or args.run_name in {".", ".."}
+        ):
+            parser.error("--run-name must be one non-empty directory name")
     return args
 
 

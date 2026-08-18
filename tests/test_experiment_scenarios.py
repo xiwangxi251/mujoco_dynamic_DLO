@@ -91,7 +91,10 @@ class EnvironmentScenarioTests(unittest.TestCase):
     def make(name: str, seed: int = 1234) -> CableGraspEnv:
         scenario = get_scenario(name)
         return CableGraspEnv(env_config_for_scenario(
-            scenario, seed=seed, episode_seconds=0.1,
+            scenario,
+            seed=seed,
+            episode_seconds=0.1,
+            camera_observation_enabled=False,
         ))
 
     def test_constructor_initialization_is_not_counted_as_a_trial(self) -> None:
@@ -106,6 +109,33 @@ class EnvironmentScenarioTests(unittest.TestCase):
             self.assertEqual(second["trial"], 2)
         finally:
             del env
+
+    def test_global_camera_is_fixed_and_returned_in_observation(self) -> None:
+        config = EnvConfig(
+            seed=12,
+            episode_seconds=0.1,
+            global_camera_width=160,
+            global_camera_height=120,
+        )
+        env = CableGraspEnv(config)
+        try:
+            observation, _ = env.reset(seed=12)
+            self.assertEqual(int(env.model.cam_bodyid[env.global_camera_id]), 0)
+            camera_position = env.data.cam_xpos[env.global_camera_id].copy()
+            image = observation["camera_rgb"]
+            self.assertEqual(image.shape, (120, 160, 3))
+            self.assertEqual(image.dtype, np.uint8)
+            self.assertGreater(float(image.std()), 1.0)
+            image[:] = 0
+            self.assertGreater(float(env.camera_rgb().std()), 1.0)
+            next_observation, _, _, _, _ = env.step(env.ready_ctrl)
+            self.assertEqual(next_observation["camera_rgb"].shape, (120, 160, 3))
+            self.assertGreater(next_observation["time"], observation["time"])
+            self.assertTrue(np.array_equal(
+                env.data.cam_xpos[env.global_camera_id], camera_position
+            ))
+        finally:
+            env.close()
 
     def test_environment_limits_arm_and_gripper_commands(self) -> None:
         env = self.make("id_static")
@@ -263,10 +293,20 @@ class EnvironmentScenarioTests(unittest.TestCase):
         self.assertEqual(config.close_prediction_horizon, 0.12)
         self.assertEqual(config.target_filter_alpha, 0.10)
         self.assertEqual(config.intercept_y_limits, (-0.43, 0.43))
+        self.assertEqual(config.approach_fast_distance, 0.12)
+        self.assertEqual(config.approach_linear_velocity_limit, 0.90)
+        self.assertEqual(config.intercept_linear_velocity_limit, 0.95)
+        self.assertEqual(config.precision_linear_velocity_limit, 0.65)
+        self.assertEqual(config.approach_orientation_gain, 0.65)
+        self.assertEqual(config.precision_orientation_gain, 1.0)
+        self.assertEqual(config.policy_joint_velocity_fraction, 1.0)
+        self.assertEqual(config.ik_target_horizon, 0.11)
         with self.assertRaisesRegex(ValueError, "prediction_horizon"):
             PolicyConfig(prediction_horizon=-0.01)
         with self.assertRaisesRegex(ValueError, "target_filter_alpha"):
             PolicyConfig(target_filter_alpha=0.0)
+        with self.assertRaisesRegex(ValueError, "policy_joint_velocity_fraction"):
+            PolicyConfig(policy_joint_velocity_fraction=1.01)
         with self.assertRaisesRegex(ValueError, "intercept_y_limits"):
             PolicyConfig(intercept_y_limits=(0.5, -0.5))
 
@@ -281,7 +321,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_approach_requires_both_position_and_orientation(self) -> None:
+    def test_approach_requires_position_and_safe_tilt_but_allows_yaw_error(self) -> None:
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1008)
@@ -292,12 +332,44 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 env.hand_position - np.array([0.0, 0.0, 0.20])
             )
 
-            # 位置已经满足，但reset时仍有90度待对齐偏航，不能开始向桌面下降。
+            # reset目标与当前姿态只有90度平面内偏航；夹爪仍然竖直，可以进入截获。
+            policy.action()
+            self.assertIs(policy.phase, Phase.INTERCEPT)
+
+            policy.phase = Phase.APPROACH
+            policy.phase_start = float(env.data.time)
+            policy.desired_approach_axis = np.array([1.0, 0.0, 0.0])
+            policy.action()
+            self.assertIs(policy.phase, Phase.APPROACH)
+        finally:
+            del env
+
+    def test_approach_accepts_bounded_motion_lag_but_rejects_large_error(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1012)
+            policy = DynamicCableGraspPolicy(env)
+            rotation = env.data.xmat[env.hand_id].reshape(3, 3)
+            policy.desired_quat = rotation_to_quat(rotation)
+            policy.desired_approach_axis = rotation[:, 2].copy()
+            policy.phase = Phase.APPROACH
+            policy.phase_start = float(env.data.time)
+
+            policy._predicted_segment = lambda prediction_horizon=None: (
+                env.hand_position
+                + np.array([0.15, 0.0, -0.20])
+            )
             policy.action()
             self.assertIs(policy.phase, Phase.APPROACH)
 
-            rotation = env.data.xmat[env.hand_id].reshape(3, 3)
-            policy.desired_quat = rotation_to_quat(rotation)
+            policy._predicted_segment = lambda prediction_horizon=None: (
+                env.hand_position
+                + np.array([
+                    0.9 * policy.config.approach_position_tolerance,
+                    0.0,
+                    -0.20,
+                ])
+            )
             policy.action()
             self.assertIs(policy.phase, Phase.INTERCEPT)
         finally:
@@ -318,6 +390,37 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
+    def test_far_approach_prioritizes_translation_without_skipping_safety_gate(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1011)
+            policy = DynamicCableGraspPolicy(env)
+            policy.phase = Phase.APPROACH
+            policy.phase_start = float(env.data.time)
+            far_target = env.hand_position + np.array([0.0, 0.30, -0.10])
+            policy._predicted_segment = lambda prediction_horizon=None: (
+                far_target - np.array([0.0, 0.0, 0.20])
+            )
+
+            action = policy.action()
+            self.assertIs(policy.phase, Phase.APPROACH)
+            self.assertTrue(np.all(np.isfinite(action)))
+
+            control_dt = env.model.opt.timestep * env.config.frame_skip
+            requested_velocity = (
+                action[:7] - env.data.qpos[env.arm_qpos_adr]
+            ) / policy.config.ik_target_horizon
+            self.assertLessEqual(
+                np.max(
+                    np.abs(requested_velocity)
+                    / np.asarray(env.config.arm_joint_velocity_limits)
+                ),
+                policy.config.policy_joint_velocity_fraction + 1e-9,
+            )
+            self.assertGreater(policy.config.ik_target_horizon, control_dt)
+        finally:
+            del env
+
     def test_intercept_rejects_unsafe_gripper_orientation(self) -> None:
         env = self.make("id_static")
         try:
@@ -325,7 +428,8 @@ class EnvironmentScenarioTests(unittest.TestCase):
             policy = DynamicCableGraspPolicy(env)
             policy.phase = Phase.INTERCEPT
             policy.phase_start = float(env.data.time)
-            # reset目标与当前姿态相差90度，必须撤离而不是继续追踪桌面目标。
+            # 将安全接近轴改为水平，模拟夹爪横倒；必须撤离而不是继续下探。
+            policy.desired_approach_axis = np.array([1.0, 0.0, 0.0])
             policy.action()
             self.assertIs(policy.phase, Phase.RECOVER)
         finally:
@@ -466,22 +570,58 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_long_l1_l2_path_keeps_no_contact_termination(self) -> None:
+    def test_long_l1_l2_path_terminates_on_real_com_boundary(self) -> None:
         level1 = self.make("id_rigid_l1_high")
         level2 = self.make("id_rigid_l2_high")
         try:
             self.assertEqual(RIGID_MOTION_TRAVEL, 1.4)
             self.assertGreater(level1._rigid_motion_duration(), 3.6)
             self.assertGreater(level2._rigid_motion_duration(), 3.6)
+            end_time = (
+                RIGID_MOTION_START_TIME + level1._rigid_motion_duration()
+            )
+            nominal_end = level1._rigid_motion_target(end_time)
+            self.assertTrue(np.array_equal(
+                nominal_end, level1._rigid_motion_target(end_time + 1.0)
+            ))
+            self.assertEqual(
+                level1.info()["rigid_motion_control"],
+                "actual_progress_velocity_v1",
+            )
 
             level1.reset(seed=43)
+            level1.config.episode_seconds = 30.0
             level1.data.time = (
                 RIGID_MOTION_START_TIME + level1._rigid_motion_duration()
             )
             _, _, _, truncated, info = level1.step(level1.ready_ctrl)
-            self.assertTrue(info["rigid_motion_finished"])
+            self.assertTrue(info["rigid_motion_nominal_finished"])
+            self.assertFalse(info["rigid_motion_finished"])
             self.assertFalse(info["rigid_motion_released"])
+            self.assertFalse(truncated)
+            self.assertIsNone(info["termination_reason"])
+
+            delta_y = (
+                level1.config.rigid_motion_exit_y
+                + 0.01
+                - level1.rigid_motion_com_y
+            )
+            level1.data.qpos[level1.cable_free_qadr + 1] += delta_y
+            level1.data.qvel[
+                level1.cable_free_dadr:level1.cable_free_dadr + 6
+            ] = 0.0
+            mujoco.mj_forward(level1.model, level1.data)
+            _, _, _, truncated, info = level1.step(level1.ready_ctrl)
+            self.assertTrue(info["rigid_motion_finished"])
             self.assertTrue(truncated)
+            self.assertEqual(
+                info["termination_reason"], "rigid_motion_boundary_crossed"
+            )
+
+            level1.rigid_motion_released = True
+            _, _, _, truncated, info = level1.step(level1.ready_ctrl)
+            self.assertFalse(truncated)
+            self.assertIsNone(info["termination_reason"])
         finally:
             del level1, level2
 
@@ -519,6 +659,13 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 abs(level1._rigid_motion_rotation_target(end)),
                 RIGID_MOTION_ROTATION,
             )
+            halfway = level1._rigid_motion_target(
+                start + 0.5 * level1._rigid_motion_duration()
+            )
+            level1.data.qpos[level1.cable_free_qadr:level1.cable_free_qadr + 2] += (
+                halfway
+            )
+            mujoco.mj_forward(level1.model, level1.data)
             level1.data.time = start + 0.5 * level1._rigid_motion_duration()
             level1._apply_cable_disturbance()
             self.assertGreater(
@@ -550,7 +697,11 @@ class EnvironmentScenarioTests(unittest.TestCase):
                     centered[0], reference, rtol=0.0, atol=1e-12
                 ))
 
-            legacy = CableGraspEnv(EnvConfig(seed=46, episode_seconds=0.1))
+            legacy = CableGraspEnv(EnvConfig(
+                seed=46,
+                episode_seconds=0.1,
+                camera_observation_enabled=False,
+            ))
             try:
                 observation, info = legacy.reset(seed=46)
                 legacy_xy = observation["cable_positions"][:, :2]
@@ -639,6 +790,63 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
+    def test_rigid_motion_does_not_accumulate_catch_up_error_while_blocked(self) -> None:
+        environments = (
+            self.make("id_rigid_l1_nominal", seed=48),
+            self.make("id_rigid_l2_nominal", seed=48),
+        )
+        try:
+            for env in environments:
+                env.reset(seed=48)
+                stopped_velocity = np.zeros((len(env.cable_ids), 2))
+                early_translation, early_rotation = env._rigid_motion_acceleration(
+                    RIGID_MOTION_START_TIME + 0.1, stopped_velocity,
+                )
+                late_translation, late_rotation = env._rigid_motion_acceleration(
+                    RIGID_MOTION_START_TIME + 10.0, stopped_velocity,
+                )
+
+                # A ten-second obstruction cannot build a larger release command.
+                self.assertTrue(np.array_equal(
+                    early_translation, late_translation,
+                ))
+                self.assertTrue(np.array_equal(early_rotation, late_rotation))
+                self.assertLessEqual(
+                    np.linalg.norm(late_translation[0, :2]),
+                    env.config.rigid_translation_max_acceleration + 1e-12,
+                )
+
+            level1 = environments[0]
+            nominal_velocity = np.broadcast_to(
+                [0.0, level1._rigid_motion_speed()],
+                (len(level1.cable_ids), 2),
+            ).copy()
+            translation, _ = level1._rigid_motion_acceleration(
+                RIGID_MOTION_START_TIME + 10.0, nominal_velocity,
+            )
+            # At nominal forward speed there is no hidden longitudinal pull.
+            self.assertAlmostEqual(float(translation[0, 1]), 0.0, places=12)
+
+            # With the environment's 50 Hz command interval, releasing a fully
+            # blocked cable approaches nominal speed monotonically and cannot
+            # overshoot it even when table friction disappears completely.
+            control_dt = level1.model.opt.timestep * level1.config.frame_skip
+            simulated_speed = 0.0
+            for _ in range(20):
+                simulated_velocity = np.broadcast_to(
+                    [0.0, simulated_speed], (len(level1.cable_ids), 2),
+                ).copy()
+                translation, _ = level1._rigid_motion_acceleration(
+                    RIGID_MOTION_START_TIME + 10.0, simulated_velocity,
+                )
+                simulated_speed += float(translation[0, 1]) * control_dt
+                self.assertLessEqual(
+                    simulated_speed, level1._rigid_motion_speed() + 1e-12,
+                )
+        finally:
+            for env in environments:
+                del env
+
     def test_combined_motion_releases_only_rigid_drive_after_confirmed_grasp(self) -> None:
         env = self.make("id_combined_l1_nominal")
         try:
@@ -648,9 +856,6 @@ class EnvironmentScenarioTests(unittest.TestCase):
             self.assertGreater(np.linalg.norm(env._last_shape_acceleration), 0.0)
             self.assertGreater(
                 np.linalg.norm(env._last_rigid_translation_acceleration), 0.0
-            )
-            self.assertGreater(
-                np.linalg.norm(env._last_rigid_rotation_acceleration), 0.0
             )
             self.assertTrue(np.array_equal(
                 env._last_rigid_shape_hold_acceleration,
@@ -671,7 +876,11 @@ class EnvironmentScenarioTests(unittest.TestCase):
             del env
 
     def test_legacy_default_preserves_original_shape_formula(self) -> None:
-        env = CableGraspEnv(EnvConfig(seed=71, episode_seconds=0.1))
+        env = CableGraspEnv(EnvConfig(
+            seed=71,
+            episode_seconds=0.1,
+            camera_observation_enabled=False,
+        ))
         try:
             env.reset(seed=71)
             t = env.phase_offset + env.data.time

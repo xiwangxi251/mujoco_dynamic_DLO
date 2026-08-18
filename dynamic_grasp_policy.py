@@ -47,11 +47,22 @@ class PolicyConfig:
     intercept_z_limits: tuple[float, float] = (0.010, 0.18)
     settle_seconds: float = 0.8
     approach_timeout: float = 6.0
-    approach_position_tolerance: float = 0.035
-    approach_orientation_tolerance: float = math.radians(25.0)
-    intercept_orientation_limit: float = math.radians(35.0)
+    # APPROACH只负责到达线缆上方；匀速L1目标存在约5 cm稳态跟踪滞后，随后由
+    # INTERCEPT完成精确下降。该门限仍远小于旧故障中的20--27 cm强制下降误差。
+    approach_position_tolerance: float = 0.065
+    approach_tilt_tolerance: float = math.radians(25.0)
+    intercept_tilt_limit: float = math.radians(35.0)
     intercept_singularity_limit: float = 0.045
-    ik_target_horizon: float = 0.06
+    # APPROACH远离目标时优先追赶位置；进入目标上方后再恢复完整姿态权重。
+    # 最终速度仍由环境端统一限幅，较长的IK目标时域只避免策略命令过弱。
+    approach_fast_distance: float = 0.12
+    approach_linear_velocity_limit: float = 0.90
+    intercept_linear_velocity_limit: float = 0.95
+    precision_linear_velocity_limit: float = 0.65
+    approach_orientation_gain: float = 0.65
+    precision_orientation_gain: float = 1.0
+    policy_joint_velocity_fraction: float = 1.0
+    ik_target_horizon: float = 0.11
     intercept_timeout: float = 9.0
     close_timeout: float = 0.8
     close_hard_timeout: float = 3.0
@@ -72,8 +83,12 @@ class PolicyConfig:
         for name in (
             "prediction_horizon", "approach_prediction_horizon",
             "close_prediction_horizon", "approach_position_tolerance",
-            "approach_orientation_tolerance", "intercept_orientation_limit",
-            "intercept_singularity_limit", "ik_target_horizon",
+            "approach_tilt_tolerance", "intercept_tilt_limit",
+            "intercept_singularity_limit", "approach_fast_distance",
+            "approach_linear_velocity_limit", "intercept_linear_velocity_limit",
+            "precision_linear_velocity_limit", "policy_joint_velocity_fraction",
+            "approach_orientation_gain", "precision_orientation_gain",
+            "ik_target_horizon",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
@@ -83,6 +98,8 @@ class PolicyConfig:
             or not 0.0 < self.target_filter_alpha <= 1.0
         ):
             raise ValueError("target_filter_alpha must be in (0, 1]")
+        if not 0.0 < self.policy_joint_velocity_fraction <= 1.0:
+            raise ValueError("policy_joint_velocity_fraction must be in (0, 1]")
         for name in (
             "intercept_x_limits", "intercept_y_limits", "intercept_z_limits",
         ):
@@ -132,6 +149,7 @@ class DynamicCableGraspPolicy:
         self.max_recover_xy_drift = 0.0
         self.last_desired = np.zeros(3)
         self.desired_quat = np.array([1.0, 0.0, 0.0, 0.0])
+        self.desired_approach_axis = np.array([0.0, 0.0, 1.0])
         self.reset()
 
     def reset(self) -> None:
@@ -158,7 +176,9 @@ class DynamicCableGraspPolicy:
             [1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0],
         ])
-        self.desired_quat = rotation_to_quat(z_rotation @ rotation)
+        desired_rotation = z_rotation @ rotation
+        self.desired_quat = rotation_to_quat(desired_rotation)
+        self.desired_approach_axis = desired_rotation[:, 2].copy()
 
     @property
     def phase_time(self) -> float:
@@ -249,6 +269,16 @@ class DynamicCableGraspPolicy:
         angle = 2.0 * math.asin(float(np.clip(0.5 * np.linalg.norm(error), 0.0, 1.0)))
         return error, angle
 
+    def _tilt_error(self) -> float:
+        """返回夹爪接近轴相对安全竖直方向的倾斜角，不把平面内偏航算作横倒。"""
+
+        rotation = self.env.data.xmat[self.env.hand_id].reshape(3, 3)
+        actual_axis = rotation[:, 2]
+        cosine = float(np.clip(
+            np.dot(actual_axis, self.desired_approach_axis), -1.0, 1.0
+        ))
+        return math.acos(cosine)
+
     def _task_jacobian(self) -> np.ndarray:
         point_jac, jac_rot = point_jacobian(
             self.env.model,
@@ -272,41 +302,91 @@ class DynamicCableGraspPolicy:
         return self._ik_action(hand, 255.0)
 
     def _ik_action(self, desired_position: np.ndarray, gripper: float) -> np.ndarray:
-        """用姿态加权阻尼最小二乘IK生成关节目标和夹爪命令。"""
+        """用位置优先的分层阻尼IK生成关节目标和夹爪命令。"""
 
         model = self.env.model
         data = self.env.data
         position_error = desired_position - self.env.hand_position
         orientation_error, _ = self._orientation_error()
-        linear_velocity = self._limit_vector_norm(6.0 * position_error, 0.65)
+        position_error_norm = float(np.linalg.norm(position_error))
+        fast_approach = bool(
+            self.phase is Phase.APPROACH
+            and position_error_norm > self.config.approach_fast_distance
+        )
+        linear_velocity_limit = (
+            self.config.approach_linear_velocity_limit
+            if fast_approach
+            else (
+                self.config.intercept_linear_velocity_limit
+                if self.phase is Phase.INTERCEPT
+                else self.config.precision_linear_velocity_limit
+            )
+        )
+        linear_velocity = self._limit_vector_norm(
+            6.0 * position_error, linear_velocity_limit
+        )
         angular_velocity = self._limit_vector_norm(2.5 * orientation_error, 1.40)
 
-        # 姿态行加权后再求解；当位置与姿态无法同时满足时，避免夹爪朝向被位置追踪吞掉。
-        orientation_weight = 2.0
+        # 位置是严格的一级任务。姿态只使用位置任务的零空间，因此即使目标接近
+        # 工作空间边缘，也不能为了转动夹爪而把夹持中心压向桌面或拉离目标。
         jacobian = self._task_jacobian()
-        weighted_jacobian = jacobian.copy()
-        weighted_jacobian[3:] *= orientation_weight
-        weighted_velocity = np.concatenate([
-            linear_velocity,
-            orientation_weight * angular_velocity,
-        ])
-        sigma_min = float(np.linalg.svd(weighted_jacobian, compute_uv=False)[-1])
-        singularity = float(np.clip((0.10 - sigma_min) / 0.10, 0.0, 1.0))
-        damping = 0.04 + 0.12 * singularity * singularity
-        inverse = np.linalg.solve(
-            weighted_jacobian @ weighted_jacobian.T + damping**2 * np.eye(6),
-            np.eye(6),
+        position_jacobian = jacobian[:3]
+        position_damping = 0.04
+        position_inverse = np.linalg.solve(
+            position_jacobian @ position_jacobian.T
+            + position_damping**2 * np.eye(3),
+            np.eye(3),
         )
-        pseudoinverse = weighted_jacobian.T @ inverse
-        q_velocity = pseudoinverse @ weighted_velocity
+        position_pseudoinverse = position_jacobian.T @ position_inverse
+        position_velocity = position_pseudoinverse @ linear_velocity
+        position_nullspace = np.eye(7) - np.linalg.pinv(
+            position_jacobian, rcond=1e-5
+        ) @ position_jacobian
 
-        # 7自由度冗余只在任务零空间中回到ready姿态，避免肘部任意翻转和逼近关节限位。
+        orientation_gain = (
+            self.config.approach_orientation_gain
+            if fast_approach
+            else self.config.precision_orientation_gain
+        )
+        orientation_jacobian = jacobian[3:] @ position_nullspace
+        orientation_sigma_min = float(
+            np.linalg.svd(orientation_jacobian, compute_uv=False)[-1]
+        )
+        orientation_singularity = float(np.clip(
+            (0.10 - orientation_sigma_min) / 0.10, 0.0, 1.0
+        ))
+        orientation_damping = (
+            0.04 + 0.12 * orientation_singularity * orientation_singularity
+        )
+        orientation_inverse = np.linalg.solve(
+            orientation_jacobian @ orientation_jacobian.T
+            + orientation_damping**2 * np.eye(3),
+            np.eye(3),
+        )
+        orientation_residual = (
+            angular_velocity - jacobian[3:] @ position_velocity
+        )
+        orientation_velocity = (
+            orientation_jacobian.T
+            @ orientation_inverse
+            @ orientation_residual
+        )
+        q_velocity = (
+            position_velocity + orientation_gain * orientation_velocity
+        )
+
+        # 最后的冗余自由度才用于回到ready姿态，避免肘部任意翻转和逼近关节限位；
+        # 使用完整任务的精确零空间，不能污染上面的手部位置和姿态任务。
         q_current = data.qpos[self.env.arm_qpos_adr]
-        nullspace = np.eye(7) - pseudoinverse @ weighted_jacobian
-        q_velocity += nullspace @ (0.8 * (self.env.ready_qpos[:7] - q_current))
+        task_nullspace = np.eye(7) - np.linalg.pinv(
+            jacobian, rcond=1e-5
+        ) @ jacobian
+        q_velocity += task_nullspace @ (
+            0.8 * (self.env.ready_qpos[:7] - q_current)
+        )
 
         # 整体缩放而非逐关节裁剪，保留IK求出的多关节运动方向。
-        velocity_limits = 0.85 * np.asarray(
+        velocity_limits = self.config.policy_joint_velocity_fraction * np.asarray(
             self.env.config.arm_joint_velocity_limits, dtype=float
         )
         velocity_scale = min(
@@ -369,16 +449,16 @@ class DynamicCableGraspPolicy:
         if self.phase is Phase.APPROACH:
             # 让实际两指夹持中心移动到预测线段上方20 cm，夹爪保持张开。
             desired = target + np.array([0.0, 0.0, 0.20])
-            _, orientation_angle = self._orientation_error()
+            tilt_angle = self._tilt_error()
             position_ready = (
                 np.linalg.norm(hand - desired)
                 < self.config.approach_position_tolerance
             )
-            orientation_ready = (
-                orientation_angle
-                < self.config.approach_orientation_tolerance
+            tilt_ready = (
+                tilt_angle
+                < self.config.approach_tilt_tolerance
             )
-            if position_ready and orientation_ready:
+            if position_ready and tilt_ready:
                 # Select one material segment when descent begins.  Re-selecting
                 # the globally nearest point every control step makes the goal
                 # jump between adjacent folds in a deforming cable.
@@ -391,9 +471,9 @@ class DynamicCableGraspPolicy:
         if self.phase is Phase.INTERCEPT:
             # 实际两指夹持中心直接追踪目标线缆段中心，不再使用旧虚拟点的z补偿。
             desired = target.copy()
-            _, orientation_angle = self._orientation_error()
+            tilt_angle = self._tilt_error()
             if (
-                orientation_angle > self.config.intercept_orientation_limit
+                tilt_angle > self.config.intercept_tilt_limit
                 or self._minimum_task_singular_value()
                 < self.config.intercept_singularity_limit
             ):

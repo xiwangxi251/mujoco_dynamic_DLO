@@ -129,6 +129,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 scenario_name=first_scenario.name,
                 scenario_id=first_scenario.scenario_id,
                 scenario_split=first_scenario.split.value,
+                camera_observation_enabled=False,
                 **first_overrides,
             )
         self.base_env = CableGraspEnv(
@@ -138,6 +139,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 seed=seed,
                 disturbance_strength=disturbance_strength,
                 episode_seconds=episode_seconds,
+                camera_observation_enabled=False,
             )
         )
         self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(8,), dtype=np.float32)

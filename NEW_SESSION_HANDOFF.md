@@ -325,11 +325,19 @@ powershell -ExecutionPolicy Bypass -File .\run_demo.ps1 --headless --trials 3
 
 ```text
 headless_videos/run_时间_seed.../
-  model.mjb
-  trial_001.mp4
-  trial_001_states.npz
-  ...
+  <场景名>/
+    <场景名>.mjb
+    trial_001.mp4
+    trial_001_global.mp4
+    trial_001_states.npz
+    episodes.csv
+    manifest.json
+    ...
 ```
+
+默认每次`run_grasp.py`命令建立一个新run目录；用PowerShell批量运行多个场景时，应为每条
+命令传入相同的`--run-name`，从而让同一批实验共享run目录。若该run下已存在同名场景，
+脚本会拒绝覆盖。
 
 模型离屏 framebuffer 会在内存中自动扩到请求的视频尺寸，避免默认 640 宽度导致 `Image width 960 > framebuffer width 640`。
 
@@ -337,7 +345,7 @@ headless_videos/run_时间_seed.../
 
 ```powershell
 & C:\ProgramData\anaconda3\envs\dynamic\python.exe .\replay_recording.py `
-  --states .\headless_videos\run_...\trial_001_states.npz --loop
+  --states .\headless_videos\run_...\id_static\trial_001_states.npz --loop
 ```
 
 回放窗口中：`Space` 播放/暂停，方向键逐帧，`R` 回到开头，`[`/`]` 调速，鼠标调整 MuJoCo 相机，`V` 以当前视角重新导出整段视频。
@@ -566,6 +574,16 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `
   选取某一轨迹。冻结L1或L2后，应删除另一组ID/OOD场景并重新冻结scenario ID。
 - 环境内部及info/manifest字段从`rigid_pilot_*`改名为`rigid_motion_*`。确认双指稳定抓取后撤除
   整体驱动的规则保持不变；combined的shape驱动继续。32项单元测试通过。
+
+### 14.9 2026-08-18 固定全局 RGB 相机与双路录像
+
+- 在模型编译阶段把 `global_camera` 挂到 world body，默认分辨率为
+  `320 x 240`，固定斜上方视野覆盖整条线缆及L1/L2整体运动范围。
+- `CableGraspEnv` 的 observation 新增 RGB `uint8` 图像 `camera_rgb`；通过
+  `EnvConfig.camera_observation_enabled=False` 可关闭渲染。
+- `run_grasp.py --headless` 每回合同步保存诊断总览 `trial_XXX.mp4` 和全局相机
+  `trial_XXX_global.mp4`，并将相机参数、路径写入 NPZ、CSV 和 manifest。
+- 状态诊断、benchmark 和既有 48 维 RL 包装器内部显式关闭相机，避免改变其输入协议。
 
 ## 15. 给新会话的建议开场提示
 

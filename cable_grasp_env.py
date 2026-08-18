@@ -76,6 +76,13 @@ class EnvConfig:
     rigid_translation_scale: float = 1.0
     rigid_rotation_scale: float = 1.0
     rigid_motion_nominal_speed: float = 0.25 # L1/L2标称平均速度，单位m/s
+    # L1/L2只在线缆质量中心实际越过这条世界坐标Y线后结束。
+    rigid_motion_exit_y: float = 0.70
+    # 整体运动按物体的实际路径进度推进，不追赶绝对时间目标。位置增益只修正
+    # 横向轨迹误差，纵向始终使用标称速度，避免受阻后补路程式加速。
+    rigid_path_position_gain: float = 20.0
+    rigid_velocity_gain: float = 32.0
+    rigid_translation_max_acceleration: float = 8.0
     rigid_shape_stiffness: float = 1000.0    # rigid中保持初始平面构型，单位1/s²
     rigid_shape_damping: float = 68.0        # rigid相对运动阻尼，单位1/s
     rigid_shape_max_acceleration: float = 45.0
@@ -102,6 +109,20 @@ class EnvConfig:
     frame_skip: int = 10                # 一个50 Hz动作对应10个500 Hz物理步
     gripper_force_scale: float = 5.0    # 提高闭爪位置伺服刚度；执行器最大力范围保持不变
     pad_friction: tuple[float, float, float] = (4.0, 0.10, 0.05)
+
+    # 固定全局相机。相机位于桌面一侧的斜上方，覆盖整条线缆及L1/L2运动范围；
+    # MuJoCo相机沿自身-Z轴观察，外参定义在世界坐标系中。
+    camera_observation_enabled: bool = True
+    global_camera_name: str = "global_camera"
+    global_camera_width: int = 320
+    global_camera_height: int = 240
+    global_camera_fovy: float = 45.0
+    global_camera_pos: tuple[float, float, float] = (
+        0.50, -1.42658348, 2.01596494,
+    )
+    global_camera_quat: tuple[float, float, float, float] = (
+        0.9537169497, 0.3007058028, 0.0, 0.0,
+    )
 
     # 环境统一限制机器人能力，脚本、RL与后续VLA都不能绕过；数值为Panda官方上限的80%。
     robot_motion_limit_profile: str = "panda_eval_80_v3"
@@ -151,6 +172,8 @@ class EnvConfig:
             "rigid_translation_scale",
             "rigid_rotation_scale",
             "rigid_motion_nominal_speed",
+            "rigid_path_position_gain",
+            "rigid_velocity_gain",
             "rigid_shape_stiffness",
             "rigid_shape_damping",
             "rigid_shape_max_acceleration",
@@ -162,6 +185,7 @@ class EnvConfig:
             "cable_stiffness_scale",
             "cable_damping_scale",
             "cable_friction_scale",
+            "rigid_translation_max_acceleration",
         )
         for name in (*nonnegative, *positive):
             value = float(getattr(self, name))
@@ -171,8 +195,39 @@ class EnvConfig:
                 raise ValueError(f"{name} must be non-negative")
             if name in positive and value <= 0.0:
                 raise ValueError(f"{name} must be positive")
+        if not math.isfinite(self.rigid_motion_exit_y):
+            raise ValueError("rigid_motion_exit_y must be finite")
+        if not (
+            RIGID_MOTION_START_Y
+            < self.rigid_motion_exit_y
+            <= RIGID_MOTION_START_Y + RIGID_MOTION_TRAVEL
+        ):
+            raise ValueError(
+                "rigid_motion_exit_y must be greater than the L1/L2 start "
+                "and no greater than the nominal endpoint"
+            )
         if self.frame_skip < 1:
             raise ValueError("frame_skip must be positive")
+        if not isinstance(self.camera_observation_enabled, bool):
+            raise ValueError("camera_observation_enabled must be boolean")
+        if not self.global_camera_name.strip():
+            raise ValueError("global_camera_name must be non-empty")
+        for name in ("global_camera_width", "global_camera_height"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if not 0.0 < self.global_camera_fovy < 180.0:
+            raise ValueError("global_camera_fovy must be in (0, 180) degrees")
+        camera_pos = np.asarray(self.global_camera_pos, dtype=float)
+        camera_quat = np.asarray(self.global_camera_quat, dtype=float)
+        if camera_pos.shape != (3,) or not np.all(np.isfinite(camera_pos)):
+            raise ValueError("global_camera_pos must contain 3 finite values")
+        if (
+            camera_quat.shape != (4,)
+            or not np.all(np.isfinite(camera_quat))
+            or not math.isclose(float(np.linalg.norm(camera_quat)), 1.0, abs_tol=1e-6)
+        ):
+            raise ValueError("global_camera_quat must be a normalized quaternion")
         if self.grasp_candidate_gap_seconds < 0.0:
             raise ValueError("grasp_candidate_gap_seconds must be non-negative")
         if (
@@ -246,6 +301,12 @@ class CableGraspEnv:
         self.config = config or EnvConfig()
         self.rng = np.random.default_rng(self.config.seed)
         self.model = self._load_model(self.config)
+        self.model.vis.global_.offwidth = max(
+            int(self.model.vis.global_.offwidth), self.config.global_camera_width
+        )
+        self.model.vis.global_.offheight = max(
+            int(self.model.vis.global_.offheight), self.config.global_camera_height
+        )
 
         # 控制夹爪力度
         grip_scale = self.config.gripper_force_scale
@@ -263,6 +324,9 @@ class CableGraspEnv:
         self.arm_qpos_adr = self.model.jnt_qposadr[self.arm_joint_ids].copy()
         self.arm_dof_adr = self.model.jnt_dofadr[self.arm_joint_ids].copy()
         self.hand_id = id_of(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand")
+        self.global_camera_id = id_of(
+            self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.config.global_camera_name
+        )
         self.table_geom_id = id_of(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table")
         table_center = self.model.geom_pos[self.table_geom_id, :2]
         table_half_size = self.model.geom_size[self.table_geom_id, :2]
@@ -401,6 +465,7 @@ class CableGraspEnv:
         self.ever_bilateral_candidate = False
         self.ever_confirmed_grasp = False
         self.rigid_motion_released = False
+        self.last_termination_reason: str | None = None
         self.episode_seed: int | None = None
         self.initial_cable_translation = np.zeros(2)
         self._last_contact_count = 0
@@ -428,6 +493,9 @@ class CableGraspEnv:
         self._max_abs_actual_arm_velocity = np.zeros(7)
         self._max_actual_hand_linear_speed = 0.0
         self._max_actual_hand_angular_speed = 0.0
+        self._camera_renderer: mujoco.Renderer | None = None
+        self._camera_frame_time: float | None = None
+        self._camera_frame: np.ndarray | None = None
         self.reset()
         # 上面的 reset 只用于让刚构造的对象拥有完整、可查询的初始物理状态，
         # 不是调用方实际运行的 episode。首次显式 reset 应编号为 trial=1。
@@ -547,6 +615,7 @@ class CableGraspEnv:
         self.ever_bilateral_candidate = False
         self.ever_confirmed_grasp = False
         self.rigid_motion_released = False
+        self.last_termination_reason = None
         self._last_contact_count = 0
         self._last_shape_acceleration[:] = 0.0
         self._last_rigid_translation_acceleration[:] = 0.0
@@ -572,6 +641,8 @@ class CableGraspEnv:
         self._max_abs_actual_arm_velocity[:] = 0.0
         self._max_actual_hand_linear_speed = 0.0
         self._max_actual_hand_angular_speed = 0.0
+        self._camera_frame_time = None
+        self._camera_frame = None
         self.trial_index += 1
         return self.observation(), self.info()
 
@@ -592,6 +663,7 @@ class CableGraspEnv:
 
         last_qualification = False
         truncated = False
+        self.last_termination_reason = None
         gripper_closed = bool(applied_action[7] < 100.0)
 
         for _ in range(max(1, self.config.frame_skip)):
@@ -638,14 +710,15 @@ class CableGraspEnv:
                     "max_z": current_info["max_z"],
                     "success_hold": self.success_hold,
                 }
-            rigid_motion_timeout = (
+            rigid_motion_boundary_crossed = (
                 self.rigid_motion_finished
                 and not self.rigid_motion_released
             )
-            truncated = (
-                self.data.time >= self.config.episode_seconds
-                or rigid_motion_timeout
-            )
+            if rigid_motion_boundary_crossed:
+                self.last_termination_reason = "rigid_motion_boundary_crossed"
+            elif self.data.time >= self.config.episode_seconds:
+                self.last_termination_reason = "episode_time_limit"
+            truncated = self.last_termination_reason is not None
             if truncated:
                 break
 
@@ -854,8 +927,27 @@ class CableGraspEnv:
     # 2. 对外观测与诊断接口
     # -------------------------------------------------------------------------
 
+    def camera_rgb(self) -> np.ndarray:
+        """返回固定全局RGB相机图像，形状为(H, W, 3)、类型为uint8。"""
+        if not self.config.camera_observation_enabled:
+            raise RuntimeError("camera observation is disabled for this environment")
+        current_time = float(self.data.time)
+        if self._camera_frame is None or self._camera_frame_time != current_time:
+            if self._camera_renderer is None:
+                self._camera_renderer = mujoco.Renderer(
+                    self.model,
+                    height=self.config.global_camera_height,
+                    width=self.config.global_camera_width,
+                )
+            self._camera_renderer.update_scene(
+                self.data, camera=self.config.global_camera_name
+            )
+            self._camera_frame = self._camera_renderer.render().copy()
+            self._camera_frame_time = current_time
+        return self._camera_frame.copy()
+
     def observation(self) -> dict:
-        return {
+        observation = {
             "time": float(self.data.time),
             "arm_qpos": self.data.qpos[self.arm_qpos_adr].copy(),
             "hand_position": self.hand_position.copy(),
@@ -865,6 +957,25 @@ class CableGraspEnv:
             "cable_positions": self.data.xpos[self.cable_ids].copy(),
             "grasped_body_id": None if self.grasp_state is None else self.grasp_state.body_id,
         }
+        if self.config.camera_observation_enabled:
+            observation["camera_rgb"] = self.camera_rgb()
+        return observation
+
+    def close(self) -> None:
+        """释放惰性创建的离屏相机渲染器。"""
+        renderer = getattr(self, "_camera_renderer", None)
+        if renderer is not None:
+            renderer.close()
+            self._camera_renderer = None
+        self._camera_frame = None
+        self._camera_frame_time = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # 构造失败或解释器关闭期间不传播清理异常。
+            pass
 
     def info(self) -> dict:
         cable_positions = self.data.xpos[self.cable_ids]
@@ -911,6 +1022,21 @@ class CableGraspEnv:
             "rigid_motion_duration": (
                 self._rigid_motion_duration() if uses_rigid_motion else None
             ),
+            "rigid_motion_nominal_finished": self.rigid_motion_nominal_finished,
+            "rigid_motion_exit_y": (
+                self.config.rigid_motion_exit_y if uses_rigid_motion else None
+            ),
+            "rigid_motion_control": (
+                "actual_progress_velocity_v1" if uses_rigid_motion else None
+            ),
+            "rigid_path_position_gain": self.config.rigid_path_position_gain,
+            "rigid_velocity_gain": self.config.rigid_velocity_gain,
+            "rigid_translation_max_acceleration": (
+                self.config.rigid_translation_max_acceleration
+            ),
+            "rigid_motion_com_y": (
+                self.rigid_motion_com_y if uses_rigid_motion else None
+            ),
             "rigid_motion_finished": self.rigid_motion_finished,
             "rigid_motion_active": bool(
                 uses_rigid_motion
@@ -918,6 +1044,7 @@ class CableGraspEnv:
                 and not self.rigid_motion_released
             ),
             "rigid_motion_released": self.rigid_motion_released,
+            "termination_reason": self.last_termination_reason,
             "initial_shape_family": self._rigid_initial_shape_family,
             "rigid_initial_shape_family": self._rigid_initial_shape_family,
             "rigid_motion_rotation_sign": self._rigid_motion_rotation_sign,
@@ -1557,14 +1684,13 @@ class CableGraspEnv:
     def _rigid_motion_acceleration(
         self, time_value: float, velocity_xy: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """分别返回L1/L2平移和整体旋转的刚体加速度场。"""
+        """Return actual-progress L1/L2 translation and rotation fields.
 
-        h = 1e-3
-        desired = self._rigid_motion_target(time_value)
-        before = self._rigid_motion_target(time_value - h)
-        after = self._rigid_motion_target(time_value + h)
-        desired_velocity = (after - before) / (2.0 * h)
-        desired_acceleration = (after - 2.0 * desired + before) / (h * h)
+        The controller never stores longitudinal path error against wall-clock
+        time. Contact may therefore slow the cable, but releasing that contact
+        only restores the nominal velocity instead of commanding a catch-up
+        burst.
+        """
 
         current_xy = self.data.xpos[self.cable_ids, :2]
         current_com = np.average(current_xy, axis=0, weights=self.cable_mass)
@@ -1572,25 +1698,37 @@ class CableGraspEnv:
             velocity_xy, axis=0, weights=self.cable_mass
         )
         current_offset = current_com - self._rigid_reference_com_xy
-        acceleration_xy = (
-            desired_acceleration
-            + 45.0 * (desired - current_offset)
-            + 10.0 * (desired_velocity - current_velocity)
+        path_point, tangent, progress, progress_metric = (
+            self._rigid_motion_path_state(current_offset)
         )
+
+        if time_value < RIGID_MOTION_START_TIME:
+            acceleration_xy = np.zeros(2)
+        else:
+            path_error = path_point - current_offset
+            # Correct only normal displacement. Deliberately discard the
+            # tangential component: that component is the old catch-up error.
+            cross_track_error = path_error - tangent * np.dot(path_error, tangent)
+            desired_velocity = self._rigid_motion_speed() * tangent
+            acceleration_xy = (
+                self.config.rigid_path_position_gain * cross_track_error
+                + self.config.rigid_velocity_gain
+                * (desired_velocity - current_velocity)
+            )
         norm = float(np.linalg.norm(acceleration_xy))
-        if norm > 12.0:
-            acceleration_xy *= 12.0 / norm
+        maximum = self.config.rigid_translation_max_acceleration
+        if norm > maximum:
+            acceleration_xy *= maximum / norm
         translation = np.broadcast_to(
             np.r_[acceleration_xy, 0.0], (len(self.cable_ids), 3)
         ).copy()
 
-        desired_yaw = self._rigid_motion_rotation_target(time_value)
-        yaw_before = self._rigid_motion_rotation_target(time_value - h)
-        yaw_after = self._rigid_motion_rotation_target(time_value + h)
-        desired_yaw_rate = (yaw_after - yaw_before) / (2.0 * h)
-        desired_yaw_acceleration = (
-            yaw_after - 2.0 * desired_yaw + yaw_before
-        ) / (h * h)
+        desired_yaw, desired_yaw_rate = self._rigid_motion_rotation_state(
+            progress, progress_metric, tangent, current_velocity,
+        )
+        if time_value < RIGID_MOTION_START_TIME:
+            desired_yaw = 0.0
+            desired_yaw_rate = 0.0
         _, current_yaw = self._current_rigid_pose()
         velocity_relative = velocity_xy - current_velocity
         current_relative_xy = self.data.xpos[self.cable_ids, :2] - current_com
@@ -1605,8 +1743,7 @@ class CableGraspEnv:
             )
         ) / max(planar_inertia, 1e-12))
         angular_acceleration = (
-            desired_yaw_acceleration
-            + 32.0 * (desired_yaw - current_yaw)
+            32.0 * (desired_yaw - current_yaw)
             + 9.0 * (desired_yaw_rate - current_yaw_rate)
         )
         angular_acceleration = float(np.clip(
@@ -1626,6 +1763,82 @@ class CableGraspEnv:
         )
         rotation -= np.average(rotation, axis=0, weights=self.cable_mass)
         return translation, rotation
+
+    def _rigid_motion_speed(self) -> float:
+        return (
+            self.config.rigid_motion_nominal_speed
+            * self.config.motion_frequency_scale
+        )
+
+    def _rigid_motion_path_state(
+        self, current_offset: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float, float]:
+        """Project the real cable COM onto L1/L2 and return local path state.
+
+        The final scalar is metres per unit progress. Past the nominal end the
+        final tangent remains active until the real COM crosses the exit line.
+        """
+
+        if self.config.motion_profile_version == "rigid_level1_single_pass_v2":
+            distance = float(np.clip(
+                current_offset[1], 0.0, RIGID_MOTION_TRAVEL,
+            ))
+            return (
+                np.array([0.0, distance]),
+                np.array([0.0, 1.0]),
+                distance / RIGID_MOTION_TRAVEL,
+                RIGID_MOTION_TRAVEL,
+            )
+
+        x_sign = 1.0 if math.cos(self.phase_offset) >= 0.0 else -1.0
+        reflection = np.array([x_sign, 1.0])
+        samples = _L2_ARC_SAMPLES * reflection
+        sample_index = int(np.argmin(np.sum(
+            (samples - current_offset) ** 2, axis=1,
+        )))
+        progress = sample_index / float(len(samples) - 1)
+        control = RIGID_MOTION_L2_CONTROL * reflection
+        one_minus = 1.0 - progress
+        derivative = (
+            3.0 * one_minus ** 2 * (control[1] - control[0])
+            + 6.0 * one_minus * progress * (control[2] - control[1])
+            + 3.0 * progress ** 2 * (control[3] - control[2])
+        )
+        metric = float(np.linalg.norm(derivative))
+        tangent = derivative / max(metric, 1e-12)
+        return samples[sample_index], tangent, progress, metric
+
+    def _rigid_motion_rotation_from_progress(self, progress: float) -> float:
+        progress = float(np.clip(progress, 0.0, 1.0))
+        smooth_progress = progress * progress * (3.0 - 2.0 * progress)
+        return (
+            self._rigid_motion_rotation_sign
+            * self.config.rigid_rotation_scale
+            * RIGID_MOTION_ROTATION
+            * smooth_progress
+        )
+
+    def _rigid_motion_rotation_state(
+        self,
+        progress: float,
+        progress_metric: float,
+        tangent: np.ndarray,
+        current_velocity: np.ndarray,
+    ) -> tuple[float, float]:
+        """Return yaw and yaw rate driven by real, not scheduled, progress."""
+
+        clipped_progress = float(np.clip(progress, 0.0, 1.0))
+        forward_speed = max(float(np.dot(current_velocity, tangent)), 0.0)
+        progress_rate = forward_speed / max(progress_metric, 1e-12)
+        smooth_derivative = 6.0 * clipped_progress * (1.0 - clipped_progress)
+        yaw_rate = (
+            self._rigid_motion_rotation_sign
+            * self.config.rigid_rotation_scale
+            * RIGID_MOTION_ROTATION
+            * smooth_derivative
+            * progress_rate
+        )
+        return self._rigid_motion_rotation_from_progress(progress), yaw_rate
 
     def _rigid_motion_target(self, time_value: float) -> np.ndarray:
         """返回同起终点、无折返的L1直线或L2三次曲线质心位移。"""
@@ -1647,17 +1860,11 @@ class CableGraspEnv:
         return _cubic_bezier(control, u)
 
     def _rigid_motion_rotation_target(self, time_value: float) -> float:
-        """返回与单程平移同步、起止角速度为零的有限整体转角。"""
+        """Return the nominal scheduled yaw for diagnostics only."""
 
         elapsed = max(0.0, float(time_value) - RIGID_MOTION_START_TIME)
         progress = float(np.clip(elapsed / self._rigid_motion_duration(), 0.0, 1.0))
-        smooth_progress = progress * progress * (3.0 - 2.0 * progress)
-        return (
-            self._rigid_motion_rotation_sign
-            * self.config.rigid_rotation_scale
-            * RIGID_MOTION_ROTATION
-            * smooth_progress
-        )
+        return self._rigid_motion_rotation_from_progress(progress)
 
     def _rigid_motion_duration(self) -> float:
         speed = (
@@ -1672,11 +1879,26 @@ class CableGraspEnv:
         return path_length / speed
 
     @property
-    def rigid_motion_finished(self) -> bool:
+    def rigid_motion_nominal_finished(self) -> bool:
         return bool(
             self.config.motion_profile_version in RIGID_MOTION_PROFILES
             and self.data.time
             >= RIGID_MOTION_START_TIME + self._rigid_motion_duration()
+        )
+
+    @property
+    def rigid_motion_com_y(self) -> float:
+        return float(np.average(
+            self.data.xpos[self.cable_ids, 1], weights=self.cable_mass,
+        ))
+
+    @property
+    def rigid_motion_finished(self) -> bool:
+        """Return whether the real cable COM crossed the L1/L2 exit line."""
+
+        return bool(
+            self.config.motion_profile_version in RIGID_MOTION_PROFILES
+            and self.rigid_motion_com_y >= self.config.rigid_motion_exit_y
         )
 
     def _rigid_shape_hold_acceleration(
@@ -1687,18 +1909,22 @@ class CableGraspEnv:
         current_xy = self.data.xpos[self.cable_ids, :2]
         current_com = np.average(current_xy, axis=0, weights=self.cable_mass)
         reference_relative = self._rigid_reference_xy - self._rigid_reference_com_xy
-        target_yaw = self._rigid_motion_rotation_target(time_value)
+        com_velocity = np.average(velocity_xy, axis=0, weights=self.cable_mass)
+        current_offset = current_com - self._rigid_reference_com_xy
+        _, tangent, progress, progress_metric = self._rigid_motion_path_state(
+            current_offset
+        )
+        target_yaw, target_yaw_rate = self._rigid_motion_rotation_state(
+            progress, progress_metric, tangent, com_velocity,
+        )
+        if time_value < RIGID_MOTION_START_TIME:
+            target_yaw = 0.0
+            target_yaw_rate = 0.0
         target_relative = reference_relative @ self._planar_rotation(target_yaw)
         current_relative = current_xy - current_com
         position_error = target_relative - current_relative
 
-        com_velocity = np.average(velocity_xy, axis=0, weights=self.cable_mass)
         relative_velocity = velocity_xy - com_velocity
-        h = 1e-3
-        target_yaw_rate = (
-            self._rigid_motion_rotation_target(time_value + h)
-            - self._rigid_motion_rotation_target(time_value - h)
-        ) / (2.0 * h)
         target_relative_velocity = target_yaw_rate * np.column_stack((
             -target_relative[:, 1], target_relative[:, 0],
         ))
@@ -1866,6 +2092,17 @@ class CableGraspEnv:
             if geom.name == "table_edge":
                 spec.delete(geom)
         spec.stat.extent = max(float(spec.stat.extent), 1.80)
+
+        # 相机挂在world body上，因此机械臂运动不会改变外参。编译前注入MjSpec，
+        # 确保保存出的.mjb、观测和视频使用同一个固定视觉传感器。
+        global_camera = spec.worldbody.add_camera()
+        global_camera.name = config.global_camera_name
+        global_camera.pos[:] = config.global_camera_pos
+        global_camera.quat[:] = config.global_camera_quat
+        global_camera.fovy = config.global_camera_fovy
+        global_camera.resolution[:] = (
+            config.global_camera_width, config.global_camera_height,
+        )
 
         # 修改线缆 OOD 属性
         # 长度

@@ -74,6 +74,7 @@ def _legacy_config(seed: int, disturbance: float, seconds: float) -> EnvConfig:
         seed=seed,
         disturbance_strength=disturbance,
         episode_seconds=seconds,
+        camera_observation_enabled=False,
     )
 
 
@@ -87,7 +88,10 @@ def _scenario_config(
     if scenario is None:
         return _legacy_config(seed, disturbance, seconds)
     return env_config_for_scenario(
-        scenario, seed=seed, episode_seconds=seconds,
+        scenario,
+        seed=seed,
+        episode_seconds=seconds,
+        camera_observation_enabled=False,
     )
 
 
@@ -138,6 +142,21 @@ def _base_row(
             initial_info.get("motion_frequency_scale", 1.0)
         ),
         "motion_profile_hash": initial_info.get("motion_profile_hash"),
+        "rigid_motion_duration": initial_info.get("rigid_motion_duration"),
+        "rigid_motion_exit_y": initial_info.get("rigid_motion_exit_y"),
+        "rigid_motion_control": initial_info.get("rigid_motion_control"),
+        "rigid_path_position_gain": initial_info.get("rigid_path_position_gain"),
+        "rigid_velocity_gain": initial_info.get("rigid_velocity_gain"),
+        "rigid_translation_max_acceleration": initial_info.get(
+            "rigid_translation_max_acceleration"
+        ),
+        "rigid_motion_com_y": info.get("rigid_motion_com_y"),
+        "rigid_motion_nominal_finished": bool(
+            info.get("rigid_motion_nominal_finished", False)
+        ),
+        "rigid_motion_finished": bool(info.get("rigid_motion_finished", False)),
+        "rigid_motion_released": bool(info.get("rigid_motion_released", False)),
+        "termination_reason": info.get("termination_reason"),
         "cable_length_scale": float(initial_info.get("cable_length_scale", 1.0)),
         "cable_density_scale": float(initial_info.get("cable_density_scale", 1.0)),
         "cable_stiffness_scale": float(
@@ -289,23 +308,26 @@ def _run_scripted(
         _, initial_info = env.reset(seed=seed)
         policy.reset()
         min_target_distance = float("inf")
+        termination_reason: str | None = None
         while not policy.finished and env.data.time < env.config.episode_seconds:
             action = policy.action()
-            _, _, _, truncated, _ = env.step(action)
+            _, _, _, truncated, step_info = env.step(action)
             min_target_distance = min(
                 min_target_distance,
                 float(np.linalg.norm(env.target_position() - env.hand_position)),
             )
             if truncated:
-                policy.result = "failed_timeout"
+                termination_reason = step_info.get("termination_reason")
+                policy.result = (
+                    "failed_motion_boundary"
+                    if termination_reason == "rigid_motion_boundary_crossed"
+                    else "failed_timeout"
+                )
                 policy.finished = True
         info = env.info()
         info["ever_pinched"] = env.last_grasped_body_id is not None
         info["base_success"] = env.ever_success
         info["success"] = policy.result == "success"
-        reached_time_limit = bool(
-            env.data.time >= env.config.episode_seconds - 1e-9
-        )
         row = _base_row(
             "scripted", episode, seed, scenario, initial_info, info,
             env.grasp_break_history,
@@ -319,7 +341,7 @@ def _run_scripted(
             "min_target_distance": min_target_distance,
             "policy_result": policy.result,
             "terminated": policy.result == "success",
-            "truncated": reached_time_limit,
+            "truncated": termination_reason is not None,
         })
         rows.append(row)
     return rows
