@@ -174,6 +174,26 @@ class EnvConfig:
         0.9537169497, 0.3007058028, 0.0, 0.0,
     )
 
+    # DynamicVLA was trained with a fixed opposite camera and a Panda wrist
+    # camera at 480x360, 25 Hz.  Keep this rig optional so scripted/RL model
+    # files and observations remain unchanged unless a VLA evaluation asks for
+    # it explicitly.  The poses below reproduce DynamicVLA's DOM simulator
+    # configuration in the Panda base/hand frames (OpenGL camera convention).
+    dynamicvla_cameras_enabled: bool = False
+    dynamicvla_opst_camera_name: str = "dynamicvla_opst_camera"
+    dynamicvla_wrist_camera_name: str = "dynamicvla_wrist_camera"
+    dynamicvla_camera_width: int = 480
+    dynamicvla_camera_height: int = 360
+    dynamicvla_camera_fovy: float = 73.7397952917
+    dynamicvla_opst_camera_pos: tuple[float, float, float] = (1.0, 0.0, 0.6)
+    dynamicvla_opst_camera_quat: tuple[float, float, float, float] = (
+        0.6123724357, 0.3535533906, 0.3535533906, 0.6123724357,
+    )
+    dynamicvla_wrist_camera_pos: tuple[float, float, float] = (0.065, 0.0, 0.0)
+    dynamicvla_wrist_camera_quat: tuple[float, float, float, float] = (
+        0.0, 0.7071067812, 0.7071067812, 0.0,
+    )
+
     # 环境统一限制机器人能力，脚本、RL与后续VLA都不能绕过；数值为Panda官方上限的80%。
     robot_motion_limit_profile: str = "panda_eval_80_v3"
     arm_joint_velocity_limits: tuple[float, ...] = (
@@ -260,6 +280,8 @@ class EnvConfig:
             raise ValueError("frame_skip must be positive")
         if not isinstance(self.camera_observation_enabled, bool):
             raise ValueError("camera_observation_enabled must be boolean")
+        if not isinstance(self.dynamicvla_cameras_enabled, bool):
+            raise ValueError("dynamicvla_cameras_enabled must be boolean")
         if not self.global_camera_name.strip():
             raise ValueError("global_camera_name must be non-empty")
         for name in ("global_camera_width", "global_camera_height"):
@@ -278,6 +300,36 @@ class EnvConfig:
             or not math.isclose(float(np.linalg.norm(camera_quat)), 1.0, abs_tol=1e-6)
         ):
             raise ValueError("global_camera_quat must be a normalized quaternion")
+        if self.dynamicvla_cameras_enabled:
+            for name in (
+                "dynamicvla_opst_camera_name", "dynamicvla_wrist_camera_name",
+            ):
+                if not getattr(self, name).strip():
+                    raise ValueError(f"{name} must be non-empty")
+            for name in (
+                "dynamicvla_camera_width", "dynamicvla_camera_height",
+            ):
+                value = getattr(self, name)
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f"{name} must be a positive integer")
+            if not 0.0 < self.dynamicvla_camera_fovy < 180.0:
+                raise ValueError("dynamicvla_camera_fovy must be in (0, 180) degrees")
+            for name in (
+                "dynamicvla_opst_camera_pos", "dynamicvla_wrist_camera_pos",
+            ):
+                value = np.asarray(getattr(self, name), dtype=float)
+                if value.shape != (3,) or not np.all(np.isfinite(value)):
+                    raise ValueError(f"{name} must contain 3 finite values")
+            for name in (
+                "dynamicvla_opst_camera_quat", "dynamicvla_wrist_camera_quat",
+            ):
+                value = np.asarray(getattr(self, name), dtype=float)
+                if (
+                    value.shape != (4,)
+                    or not np.all(np.isfinite(value))
+                    or not math.isclose(float(np.linalg.norm(value)), 1.0, abs_tol=1e-6)
+                ):
+                    raise ValueError(f"{name} must be a normalized quaternion")
         if self.grasp_candidate_gap_seconds < 0.0:
             raise ValueError("grasp_candidate_gap_seconds must be non-negative")
         if (
@@ -357,6 +409,15 @@ class CableGraspEnv:
         self.model.vis.global_.offheight = max(
             int(self.model.vis.global_.offheight), self.config.global_camera_height
         )
+        if self.config.dynamicvla_cameras_enabled:
+            self.model.vis.global_.offwidth = max(
+                int(self.model.vis.global_.offwidth),
+                self.config.dynamicvla_camera_width,
+            )
+            self.model.vis.global_.offheight = max(
+                int(self.model.vis.global_.offheight),
+                self.config.dynamicvla_camera_height,
+            )
 
         # 控制夹爪力度
         grip_scale = self.config.gripper_force_scale
@@ -377,6 +438,17 @@ class CableGraspEnv:
         self.global_camera_id = id_of(
             self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.config.global_camera_name
         )
+        self.dynamicvla_opst_camera_id: int | None = None
+        self.dynamicvla_wrist_camera_id: int | None = None
+        if self.config.dynamicvla_cameras_enabled:
+            self.dynamicvla_opst_camera_id = id_of(
+                self.model, mujoco.mjtObj.mjOBJ_CAMERA,
+                self.config.dynamicvla_opst_camera_name,
+            )
+            self.dynamicvla_wrist_camera_id = id_of(
+                self.model, mujoco.mjtObj.mjOBJ_CAMERA,
+                self.config.dynamicvla_wrist_camera_name,
+            )
         self.table_geom_id = id_of(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table")
         table_center = self.model.geom_pos[self.table_geom_id, :2]
         table_half_size = self.model.geom_size[self.table_geom_id, :2]
@@ -546,6 +618,9 @@ class CableGraspEnv:
         self._camera_renderer: mujoco.Renderer | None = None
         self._camera_frame_time: float | None = None
         self._camera_frame: np.ndarray | None = None
+        self._dynamicvla_camera_renderer: mujoco.Renderer | None = None
+        self._dynamicvla_camera_frame_time: float | None = None
+        self._dynamicvla_camera_frames: dict[str, np.ndarray] = {}
         self.reset()
         # 上面的 reset 只用于让刚构造的对象拥有完整、可查询的初始物理状态，
         # 不是调用方实际运行的 episode。首次显式 reset 应编号为 trial=1。
@@ -693,6 +768,8 @@ class CableGraspEnv:
         self._max_actual_hand_angular_speed = 0.0
         self._camera_frame_time = None
         self._camera_frame = None
+        self._dynamicvla_camera_frame_time = None
+        self._dynamicvla_camera_frames.clear()
         self.trial_index += 1
         return self.observation(), self.info()
 
@@ -996,6 +1073,43 @@ class CableGraspEnv:
             self._camera_frame_time = current_time
         return self._camera_frame.copy()
 
+    def dynamicvla_camera_rgb(self) -> dict[str, np.ndarray]:
+        """Return the opposite/wrist RGB pair expected by DynamicVLA.
+
+        Both arrays are uint8 ``(360, 480, 3)`` by default. The cameras only
+        exist when ``dynamicvla_cameras_enabled`` was selected before model
+        compilation and therefore cannot be enabled in the middle of a run.
+        """
+
+        if not self.config.dynamicvla_cameras_enabled:
+            raise RuntimeError("DynamicVLA cameras are disabled for this environment")
+        current_time = float(self.data.time)
+        if (
+            not self._dynamicvla_camera_frames
+            or self._dynamicvla_camera_frame_time != current_time
+        ):
+            if self._dynamicvla_camera_renderer is None:
+                self._dynamicvla_camera_renderer = mujoco.Renderer(
+                    self.model,
+                    height=self.config.dynamicvla_camera_height,
+                    width=self.config.dynamicvla_camera_width,
+                )
+            frames: dict[str, np.ndarray] = {}
+            for key, camera_name in (
+                ("opst_cam", self.config.dynamicvla_opst_camera_name),
+                ("wrist_cam", self.config.dynamicvla_wrist_camera_name),
+            ):
+                self._dynamicvla_camera_renderer.update_scene(
+                    self.data, camera=camera_name
+                )
+                frames[key] = self._dynamicvla_camera_renderer.render().copy()
+            self._dynamicvla_camera_frames = frames
+            self._dynamicvla_camera_frame_time = current_time
+        return {
+            name: frame.copy()
+            for name, frame in self._dynamicvla_camera_frames.items()
+        }
+
     def observation(self) -> dict:
         observation = {
             "time": float(self.data.time),
@@ -1017,8 +1131,14 @@ class CableGraspEnv:
         if renderer is not None:
             renderer.close()
             self._camera_renderer = None
+        dynamicvla_renderer = getattr(self, "_dynamicvla_camera_renderer", None)
+        if dynamicvla_renderer is not None:
+            dynamicvla_renderer.close()
+            self._dynamicvla_camera_renderer = None
         self._camera_frame = None
         self._camera_frame_time = None
+        self._dynamicvla_camera_frames = {}
+        self._dynamicvla_camera_frame_time = None
 
     def __del__(self) -> None:
         try:
@@ -2169,6 +2289,40 @@ class CableGraspEnv:
         global_camera.resolution[:] = (
             config.global_camera_width, config.global_camera_height,
         )
+
+        if config.dynamicvla_cameras_enabled:
+            # The yellow cable_marker is a scripted-policy debug aid, not part
+            # of DOM observations. Hide it from the zero-shot visual input so
+            # the model cannot mistake it for a trained fruit category.
+            marker = next(site for site in spec.sites if site.name == "cable_marker")
+            marker.rgba[3] = 0.0
+
+            # DOM's fixed camera is expressed in the Panda base frame. This
+            # project's Panda base coincides with the MuJoCo world frame.
+            opst_camera = spec.worldbody.add_camera()
+            opst_camera.name = config.dynamicvla_opst_camera_name
+            opst_camera.pos[:] = config.dynamicvla_opst_camera_pos
+            opst_camera.quat[:] = config.dynamicvla_opst_camera_quat
+            opst_camera.fovy = config.dynamicvla_camera_fovy
+            opst_camera.resolution[:] = (
+                config.dynamicvla_camera_width,
+                config.dynamicvla_camera_height,
+            )
+
+            # DynamicVLA attaches its wrist camera directly to panda_hand.
+            # Isaac Lab and MuJoCo both use an OpenGL optical convention here
+            # (camera looks along local -Z), so no extra axis conversion is
+            # required for this body-local pose.
+            hand_spec = next(body for body in spec.bodies if body.name == "hand")
+            wrist_camera = hand_spec.add_camera()
+            wrist_camera.name = config.dynamicvla_wrist_camera_name
+            wrist_camera.pos[:] = config.dynamicvla_wrist_camera_pos
+            wrist_camera.quat[:] = config.dynamicvla_wrist_camera_quat
+            wrist_camera.fovy = config.dynamicvla_camera_fovy
+            wrist_camera.resolution[:] = (
+                config.dynamicvla_camera_width,
+                config.dynamicvla_camera_height,
+            )
 
         # 修改线缆 OOD 属性
         # 长度

@@ -7,6 +7,10 @@ import mujoco
 import numpy as np
 
 from dynamic_grasp_policy import DynamicCableGraspPolicy, Phase, PolicyConfig
+from dynamicvla_adapter import (
+    DynamicVLATaskSpaceAdapter,
+    make_dynamicvla_observation,
+)
 from cable_grasp_env import (
     CableGraspEnv,
     EnvConfig,
@@ -134,6 +138,57 @@ class EnvironmentScenarioTests(unittest.TestCase):
             self.assertTrue(np.array_equal(
                 env.data.cam_xpos[env.global_camera_id], camera_position
             ))
+        finally:
+            env.close()
+
+    def test_dynamicvla_camera_rig_and_task_space_adapter(self) -> None:
+        env = CableGraspEnv(EnvConfig(
+            seed=13,
+            episode_seconds=0.1,
+            camera_observation_enabled=False,
+            dynamicvla_cameras_enabled=True,
+        ))
+        try:
+            env.reset(seed=13)
+            self.assertEqual(
+                int(env.model.cam_bodyid[env.dynamicvla_opst_camera_id]), 0
+            )
+            self.assertEqual(
+                int(env.model.cam_bodyid[env.dynamicvla_wrist_camera_id]),
+                env.hand_id,
+            )
+            observation = make_dynamicvla_observation(
+                env, "Pick up the orange cable.", index=0
+            )
+            self.assertEqual(
+                observation["observation.images.opst_cam"].shape,
+                (1, 360, 480, 3),
+            )
+            self.assertEqual(
+                observation["observation.images.wrist_cam"].shape,
+                (1, 360, 480, 3),
+            )
+            self.assertGreater(
+                float(observation["observation.images.opst_cam"].std()), 1.0
+            )
+            self.assertGreater(
+                float(observation["observation.images.wrist_cam"].std()), 1.0
+            )
+            self.assertEqual(
+                observation["observation.state"]["end_effector"]["pos"].shape,
+                (1, 3),
+            )
+
+            adapter = DynamicVLATaskSpaceAdapter(env)
+            adapter.set_model_action(np.array([
+                99.0, -99.0, -1.0, 1.0, 0.0, 0.0, 0.0, -1.0,
+            ]))
+            action = adapter.action()
+            diagnostics = adapter.diagnostics()
+            self.assertEqual(action.shape, (8,))
+            self.assertTrue(np.all(np.isfinite(action)))
+            self.assertTrue(diagnostics["position_clipped"])
+            self.assertEqual(action[-1], 0.0)
         finally:
             env.close()
 

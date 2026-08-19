@@ -363,3 +363,9 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_test.ps1 `
 ```
 
 `rl/runs/smoke_test`只是2048步程序链路检查，不是已经学会抓取的模型；正式效果需要运行足够长的训练。
+
+## DynamicVLA 零样本桥接
+
+仓库提供可选的双相机、任务空间 DynamicVLA 评测桥接，不需要安装 Isaac Lab。MuJoCo 服务器与
+PyTorch 推理客户端使用各自独立的环境，通过官方 ZeroMQ 消息格式通信。安装和运行说明见
+[DYNAMICVLA_ZERO_SHOT.md](DYNAMICVLA_ZERO_SHOT.md)。
