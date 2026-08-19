@@ -1,9 +1,13 @@
 # Franka Panda 动态线缆抓取项目交接文档
 
-更新时间：2026-08-13  
-项目目录：`C:\Users\27642\Desktop\dynamic_cable\panda_cable_grasp`  
-Menagerie 目录：`C:\Users\27642\Desktop\dynamic_cable\mujoco_menagerie`  
-Python：`C:\ProgramData\anaconda3\envs\dynamic\python.exe`
+- 更新时间：2026-08-19
+- 项目目录：Git 仓库根目录
+- Menagerie 目录：由 `MUJOCO_MENAGERIE_PATH` 指定；仍兼容仓库旁的自动发现
+- Python：当前激活环境中的 `python`
+
+Linux 服务器安装以 `LINUX_SERVER_SETUP.md` 为准。当前代码加载仓库内的
+`panda_cable_grasp.xml` 和 `models/panda.xml`，Menagerie 只提供 mesh 资产，不再维护
+两份任务 XML，也不再依赖某台 Windows 电脑的绝对路径。
 
 ## 0. 新会话首先阅读：截至 2026-08-13 的最新状态
 
@@ -46,12 +50,12 @@ Python：`C:\ProgramData\anaconda3\envs\dynamic\python.exe`
 仓库就在项目目录内，不在上一级 `dynamic_cable`：
 
 ```powershell
-cd C:\Users\27642\Desktop\dynamic_cable\panda_cable_grasp
+cd path\to\panda_cable_grasp
 git status --short --branch
 ```
 
-当前分支：`friction-grasp`  
-当前 HEAD：`65b0c72 Restore official Panda fingertip geometry`
+- 当前分支：`feat/linux-server-portability`
+- 当前 HEAD：`c42bc37 feat: move L1/L2 motion into ID`（其后仍有未提交修改）
 
 最近提交：
 
@@ -70,33 +74,17 @@ c7d5293 init
 
 建议新会话开始后先重新运行 `git status` 和 `git diff --stat`，然后再编辑。
 
-## 4. 最重要的路径问题：两个同名 XML
+## 4. 模型文件与 Menagerie 资产
 
-仓库中有：
+路径双副本问题已经消除：
 
-```text
-C:\Users\27642\Desktop\dynamic_cable\panda_cable_grasp\panda_cable_grasp.xml
-```
+- `panda_cable_grasp.xml` 是程序实际加载的任务模型；
+- `models/panda.xml` 是仓库固定的 Panda 与浅槽指垫模型；
+- 外部 Menagerie 仅提供 `franka_emika_panda/assets/` 下的官方 mesh。
 
-程序实际加载的是：
-
-```text
-C:\Users\27642\Desktop\dynamic_cable\mujoco_menagerie\franka_emika_panda\panda_cable_grasp.xml
-```
-
-加载路径在 `cable_grasp_env.py` 中由以下逻辑确定：
-
-```python
-ROOT = Path(__file__).resolve().parent
-MENAGERIE = ROOT.parent / "mujoco_menagerie"
-XML_PATH = MENAGERIE / "franka_emika_panda" / "panda_cable_grasp.xml"
-```
-
-两个文件现已同步为 `solver="Newton" cone="elliptic" impratio="20" noslip_iterations="1"`，
-并已验证文件哈希一致。程序仍实际加载 Menagerie 目录副本；后续修改 XML 时仍需同步两份，
-或在用户确认后消除双副本。
-
-此外，Panda 的 `panda.xml`、mesh 和 assets 均来自 Menagerie 目录，不在当前 Git 仓库的版本控制范围内。
+Menagerie 可由 `MUJOCO_MENAGERIE_PATH` 指向任意位置；未设置时依次检查仓库内、
+`third_party/` 和仓库旁的常见位置。不要再复制任务 XML 到 Menagerie，也不要直接修改
+Menagerie 的 `panda.xml`。Linux 安装和固定资产 commit 见 `LINUX_SERVER_SETUP.md`。
 
 ## 5. 当前软件环境
 
@@ -136,11 +124,12 @@ PPO 当前通过多个 CPU 子进程并行环境训练，不是 MJX/JAX 或 MuJo
   - GUI 与 headless 调度；
   - 打印阶段变化和失败诊断；
   - headless 每回合录制 MP4 和完整 MuJoCo 状态。
-- `run_demo.ps1`
-  - 固定使用 `dynamic` 环境启动 `run_grasp.py`。
+- `run_demo.sh`、`run_demo.ps1`
+  - 使用当前环境中的 `python` 启动 `run_grasp.py`。
 - `panda_cable_grasp.xml`
-  - 项目目录中的场景副本，包含桌面、线缆 composite、线缆参数和桌面—线缆接触 pair；
-  - 注意程序当前不直接加载此副本。
+  - 程序实际加载的场景，包含桌面、线缆 composite、线缆参数和桌面—线缆接触 pair。
+- `models/panda.xml`
+  - 仓库固定的 Panda 与浅槽指垫定义；外部 Menagerie 只提供 mesh。
 - `replay_recording.py`
   - 加载 `.npz` 状态文件并打开 MuJoCo 窗口；
   - 可用鼠标在线选择任意视角，按 `V` 用当前视角导出完整视频。
@@ -303,7 +292,7 @@ RELEASE：仅在重试耗尽且没有形成抓取时张开 1.2 s；已确认抓�
 ### GUI 脚本基线
 
 ```powershell
-cd C:\Users\27642\Desktop\dynamic_cable\panda_cable_grasp
+cd path\to\panda_cable_grasp
 powershell -ExecutionPolicy Bypass -File .\run_demo.ps1
 ```
 
@@ -344,7 +333,7 @@ headless_videos/run_时间_seed.../
 ### 交互式状态回放与重新选视角
 
 ```powershell
-& C:\ProgramData\anaconda3\envs\dynamic\python.exe .\replay_recording.py `
+python .\replay_recording.py `
   --states .\headless_videos\run_...\id_static\trial_001_states.npz --loop
 ```
 
@@ -589,4 +578,4 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `
 
 可以把下面内容与本文档一起发给新会话：
 
-> 请先完整阅读 `C:\Users\27642\Desktop\dynamic_cable\panda_cable_grasp\NEW_SESSION_HANDOFF.md`，然后检查仓库当前`git status`，不要撤销或覆盖未提交修改。RL v3的奖励、PPO稳定性和配对评估代码已完成smoke，但尚未正式长训练；PPO v2的3/10只能作为历史诊断，不能代表v3。请先核对第14.4节，再从头训练`rl/runs/ppo_cable_v3`并用独立seed配对评估。除非我明确要求，不要修改线缆扰动、夹爪/碰撞尺寸、摩擦、抓取物理或0.80 s阈值，也不要通过环境端强制改写策略动作降低任务难度。
+> 请先完整阅读仓库根目录的 `NEW_SESSION_HANDOFF.md`，然后检查仓库当前`git status`，不要撤销或覆盖未提交修改。RL v3的奖励、PPO稳定性和配对评估代码已完成smoke，但尚未正式长训练；PPO v2的3/10只能作为历史诊断，不能代表v3。请先核对第14.4节，再从头训练`rl/runs/ppo_cable_v3`并用独立seed配对评估。除非我明确要求，不要修改线缆扰动、夹爪/碰撞尺寸、摩擦、抓取物理或0.80 s阈值，也不要通过环境端强制改写策略动作降低任务难度。

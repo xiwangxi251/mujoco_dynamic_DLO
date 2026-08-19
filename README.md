@@ -3,6 +3,10 @@
 本项目使用 Menagerie 的 Franka Panda、MuJoCo 官方
 `mujoco.elasticity.cable` 插件，以及一个持续变形的自由线缆场景。
 
+Linux 无头服务器请先阅读 [LINUX_SERVER_SETUP.md](LINUX_SERVER_SETUP.md)。模型、插件和
+输出目录均已支持跨平台配置：`MUJOCO_MENAGERIE_PATH` 指定 Menagerie，
+`MUJOCO_GL=egl|osmesa` 指定离屏渲染，`PANDA_CABLE_OUTPUT_ROOT` 指定实验输出盘。
+
 程序现已按职责拆分：
 
 - `cable_grasp_env.py`：模型加载、`reset/step`、连续扰动、真实碰撞/摩擦和成功判定；
@@ -11,7 +15,7 @@
 - `replay_recording.py`：打开状态回放窗口，用鼠标选视角并重新导出整段视频；
 - `render_recording.py`：读取无头模式保存的完整状态，从任意相机角度离线重新渲染；
 - `panda_cable_grasp.xml`：桌面、线缆和物理参数；
-- `run_demo.ps1`：使用 `dynamic` Conda 环境启动。
+- `run_demo.sh` / `run_demo.ps1`：分别用于 Linux/macOS shell 和 Windows PowerShell。
 
 策略动作只包含 7 个机械臂关节目标和 1 个夹爪命令。线缆扰动始终由环境施加，
 不会再因为闭爪而降到 15% 或停止。
@@ -19,7 +23,7 @@
 ## 启动 GUI
 
 ```powershell
-cd C:\Users\27642\Desktop\dynamic_cable\panda_cable_grasp
+cd path\to\panda_cable_grasp
 powershell -ExecutionPolicy Bypass -File .\run_demo.ps1
 ```
 
@@ -62,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File .\run_demo.ps1 --speed 2 --trials 0 --d
 无界面模式不做实时等待，但运行的仍是和 GUI 完全相同的环境和策略：
 
 ```powershell
-& C:\ProgramData\anaconda3\envs\dynamic\python.exe .\run_grasp.py --headless --trials 3
+python .\run_grasp.py --headless --trials 3
 ```
 
 无界面模式会同步离屏渲染，每个 trial 单独保存一个 MP4。默认输出到
@@ -105,7 +109,7 @@ foreach ($scenario in $scenarios) {
 推荐使用交互式回放窗口：
 
 ```powershell
-& C:\ProgramData\anaconda3\envs\dynamic\python.exe .\replay_recording.py `
+python .\replay_recording.py `
   --states .\headless_videos\run_时间_seed20260804\id_static\trial_001_states.npz
 ```
 
@@ -124,7 +128,7 @@ foreach ($scenario in $scenarios) {
 下面的批处理命令仍可用于已知相机数值、不需要打开交互窗口的情况：
 
 ```powershell
-& C:\ProgramData\anaconda3\envs\dynamic\python.exe .\render_recording.py `
+python .\render_recording.py `
   --states .\headless_videos\run_时间_seed20260804\id_static\trial_001_states.npz `
   --azimuth 45 --elevation -15 --distance 1.8 `
   --lookat 0.55 0 0.30 `
@@ -229,7 +233,7 @@ secured后纯主动张爪、闭爪物理滑脱和“接触已丢失时又张爪�
 首次使用已经在 `dynamic` 环境安装了依赖；如需重建环境可运行：
 
 ```powershell
-& C:\ProgramData\anaconda3\envs\dynamic\python.exe -m pip install -r .\rl\requirements_rl.txt
+python -m pip install -r .\rl\requirements_rl.txt
 ```
 
 默认用6个独立MuJoCo进程训练200万步并写入`rl/runs/ppo_cable_v3/`。前100万步把训练扰动
@@ -261,7 +265,7 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `
 查看实时TensorBoard曲线：
 
 ```powershell
-& C:\ProgramData\anaconda3\envs\dynamic\python.exe -m tensorboard.main `
+python -m tensorboard.main `
   --logdir .\rl\runs\ppo_cable_v3\tensorboard
 ```
 
@@ -299,7 +303,7 @@ CSV同时记录公共任务成功、PPO内部严格成功、场景指纹、动�
 `scenario_id + motion_profile_hash + scene_fingerprint`：
 
 ```powershell
-& C:\ProgramData\anaconda3\envs\dynamic\python.exe .\benchmark.py `
+python .\benchmark.py `
   --suite core --methods scripted ppo --episodes 100 --seed 20280804 `
   --ppo-model .\rl\runs\ppo_cable_v3\evaluation\best\best_model.zip
 ```
@@ -322,7 +326,7 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `
 先运行无策略运动诊断，确认四类场景的实际响应可区分：
 
 ```powershell
-& C:\ProgramData\anaconda3\envs\dynamic\python.exe .\motion_diagnostics.py `
+python .\motion_diagnostics.py `
   --suite core --seeds 10 --seconds 8 --sample-hz 10 --seed 20280804
 ```
 
@@ -347,7 +351,7 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_test.ps1 `
 状态文件与脚本基线格式兼容，可直接回放：
 
 ```powershell
-& C:\ProgramData\anaconda3\envs\dynamic\python.exe .\replay_recording.py `
+python .\replay_recording.py `
   --states .\rl_test_videos\run_...\episode_001_states.npz --loop
 ```
 

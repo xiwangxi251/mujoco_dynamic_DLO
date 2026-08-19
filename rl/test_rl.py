@@ -23,7 +23,7 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.utils import set_random_seed
 
-from cable_grasp_env import XML_PATH
+from cable_grasp_env import PANDA_XML_PATH, XML_PATH, resolve_menagerie_panda_dir
 from failure_taxonomy import (
     TASK_OUTCOME_TYPES,
     break_causal_class,
@@ -31,6 +31,7 @@ from failure_taxonomy import (
     confirmed_break_times,
     scene_fingerprint,
 )
+from project_paths import output_path
 from .rl_cable_env import RLCableGraspEnv
 
 
@@ -422,6 +423,8 @@ def _manifest(
         "checkpoint": _file_record(args.model),
         "environment": {
             "source_xml": _file_record(XML_PATH),
+            "panda_xml": _file_record(PANDA_XML_PATH),
+            "menagerie_panda_assets": str(resolve_menagerie_panda_dir()),
             "compiled_model_sha256": _compiled_model_sha256(env.model),
             "base_environment_source": (
                 _file_record(Path(base_source)) if base_source else None
@@ -1110,7 +1113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--stochastic", action="store_true")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--video-dir", type=Path, default=Path("rl_test_videos"),
+    parser.add_argument("--video-dir", type=Path, default=output_path("rl_test_videos"),
                         help="headless结果根目录；每次测试建立独立子目录")
     parser.add_argument(
         "--no-video",

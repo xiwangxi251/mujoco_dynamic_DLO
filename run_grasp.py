@@ -11,9 +11,16 @@ import platform
 import sys
 import time
 
-from cable_grasp_env import CableGraspEnv, EnvConfig, XML_PATH
+from cable_grasp_env import (
+    CableGraspEnv,
+    EnvConfig,
+    PANDA_XML_PATH,
+    XML_PATH,
+    resolve_menagerie_panda_dir,
+)
 from dynamic_grasp_policy import DynamicCableGraspPolicy
 from experiment_scenarios import get_scenario, list_scenario_names
+from project_paths import output_path
 
 
 def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
@@ -309,6 +316,11 @@ def run_headless(args: argparse.Namespace) -> None:
             "path": str(XML_PATH.resolve()),
             "sha256": _sha256(XML_PATH),
         },
+        "panda_xml": {
+            "path": str(PANDA_XML_PATH.resolve()),
+            "sha256": _sha256(PANDA_XML_PATH),
+        },
+        "menagerie_panda_assets": str(resolve_menagerie_panda_dir()),
         "source_files": {
             name: {"path": str(path.resolve()), "sha256": _sha256(path)}
             for name, path in {
@@ -541,7 +553,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-seconds", type=float, default=28.0,
                         help="maximum simulated seconds per trial")
     parser.add_argument("--seed", type=int, default=20260804)
-    parser.add_argument("--video-dir", type=Path, default=Path("headless_videos"),
+    parser.add_argument("--video-dir", type=Path, default=output_path("headless_videos"),
                         help="headless视频根目录；每次运行会建立独立子目录")
     parser.add_argument(
         "--run-name",

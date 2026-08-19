@@ -26,6 +26,7 @@ from dynamic_grasp_policy import DynamicCableGraspPolicy
 from experiment_scenarios import get_scenario, list_scenario_names
 from failure_taxonomy import classify_task_outcome, scene_fingerprint
 from motion_diagnostics import env_config_for_scenario
+from project_paths import output_path
 
 
 ROOT = Path(__file__).resolve().parent
@@ -262,7 +263,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-seconds", type=float, default=28.0)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--sample-every", type=int, default=5)
-    parser.add_argument("--output", type=Path, default=Path("gripper_ctrl_ablation"))
+    parser.add_argument(
+        "--output", type=Path, default=output_path("gripper_ctrl_ablation")
+    )
     args = parser.parse_args()
     if args.seeds < 1 or args.workers < 1 or args.sample_every < 1:
         parser.error("--seeds, --workers, and --sample-every must be positive")

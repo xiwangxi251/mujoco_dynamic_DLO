@@ -7,6 +7,10 @@ from datetime import datetime
 from pathlib import Path
 import time
 
+from runtime_config import configure_mujoco_runtime
+
+configure_mujoco_runtime()
+
 import cv2
 import mujoco
 from mujoco import viewer

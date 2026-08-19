@@ -4,17 +4,67 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import math
+import os
 from pathlib import Path
+
+from runtime_config import configure_mujoco_runtime
+
+configure_mujoco_runtime()
 
 import mujoco
 import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent
-MENAGERIE = ROOT.parent / "mujoco_menagerie"
-XML_PATH = MENAGERIE / "franka_emika_panda" / "panda_cable_grasp.xml"
+XML_PATH = ROOT / "panda_cable_grasp.xml"
+PANDA_XML_PATH = ROOT / "models" / "panda.xml"
+MENAGERIE_ENV_VAR = "MUJOCO_MENAGERIE_PATH"
+
+
+def resolve_menagerie_panda_dir() -> Path:
+    """Locate official Panda mesh assets without assuming a workstation path."""
+
+    configured = os.environ.get(MENAGERIE_ENV_VAR)
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend((
+        ROOT / "mujoco_menagerie",
+        ROOT / "third_party" / "mujoco_menagerie",
+        ROOT.parent / "mujoco_menagerie",
+    ))
+
+    checked: list[Path] = []
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        panda_dir = (
+            candidate
+            if candidate.name == "franka_emika_panda"
+            else candidate / "franka_emika_panda"
+        )
+        checked.append(panda_dir)
+        if (panda_dir / "assets").is_dir():
+            return panda_dir
+
+    locations = "\n  - ".join(str(path) for path in checked)
+    raise FileNotFoundError(
+        "MuJoCo Menagerie Panda assets were not found. Clone "
+        "https://github.com/google-deepmind/mujoco_menagerie.git and set "
+        f"{MENAGERIE_ENV_VAR} to its root directory. Checked:\n  - {locations}"
+    )
+
+
+@lru_cache(maxsize=4)
+def _panda_assets(panda_dir_text: str) -> dict[str, bytes]:
+    assets_dir = Path(panda_dir_text) / "assets"
+    return {
+        path.relative_to(assets_dir).as_posix(): path.read_bytes()
+        for path in assets_dir.rglob("*")
+        if path.is_file()
+    }
 
 RIGID_MOTION_START_TIME = 0.80
 RIGID_MOTION_START_Y = -0.70
@@ -2079,13 +2129,29 @@ class CableGraspEnv:
         ]
     @staticmethod
     def _load_model(config: EnvConfig) -> mujoco.MjModel:
-        plugin = Path(mujoco.__file__).resolve().parent / "plugin" / "elasticity.dll"
-        if plugin.exists():
-            mujoco.mj_loadPluginLibrary(str(plugin))
+        # The wheel uses platform-specific library names (.dll/.so/.dylib).
+        # Loading the whole bundled plugin directory avoids encoding any one OS.
+        plugin_dir = Path(mujoco.__file__).resolve().parent / "plugin"
+        if not plugin_dir.is_dir():
+            raise FileNotFoundError(
+                f"MuJoCo bundled plugin directory was not found: {plugin_dir}"
+            )
+        mujoco.mj_loadAllPluginLibraries(str(plugin_dir))
+
+        panda_dir = resolve_menagerie_panda_dir()
+        if not PANDA_XML_PATH.is_file():
+            raise FileNotFoundError(
+                f"Repository-owned Panda model definition is missing: {PANDA_XML_PATH}"
+            )
 
         # 所有场景都从同一源模型编译，在编译阶段扩大真实碰撞桌面并删除旧的
-        # 单侧实体挡板。这样改动由仓库代码控制，不依赖外部menagerie副本。
-        spec = mujoco.MjSpec.from_file(str(XML_PATH))
+        # 单侧实体挡板。Panda XML由仓库固定，外部Menagerie只提供官方mesh资产，
+        # 因此服务器无需修改或复制Menagerie文件，抓取几何也不会随机器变化。
+        spec = mujoco.MjSpec.from_file(
+            str(XML_PATH),
+            include={"panda.xml": PANDA_XML_PATH.read_bytes()},
+            assets=_panda_assets(str(panda_dir)),
+        )
         table = next(geom for geom in spec.geoms if geom.name == "table")
         table.size[:2] = config.table_half_size
         for geom in list(spec.geoms):

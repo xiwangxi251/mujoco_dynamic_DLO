@@ -1,5 +1,8 @@
 __pycache__/
 *.py[cod]
+.venv/
+/mujoco_menagerie/
+/third_party/mujoco_menagerie/
 MUJOCO_LOG.TXT
 rl/runs/
 headless_videos/

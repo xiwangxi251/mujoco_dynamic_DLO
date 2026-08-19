@@ -5,6 +5,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from runtime_config import configure_mujoco_runtime
+
+configure_mujoco_runtime()
+
 import cv2
 import mujoco
 import numpy as np

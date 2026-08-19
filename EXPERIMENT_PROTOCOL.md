@@ -189,7 +189,7 @@ combined发生明显形变后，单个Kabsch转角会混入线缆主轴随形变
 示例：
 
 ```powershell
-& C:\ProgramData\anaconda3\envs\dynamic\python.exe .\motion_diagnostics.py `
+python .\motion_diagnostics.py `
   --suite core --seeds 10 --seconds 8 --sample-hz 10 --seed 20280804
 ```
 

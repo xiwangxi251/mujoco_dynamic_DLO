@@ -1,0 +1,5 @@
+# Core scripted-policy, simulation, recording, and diagnostic dependencies.
+# MuJoCo's PyPI wheel includes the native engine and bundled elasticity plugin.
+mujoco==3.11.0
+numpy>=2.0,<3
+opencv-python-headless>=4.12,<6

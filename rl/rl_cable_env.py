@@ -9,6 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Sequence
 
+from runtime_config import configure_mujoco_runtime
+
+configure_mujoco_runtime()
+
 import gymnasium as gym
 import mujoco
 import numpy as np

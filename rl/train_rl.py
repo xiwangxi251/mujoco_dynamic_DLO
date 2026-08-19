@@ -16,6 +16,7 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
 from experiment_scenarios import list_scenario_names, list_suite_names
+from project_paths import output_path
 from .rl_cable_env import RLCableGraspEnv, RLConfig
 from .rl_training_metrics import TrainingMetricsCallback, plot_training_curves
 
@@ -257,7 +258,9 @@ def parse_args() -> argparse.Namespace:
         "--eval-distribution", choices=("legacy", "core", "id"), default=None,
         help="strict-eval distribution; defaults to the matching training distribution",
     )
-    parser.add_argument("--output", type=Path, default=Path("rl") / "runs" / "ppo_cable_v3")
+    parser.add_argument(
+        "--output", type=Path, default=output_path("rl", "runs", "ppo_cable_v3")
+    )
     parser.add_argument("--checkpoint-steps", type=int, default=100_000)
     parser.add_argument("--n-steps", type=int, default=1024,
                         help="PPO rollout steps collected by each worker per update")

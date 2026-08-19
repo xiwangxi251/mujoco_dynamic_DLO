@@ -17,10 +17,20 @@ import subprocess
 import sys
 from typing import Any
 
+from runtime_config import configure_mujoco_runtime
+
+configure_mujoco_runtime()
+
 import mujoco
 import numpy as np
 
-from cable_grasp_env import CableGraspEnv, EnvConfig, XML_PATH
+from cable_grasp_env import (
+    CableGraspEnv,
+    EnvConfig,
+    PANDA_XML_PATH,
+    XML_PATH,
+    resolve_menagerie_panda_dir,
+)
 from dynamic_grasp_policy import DynamicCableGraspPolicy, PolicyConfig
 from experiment_scenarios import (
     SCENARIO_SUITE_NAMES,
@@ -37,6 +47,7 @@ from failure_taxonomy import (
     scene_fingerprint,
 )
 from motion_diagnostics import env_config_for_scenario
+from project_paths import output_path
 
 
 ROOT = Path(__file__).resolve().parent
@@ -546,7 +557,7 @@ def parse_args() -> argparse.Namespace:
         help="parallel isolated environments (scripted method only)",
     )
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--output", type=Path, default=Path("benchmark_runs"))
+    parser.add_argument("--output", type=Path, default=output_path("benchmark_runs"))
     args = parser.parse_args()
     args.methods = list(dict.fromkeys(args.methods))
     if args.episodes < 1 or args.episode_seconds <= 0.0 or args.workers < 1:
@@ -685,6 +696,9 @@ def main() -> None:
         "ppo_model_sha256": _sha256(args.ppo_model),
         "source_xml": str(XML_PATH.resolve()),
         "source_xml_sha256": _sha256(XML_PATH),
+        "panda_xml": str(PANDA_XML_PATH.resolve()),
+        "panda_xml_sha256": _sha256(PANDA_XML_PATH),
+        "menagerie_panda_assets": str(resolve_menagerie_panda_dir()),
         "compiled_models": compiled_models,
         "source_files": {
             name: {"path": str(path.resolve()), "sha256": _sha256(path)}

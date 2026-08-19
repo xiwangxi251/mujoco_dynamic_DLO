@@ -1,5 +1,5 @@
 param(
-  [string]$Python = "C:\ProgramData\anaconda3\envs\dynamic\python.exe",
+  [string]$Python = "python",
   [Parameter(ValueFromRemainingArguments = $true)]
   [string[]]$TestArgs
 )
