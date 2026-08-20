@@ -108,7 +108,7 @@ class EnvConfig:
     """环境参数"""
 
     seed: int = 20260804
-    episode_seconds: float = 28.0       # 每次随机试验最多运行多少仿真秒
+    episode_seconds: float = 15.0       # 每次随机试验最多运行多少仿真秒
     disturbance_strength: float = 1.5   # 线缆外力倍率
 
     # 场景标记
@@ -194,19 +194,24 @@ class EnvConfig:
         0.0, 0.7071067812, 0.7071067812, 0.0,
     )
 
-    # 环境统一限制机器人能力，脚本、RL与后续VLA都不能绕过；数值为Panda官方上限的80%。
-    robot_motion_limit_profile: str = "panda_eval_80_v3"
+    # 环境统一限制机器人能力，脚本、RL与VLA都不能绕过。关节与手指速度
+    # 直接对齐DynamicVLA的Panda仿真配置，不再额外乘80%或提前在65%处制动。
+    robot_motion_limit_profile: str = "dynamicvla_panda_v4"
     arm_joint_velocity_limits: tuple[float, ...] = (
-        1.74, 1.74, 1.74, 1.74, 2.09, 2.09, 2.09,
+        2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61,
     )
+    # DynamicVLA只设置执行器关节速度上限，没有额外的动作加速度裁剪。
+    # 保留这组参数供特殊安全回归显式启用，但正式默认配置不使用它。
+    arm_acceleration_limit_enabled: bool = False
     arm_joint_acceleration_limits: tuple[float, ...] = (
-        12.0, 6.0, 8.0, 10.0, 12.0, 16.0, 16.0,
+        15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0,
     )
+    hand_cartesian_velocity_limit_enabled: bool = False
     hand_linear_velocity_limit: float = 1.0
     hand_angular_velocity_limit: float = 2.0
     gripper_finger_velocity_limit: float = 0.20
     arm_position_tracking_error_limit: float = 0.03
-    low_level_velocity_guard_fraction: float = 0.65
+    low_level_velocity_guard_fraction: float = 1.0
 
     # 合法性检查
     def __post_init__(self) -> None:
@@ -348,6 +353,12 @@ class EnvConfig:
                 raise ValueError(f"{name} must contain exactly 7 values")
             if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
                 raise ValueError(f"{name} values must be finite and positive")
+        if not isinstance(self.arm_acceleration_limit_enabled, bool):
+            raise ValueError("arm_acceleration_limit_enabled must be boolean")
+        if not isinstance(self.hand_cartesian_velocity_limit_enabled, bool):
+            raise ValueError(
+                "hand_cartesian_velocity_limit_enabled must be boolean"
+            )
         table_half_size = np.asarray(self.table_half_size, dtype=float)
         if (
             table_half_size.shape != (2,)
@@ -461,6 +472,14 @@ class CableGraspEnv:
             self.model, mujoco.mjtObj.mjOBJ_BODY, "right_finger"
         )
         self.finger_ids = {self.left_finger_id, self.right_finger_id}
+        self.finger_collision_geom_ids = {
+            geom_id
+            for geom_id in range(self.model.ngeom)
+            if (
+                int(self.model.geom_bodyid[geom_id]) in self.finger_ids
+                and self.model.geom_contype[geom_id] != 0
+            )
+        }
 
         # 提升指垫的摩擦
         self.pad_geom_ids = {
@@ -711,6 +730,7 @@ class CableGraspEnv:
             f"{self.config.motion_regularity}|"
             f"{self.config.disturbance_strength:.17g}|"
             f"{self.config.motion_frequency_scale:.17g}|"
+            f"{self.config.shape_motion_scale:.17g}|"
             f"{self.phase_offset:.17g}|{self.spatial_phase:.17g}"
         ).encode("ascii")
         mujoco.mj_forward(self.model, self.data)
@@ -869,24 +889,28 @@ class CableGraspEnv:
         # change.  Independent component clipping can rotate a resolved-rate
         # IK command substantially at phase changes (for example, turning a
         # requested descent into an upward end-effector transient).
-        velocity_delta = (
-            requested_velocity - self._previous_arm_command_velocity
-        )
-        allowed_delta = self._arm_acceleration_limits * control_dt
-        acceleration_scale = min(
-            1.0,
-            float(np.min(
-                allowed_delta / np.maximum(np.abs(velocity_delta), 1e-12)
-            )),
-        )
-        acceleration_limited_velocity = (
-            self._previous_arm_command_velocity
-            + acceleration_scale * velocity_delta
-        )
-        acceleration_limited = not np.allclose(
-            acceleration_limited_velocity, requested_velocity,
-            rtol=0.0, atol=1e-12,
-        )
+        if self.config.arm_acceleration_limit_enabled:
+            velocity_delta = (
+                requested_velocity - self._previous_arm_command_velocity
+            )
+            allowed_delta = self._arm_acceleration_limits * control_dt
+            acceleration_scale = min(
+                1.0,
+                float(np.min(
+                    allowed_delta / np.maximum(np.abs(velocity_delta), 1e-12)
+                )),
+            )
+            acceleration_limited_velocity = (
+                self._previous_arm_command_velocity
+                + acceleration_scale * velocity_delta
+            )
+            acceleration_limited = not np.allclose(
+                acceleration_limited_velocity, requested_velocity,
+                rtol=0.0, atol=1e-12,
+            )
+        else:
+            acceleration_limited_velocity = requested_velocity
+            acceleration_limited = False
 
         joint_limited_velocity = np.clip(
             acceleration_limited_velocity,
@@ -908,16 +932,22 @@ class CableGraspEnv:
         ) / control_dt
 
         jacp, jacr = self._hand_jacobian()
-        linear_velocity = jacp[:, self.arm_dof_adr] @ bounded_velocity
-        angular_velocity = jacr[:, self.arm_dof_adr] @ bounded_velocity
-        linear_speed = float(np.linalg.norm(linear_velocity))
-        angular_speed = float(np.linalg.norm(angular_velocity))
-        cartesian_scale = min(
-            1.0,
-            self.config.hand_linear_velocity_limit / max(linear_speed, 1e-12),
-            self.config.hand_angular_velocity_limit / max(angular_speed, 1e-12),
-        )
-        cartesian_velocity_limited = cartesian_scale < 1.0 - 1e-12
+        if self.config.hand_cartesian_velocity_limit_enabled:
+            linear_velocity = jacp[:, self.arm_dof_adr] @ bounded_velocity
+            angular_velocity = jacr[:, self.arm_dof_adr] @ bounded_velocity
+            linear_speed = float(np.linalg.norm(linear_velocity))
+            angular_speed = float(np.linalg.norm(angular_velocity))
+            cartesian_scale = min(
+                1.0,
+                self.config.hand_linear_velocity_limit
+                / max(linear_speed, 1e-12),
+                self.config.hand_angular_velocity_limit
+                / max(angular_speed, 1e-12),
+            )
+            cartesian_velocity_limited = cartesian_scale < 1.0 - 1e-12
+        else:
+            cartesian_scale = 1.0
+            cartesian_velocity_limited = False
         applied_velocity = bounded_velocity * cartesian_scale
         position_target = (
             previous_position_target + applied_velocity * control_dt
@@ -1018,12 +1048,15 @@ class CableGraspEnv:
         hand_linear_speed = float(np.linalg.norm(jacp @ self.data.qvel))
         hand_angular_speed = float(np.linalg.norm(jacr @ self.data.qvel))
         cartesian_guard_active = bool(
-            hand_linear_speed
-            >= self.config.low_level_velocity_guard_fraction
-            * self.config.hand_linear_velocity_limit
-            or hand_angular_speed
-            >= self.config.low_level_velocity_guard_fraction
-            * self.config.hand_angular_velocity_limit
+            self.config.hand_cartesian_velocity_limit_enabled
+            and (
+                hand_linear_speed
+                >= self.config.low_level_velocity_guard_fraction
+                * self.config.hand_linear_velocity_limit
+                or hand_angular_speed
+                >= self.config.low_level_velocity_guard_fraction
+                * self.config.hand_angular_velocity_limit
+            )
         )
         if cartesian_guard_active:
             guarded_action[:7] = current_qpos
@@ -1230,7 +1263,13 @@ class CableGraspEnv:
             "cable_friction_scale": self.config.cable_friction_scale,
             "robot_motion_limit_profile": self.config.robot_motion_limit_profile,
             "arm_joint_velocity_limits": self._arm_velocity_limits.copy(),
+            "arm_acceleration_limit_enabled": (
+                self.config.arm_acceleration_limit_enabled
+            ),
             "arm_joint_acceleration_limits": self._arm_acceleration_limits.copy(),
+            "hand_cartesian_velocity_limit_enabled": (
+                self.config.hand_cartesian_velocity_limit_enabled
+            ),
             "hand_linear_velocity_limit": (
                 self.config.hand_linear_velocity_limit
             ),
@@ -1398,7 +1437,13 @@ class CableGraspEnv:
             # 首次确认仍要求两侧法向力达到阈值；但确认后的高速动态接触中，
             # 求解器法向力可能短暂低于阈值，而真实碰撞仍同时存在于左右指垫。
             # 这种情况不是滑脱，不能把它累计成“无接触”并清除抓取状态。
-            raw_pairs = self._finger_contact_pairs()
+            center_index = self.cable_index[self.grasp_state.body_id]
+            radius = self.config.grasp_contact_index_radius
+            raw_pairs = [
+                (body_id, finger_id)
+                for body_id, finger_id in self._finger_body_contact_pairs()
+                if abs(self.cable_index[body_id] - center_index) <= radius
+            ]
             raw_fingers = {finger for _, finger in raw_pairs}
             raw_bilateral = (
                 self.left_finger_id in raw_fingers
@@ -1529,7 +1574,7 @@ class CableGraspEnv:
         if self.grasp_state is None:
             return
         state = self.grasp_state
-        all_pairs = self._finger_contact_pairs()
+        all_pairs = self._finger_body_contact_pairs()
         grasp_error = self._current_grasp_error()
         contacting_fingers = {finger for _, finger in all_pairs}
         unique_nodes = {body for body, _ in all_pairs}
@@ -2247,6 +2292,39 @@ class CableGraspEnv:
             for body_id, finger_id, _ in self._pad_contact_samples()
             if cable_body is None or body_id == cable_body
         ]
+
+    def _finger_body_contact_pairs(
+        self, cable_body: int | None = None,
+    ) -> list[tuple[int, int]]:
+        """Return cable contacts with any collidable surface of either finger.
+
+        Initial grasp confirmation deliberately remains pad-only. This broader
+        contact set is used only after bilateral confirmation so a cable that
+        shifts from the inner pads while remaining trapped between both finger
+        bodies is not mislabeled as a physical slip.
+        """
+
+        pairs: list[tuple[int, int]] = []
+        for contact in self.data.contact[:self.data.ncon]:
+            finger_geom = None
+            contacted_cable = None
+            if contact.geom1 in self.finger_collision_geom_ids:
+                other_body = int(self.model.geom_bodyid[contact.geom2])
+                if other_body in self.cable_set:
+                    finger_geom, contacted_cable = int(contact.geom1), other_body
+            elif contact.geom2 in self.finger_collision_geom_ids:
+                other_body = int(self.model.geom_bodyid[contact.geom1])
+                if other_body in self.cable_set:
+                    finger_geom, contacted_cable = int(contact.geom2), other_body
+            if finger_geom is None:
+                continue
+            if cable_body is not None and contacted_cable != cable_body:
+                continue
+            pairs.append((
+                contacted_cable,
+                int(self.model.geom_bodyid[finger_geom]),
+            ))
+        return pairs
     @staticmethod
     def _load_model(config: EnvConfig) -> mujoco.MjModel:
         # The wheel uses platform-specific library names (.dll/.so/.dylib).

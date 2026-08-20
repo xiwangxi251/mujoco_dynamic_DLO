@@ -91,7 +91,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         *,
         seed: int = 20260804,
         disturbance_strength: float = 1.5,
-        episode_seconds: float = 28.0,
+        episode_seconds: float = 15.0,
         env_config: EnvConfig | None = None,
         scenario_names: Sequence[str] | None = None,
         rl_config: RLConfig | None = None,

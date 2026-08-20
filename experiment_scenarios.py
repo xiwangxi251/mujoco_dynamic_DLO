@@ -76,6 +76,11 @@ FREQUENCY_SCALES: Mapping[FactorLevel, float] = MappingProxyType({
     FactorLevel.HIGH: 1.5,
 })
 
+# Calibrated over seeds 20260804..20260815 using the mass-weighted mean 3-D
+# node speed from t=0.8 s to t=7.4 s.  At the nominal shape settings this gives
+# 0.2147 m/s, matching the measured L1/L2 rigid-motion speed (0.2128 m/s).
+SHAPE_MOTION_SCALE = 0.4695
+
 
 # Nominal values are frozen from panda_cable_grasp.xml.  Scenario configs store
 # scale factors relative to these values so an MjSpec adapter can apply them
@@ -127,6 +132,7 @@ class ScenarioConfig:
     motion_profile_version: str = "factorized_v2"
     disturbance_strength: float = 1.50
     frequency_scale: float = 1.0
+    shape_motion_scale: float = SHAPE_MOTION_SCALE
 
     cable_length_scale: float = 1.0
     cable_length_ood: bool = False
@@ -218,6 +224,7 @@ class ScenarioConfig:
         numeric_fields = (
             "disturbance_strength",
             "frequency_scale",
+            "shape_motion_scale",
             "cable_length_scale",
             "cable_density_scale",
             "cable_stiffness_scale",
@@ -268,6 +275,7 @@ class ScenarioConfig:
                 )
 
         positive_fields = (
+            "shape_motion_scale",
             "cable_length_scale",
             "cable_density_scale",
             "cable_stiffness_scale",
@@ -364,6 +372,7 @@ class ScenarioConfig:
             "motion_profile_version": self.motion_profile_version,
             "motion_regularity": self.regularity.value,
             "motion_frequency_scale": self.frequency_scale,
+            "shape_motion_scale": self.shape_motion_scale,
             "cable_length_scale": self.cable_length_scale,
             "cable_density_scale": self.cable_density_scale,
             "cable_stiffness_scale": self.cable_stiffness_scale,
@@ -806,6 +815,7 @@ __all__ = [
     "SCENARIO_REGISTRY",
     "SCENARIO_SCHEMA_VERSION",
     "SCENARIO_SUITE_NAMES",
+    "SHAPE_MOTION_SCALE",
     "ScenarioConfig",
     "ScenarioRegistry",
     "ScenarioSplit",

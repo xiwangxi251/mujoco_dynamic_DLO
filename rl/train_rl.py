@@ -246,7 +246,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--seed", type=int, default=20260804)
     parser.add_argument("--disturbance", type=float, default=1.5)
-    parser.add_argument("--episode-seconds", type=float, default=28.0)
+    parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument(
         "--training-distribution", choices=("legacy", "id"), default="legacy",
         help=(

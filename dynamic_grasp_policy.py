@@ -36,10 +36,10 @@ class Phase(Enum):
 class PolicyConfig:
     """脚本基线的时间参数。论文方法可完全不用这个类。"""
 
-    # 20260804--20260806配对扫描中，0.36 s能够补偿目标EMA与受加速度限制的
-    # Panda响应延迟；0.12 s明显滞后，0.44 s则开始过冲。
-    prediction_horizon: float = 0.36
-    approach_prediction_horizon: float = 0.36
+    # 所有场景直接使用目标节点总速度预测，不按场景或运动分量采用不同算法。
+    # 0.30 s作为当前统一测试值；闭爪时仍使用更保守的0.12 s短时预测。
+    prediction_horizon: float = 0.30
+    approach_prediction_horizon: float = 0.30
     close_prediction_horizon: float = 0.12
     target_filter_alpha: float = 0.10
     intercept_x_limits: tuple[float, float] = (0.30, 0.82)
@@ -82,7 +82,8 @@ class PolicyConfig:
     def __post_init__(self) -> None:
         for name in (
             "prediction_horizon", "approach_prediction_horizon",
-            "close_prediction_horizon", "approach_position_tolerance",
+            "close_prediction_horizon",
+            "approach_position_tolerance",
             "approach_tilt_tolerance", "intercept_tilt_limit",
             "intercept_singularity_limit", "approach_fast_distance",
             "approach_linear_velocity_limit", "intercept_linear_velocity_limit",
@@ -635,10 +636,15 @@ class DynamicCableGraspPolicy:
     def summary(self) -> str:
         info = self.env.info()
         decisive = self.env.success_snapshot or info
+        task_result = "success" if self.env.ever_success else self.result
+        policy_result_text = (
+            "" if task_result == self.result else f" policy_result={self.result}"
+        )
         error = decisive["grasp_error"]
         error_text = "none" if not math.isfinite(error) else f"{error:.4f}m"
         summary = (
-            f"trial={info['trial']} result={self.result} sim_time={self.env.data.time:.3f}s "
+            f"trial={info['trial']} result={task_result}{policy_result_text} "
+            f"sim_time={self.env.data.time:.3f}s "
             f"target_body={info['target_body_id']} grasped_body={decisive['grasped_body_id']} "
             f"bilateral={decisive['bilateral_grasp']} "
             f"aperture={1000.0 * decisive['finger_aperture']:.1f}mm "

@@ -1109,7 +1109,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=20270804)
     parser.add_argument("--disturbance", type=float, default=1.5)
-    parser.add_argument("--episode-seconds", type=float, default=28.0)
+    parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--stochastic", action="store_true")
     parser.add_argument("--device", default="cpu")

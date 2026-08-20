@@ -260,7 +260,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seeds", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20280901)
-    parser.add_argument("--episode-seconds", type=float, default=28.0)
+    parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--sample-every", type=int, default=5)
     parser.add_argument(

@@ -152,6 +152,7 @@ def _base_row(
         "motion_frequency_scale": float(
             initial_info.get("motion_frequency_scale", 1.0)
         ),
+        "shape_motion_scale": float(initial_info.get("shape_motion_scale", 1.0)),
         "motion_profile_hash": initial_info.get("motion_profile_hash"),
         "rigid_motion_duration": initial_info.get("rigid_motion_duration"),
         "rigid_motion_exit_y": initial_info.get("rigid_motion_exit_y"),
@@ -187,11 +188,17 @@ def _base_row(
                 "arm_joint_velocity_limits", [],
             )).tolist()
         ),
+        "arm_acceleration_limit_enabled": bool(initial_info.get(
+            "arm_acceleration_limit_enabled", False
+        )),
         "arm_joint_acceleration_limits": json.dumps(
             np.asarray(initial_info.get(
                 "arm_joint_acceleration_limits", [],
             )).tolist()
         ),
+        "hand_cartesian_velocity_limit_enabled": bool(initial_info.get(
+            "hand_cartesian_velocity_limit_enabled", False
+        )),
         "hand_linear_velocity_limit": float(initial_info.get(
             "hand_linear_velocity_limit", np.nan
         )),
@@ -351,7 +358,7 @@ def _run_scripted(
             "episode_return": np.nan,
             "min_target_distance": min_target_distance,
             "policy_result": policy.result,
-            "terminated": policy.result == "success",
+            "terminated": env.ever_success,
             "truncated": termination_reason is not None,
         })
         rows.append(row)
@@ -551,7 +558,7 @@ def parse_args() -> argparse.Namespace:
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--scenario", choices=list_scenario_names())
     selection.add_argument("--suite", choices=SCENARIO_SUITE_NAMES)
-    parser.add_argument("--episode-seconds", type=float, default=28.0)
+    parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument(
         "--workers", type=int, default=1,
         help="parallel isolated environments (scripted method only)",
