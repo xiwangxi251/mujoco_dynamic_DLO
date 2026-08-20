@@ -7,6 +7,10 @@ import mujoco
 import numpy as np
 
 from dynamic_grasp_policy import DynamicCableGraspPolicy, Phase, PolicyConfig
+from dynamicvla_adapter import (
+    DynamicVLATaskSpaceAdapter,
+    make_dynamicvla_observation,
+)
 from cable_grasp_env import (
     CableGraspEnv,
     EnvConfig,
@@ -42,6 +46,10 @@ class ScenarioRegistryTests(unittest.TestCase):
         self.assertEqual(len(core), 6)
         self.assertEqual(DEFAULT_SCENARIO.motion_type.value, "shape")
         self.assertEqual(DEFAULT_SCENARIO.disturbance_strength, 1.5)
+        self.assertEqual(DEFAULT_SCENARIO.shape_motion_scale, 0.4695)
+        self.assertEqual(
+            DEFAULT_SCENARIO.to_env_overrides()["shape_motion_scale"], 0.4695
+        )
         self.assertEqual(
             DEFAULT_SCENARIO.to_env_overrides()["motion_profile_version"],
             "factorized_v2",
@@ -137,6 +145,57 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             env.close()
 
+    def test_dynamicvla_camera_rig_and_task_space_adapter(self) -> None:
+        env = CableGraspEnv(EnvConfig(
+            seed=13,
+            episode_seconds=0.1,
+            camera_observation_enabled=False,
+            dynamicvla_cameras_enabled=True,
+        ))
+        try:
+            env.reset(seed=13)
+            self.assertEqual(
+                int(env.model.cam_bodyid[env.dynamicvla_opst_camera_id]), 0
+            )
+            self.assertEqual(
+                int(env.model.cam_bodyid[env.dynamicvla_wrist_camera_id]),
+                env.hand_id,
+            )
+            observation = make_dynamicvla_observation(
+                env, "Pick up the orange cable.", index=0
+            )
+            self.assertEqual(
+                observation["observation.images.opst_cam"].shape,
+                (1, 360, 480, 3),
+            )
+            self.assertEqual(
+                observation["observation.images.wrist_cam"].shape,
+                (1, 360, 480, 3),
+            )
+            self.assertGreater(
+                float(observation["observation.images.opst_cam"].std()), 1.0
+            )
+            self.assertGreater(
+                float(observation["observation.images.wrist_cam"].std()), 1.0
+            )
+            self.assertEqual(
+                observation["observation.state"]["end_effector"]["pos"].shape,
+                (1, 3),
+            )
+
+            adapter = DynamicVLATaskSpaceAdapter(env)
+            adapter.set_model_action(np.array([
+                99.0, -99.0, -1.0, 1.0, 0.0, 0.0, 0.0, -1.0,
+            ]))
+            action = adapter.action()
+            diagnostics = adapter.diagnostics()
+            self.assertEqual(action.shape, (8,))
+            self.assertTrue(np.all(np.isfinite(action)))
+            self.assertTrue(diagnostics["position_clipped"])
+            self.assertEqual(action[-1], 0.0)
+        finally:
+            env.close()
+
     def test_environment_limits_arm_and_gripper_commands(self) -> None:
         env = self.make("id_static")
         try:
@@ -152,25 +211,14 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 np.abs(applied_velocity)
                 <= np.asarray(env.config.arm_joint_velocity_limits) + 1e-12
             ))
-            self.assertTrue(np.all(
-                np.abs(applied_velocity)
-                <= np.asarray(env.config.arm_joint_acceleration_limits)
-                * control_dt + 1e-12
-            ))
+            self.assertFalse(env.config.arm_acceleration_limit_enabled)
             self.assertTrue(np.allclose(
                 info["applied_action"][:7],
                 observation["arm_qpos"] + applied_velocity * control_dt,
                 rtol=0.0,
                 atol=1e-12,
             ))
-            self.assertLessEqual(
-                np.linalg.norm(info["commanded_hand_linear_velocity"]),
-                env.config.hand_linear_velocity_limit + 1e-12,
-            )
-            self.assertLessEqual(
-                np.linalg.norm(info["commanded_hand_angular_velocity"]),
-                env.config.hand_angular_velocity_limit + 1e-12,
-            )
+            self.assertFalse(env.config.hand_cartesian_velocity_limit_enabled)
             finger_target_change = (
                 255.0 - info["applied_action"][7]
             ) * env._gripper_ctrl_to_finger_position
@@ -179,8 +227,25 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 env.config.gripper_finger_velocity_limit + 1e-12,
             )
             self.assertTrue(info["motion_limit_active"])
-            self.assertTrue(info["motion_limit_flags"]["acceleration"])
+            self.assertFalse(info["motion_limit_flags"]["acceleration"])
             self.assertTrue(info["motion_limit_flags"]["gripper_velocity"])
+        finally:
+            del env
+
+    def test_default_speed_limits_match_dynamicvla_panda(self) -> None:
+        env = self.make("id_static")
+        try:
+            self.assertEqual(
+                env.config.robot_motion_limit_profile, "dynamicvla_panda_v4"
+            )
+            self.assertTrue(np.array_equal(
+                np.asarray(env.config.arm_joint_velocity_limits),
+                np.asarray([2.175] * 4 + [2.61] * 3),
+            ))
+            self.assertEqual(env.config.gripper_finger_velocity_limit, 0.20)
+            self.assertEqual(env.config.low_level_velocity_guard_fraction, 1.0)
+            self.assertFalse(env.config.arm_acceleration_limit_enabled)
+            self.assertFalse(env.config.hand_cartesian_velocity_limit_enabled)
         finally:
             del env
 
@@ -221,9 +286,35 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
+    def test_low_level_guard_does_not_derate_dynamicvla_limit(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1007)
+            action = env.ready_ctrl.copy()
+            action[0] += 0.2
+            env.data.qvel[env.arm_dof_adr[0]] = (
+                0.99 * env._arm_velocity_limits[0]
+            )
+            original_jacobian = env._hand_jacobian
+            env._hand_jacobian = lambda: (
+                np.zeros((3, env.model.nv)),
+                np.zeros((3, env.model.nv)),
+            )
+            try:
+                guarded, active = env._velocity_guarded_action(action)
+            finally:
+                env._hand_jacobian = original_jacobian
+            self.assertFalse(active)
+            self.assertGreater(
+                guarded[0], env.data.qpos[env.arm_qpos_adr[0]]
+            )
+        finally:
+            del env
+
     def test_low_level_guard_brakes_on_cartesian_speed(self) -> None:
         env = self.make("id_static")
         try:
+            env.config.hand_cartesian_velocity_limit_enabled = True
             env.reset(randomize=False, seed=1008)
             action = env.ready_ctrl.copy()
             action[:7] += 0.05
@@ -280,16 +371,70 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
+    def test_confirmed_grasp_retains_bilateral_finger_body_contact(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1008)
+            env.grasp_state = GraspState(
+                body_id=env.target_body_id,
+                candidate_time=float(env.data.time),
+                bilateral_confirmed=True,
+                last_bilateral_time=float(env.data.time),
+                lost_contact_time=0.0,
+            )
+            env._physical_grasp_candidate = lambda: None
+            env._finger_body_contact_pairs = lambda cable_body=None: [
+                (env.target_body_id, env.left_finger_id),
+                (env.target_body_id, env.right_finger_id),
+            ]
+            steps = math.ceil(
+                1.5 * env.config.grasp_loss_seconds / env.model.opt.timestep
+            )
+            for _ in range(steps):
+                env._update_physical_grasp_state(gripper_closed=True)
+            self.assertIsNotNone(env.grasp_state)
+            self.assertEqual(env.grasp_state.lost_contact_time, 0.0)
+        finally:
+            del env
+
+    def test_confirmed_grasp_still_clears_without_bilateral_finger_contact(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1009)
+            env.grasp_state = GraspState(
+                body_id=env.target_body_id,
+                candidate_time=float(env.data.time),
+                bilateral_confirmed=True,
+                last_bilateral_time=float(env.data.time),
+                lost_contact_time=0.0,
+            )
+            env._physical_grasp_candidate = lambda: None
+            env._finger_body_contact_pairs = lambda cable_body=None: [
+                (env.target_body_id, env.left_finger_id),
+            ]
+            steps = math.ceil(
+                env.config.grasp_loss_seconds / env.model.opt.timestep
+            ) + 1
+            for _ in range(steps):
+                env._update_physical_grasp_state(gripper_closed=True)
+            self.assertIsNone(env.grasp_state)
+            self.assertEqual(
+                env.last_grasp_break["reason"], "lost_physical_pad_contact"
+            )
+        finally:
+            del env
+
     def test_curved_grasp_uses_two_node_contact_radius(self) -> None:
         config = EnvConfig(grasp_contact_index_radius=2)
+        self.assertEqual(config.episode_seconds, 15.0)
         self.assertEqual(config.grasp_contact_index_radius, 2)
         with self.assertRaisesRegex(ValueError, "non-negative integer"):
             EnvConfig(grasp_contact_index_radius=-1)
 
     def test_scripted_policy_uses_measured_motion_delay_compensation(self) -> None:
         config = PolicyConfig()
-        self.assertEqual(config.prediction_horizon, 0.36)
-        self.assertEqual(config.approach_prediction_horizon, 0.36)
+        self.assertEqual(config.prediction_horizon, 0.30)
+        self.assertEqual(config.approach_prediction_horizon, 0.30)
         self.assertEqual(config.close_prediction_horizon, 0.12)
         self.assertEqual(config.target_filter_alpha, 0.10)
         self.assertEqual(config.intercept_y_limits, (-0.43, 0.43))
@@ -309,6 +454,27 @@ class EnvironmentScenarioTests(unittest.TestCase):
             PolicyConfig(policy_joint_velocity_fraction=1.01)
         with self.assertRaisesRegex(ValueError, "intercept_y_limits"):
             PolicyConfig(intercept_y_limits=(0.5, -0.5))
+
+    def test_prediction_uses_total_target_velocity_for_every_scenario(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1010)
+            policy = DynamicCableGraspPolicy(env)
+            policy.phase = Phase.APPROACH
+            position = np.array([0.50, 0.00, 0.05])
+            policy.filtered_target = position.copy()
+            env.target_position = lambda: position.copy()
+            env.target_velocity = lambda: np.array([0.30, 0.20, 0.00])
+            predicted = policy._predicted_segment()
+            expected_unfiltered_offset = np.array([0.09, 0.06, 0.0])
+            self.assertTrue(np.allclose(
+                predicted,
+                position + 0.10 * expected_unfiltered_offset,
+                rtol=0.0,
+                atol=1e-12,
+            ))
+        finally:
+            del env
 
     def test_environment_rejects_nonfinite_actions(self) -> None:
         env = self.make("id_static")

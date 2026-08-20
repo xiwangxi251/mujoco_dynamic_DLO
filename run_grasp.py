@@ -208,6 +208,7 @@ def run_headless(args: argparse.Namespace) -> None:
                 policy.finished = True
         writer.release()
         global_writer.release()
+        task_result = "success" if env.ever_success else policy.result
         states_path = video_dir / f"trial_{env.trial_index:03d}_states.npz"
         np.savez_compressed(
             states_path,
@@ -232,7 +233,8 @@ def run_headless(args: argparse.Namespace) -> None:
             scenario_name=np.asarray(env.config.scenario_name),
             scenario_id=np.asarray(env.config.scenario_id or ""),
             motion_profile_hash=np.asarray(env.motion_profile_hash),
-            result=np.asarray(policy.result),
+            result=np.asarray(task_result),
+            policy_result=np.asarray(policy.result),
             termination_reason=np.asarray(termination_reason or ""),
         )
         info = env.info()
@@ -254,7 +256,7 @@ def run_headless(args: argparse.Namespace) -> None:
             "episode_return": np.nan,
             "min_target_distance": min_target_distance,
             "policy_result": policy.result,
-            "terminated": policy.result == "success",
+            "terminated": env.ever_success,
             "truncated": termination_reason is not None,
             "video_path": str(video_path.resolve()),
             "global_video_path": str(global_video_path.resolve()),
@@ -262,7 +264,7 @@ def run_headless(args: argparse.Namespace) -> None:
             "model_path": str(model_path.resolve()),
         })
         rows.append(row)
-        successes += int(policy.result == "success")
+        successes += int(env.ever_success)
         print(policy.summary(), flush=True)
         print(f"  video={video_path.resolve()}", flush=True)
         print(f"  global_video={global_video_path.resolve()}", flush=True)
@@ -550,7 +552,7 @@ def parse_args() -> argparse.Namespace:
         "--scenario", choices=list_scenario_names(),
         help="run one frozen experiment scenario; overrides --disturbance",
     )
-    parser.add_argument("--episode-seconds", type=float, default=28.0,
+    parser.add_argument("--episode-seconds", type=float, default=15.0,
                         help="maximum simulated seconds per trial")
     parser.add_argument("--seed", type=int, default=20260804)
     parser.add_argument("--video-dir", type=Path, default=output_path("headless_videos"),

@@ -188,3 +188,9 @@ python run_grasp.py \
 - MP4 无法编码：确认安装 `ffmpeg`；同时检查输出目录可写且磁盘空间充足。
 - 多进程训练很慢：当前环境是 CPU MuJoCo，并非 MJX GPU 批量物理；GPU主要用于策略网络
   和视频渲染。
+
+## 9. DynamicVLA 零样本评测
+
+DynamicVLA 使用独立的 Python 3.10/PyTorch 环境，MuJoCo 环境不需要安装 Isaac Sim 或 Isaac Lab。
+完整的环境安装、无权重自检、双终端启动命令和输出说明见
+[`DYNAMICVLA_ZERO_SHOT.md`](DYNAMICVLA_ZERO_SHOT.md)。

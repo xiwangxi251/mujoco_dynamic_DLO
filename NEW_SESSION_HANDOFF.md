@@ -5,6 +5,14 @@
 - Menagerie 目录：由 `MUJOCO_MENAGERIE_PATH` 指定；仍兼容仓库旁的自动发现
 - Python：当前激活环境中的 `python`
 
+> 2026-08-20 RL baseline v2 更新：旧48维观测/8维关节动作已被99维整线DLO观测和5维TCP动作替代，
+> 旧PPO checkpoint不兼容。默认训练只使用L1 nominal场景，并采用三阶段课程：`id_static` →
+> `id_shape_nominal_current + id_rigid_l1_nominal` → `id_combined_l1_nominal`。两个运动阶段各用
+> 50万步从现有low强度升到nominal，每阶段需要累计10次严格成功才允许进入下一阶段。
+> 当前机器实测6/8/10/12/14/16环境吞吐约为62/73/80/87/89/95 steps/s；14环境长跑只剩约0.8 GB
+> 可用内存，因此正式默认使用12环境。当前默认输出为`rl/runs/ppo_dlo_baseline_v2/`。下文涉及PPO v2/v3、
+> 48维观测、8维动作、`target_kl=0.015`和`ppo_cable_v3`的内容仅保留为历史记录。
+
 Linux 服务器安装以 `LINUX_SERVER_SETUP.md` 为准。当前代码加载仓库内的
 `panda_cable_grasp.xml` 和 `models/panda.xml`，Menagerie 只提供 mesh 资产，不再维护
 两份任务 XML，也不再依赖某台 Windows 电脑的绝对路径。

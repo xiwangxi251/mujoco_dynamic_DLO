@@ -108,7 +108,7 @@ class EnvConfig:
     """环境参数"""
 
     seed: int = 20260804
-    episode_seconds: float = 28.0       # 每次随机试验最多运行多少仿真秒
+    episode_seconds: float = 15.0       # 每次随机试验最多运行多少仿真秒
     disturbance_strength: float = 1.5   # 线缆外力倍率
 
     # 场景标记
@@ -174,19 +174,44 @@ class EnvConfig:
         0.9537169497, 0.3007058028, 0.0, 0.0,
     )
 
-    # 环境统一限制机器人能力，脚本、RL与后续VLA都不能绕过；数值为Panda官方上限的80%。
-    robot_motion_limit_profile: str = "panda_eval_80_v3"
+    # DynamicVLA was trained with a fixed opposite camera and a Panda wrist
+    # camera at 480x360, 25 Hz.  Keep this rig optional so scripted/RL model
+    # files and observations remain unchanged unless a VLA evaluation asks for
+    # it explicitly.  The poses below reproduce DynamicVLA's DOM simulator
+    # configuration in the Panda base/hand frames (OpenGL camera convention).
+    dynamicvla_cameras_enabled: bool = False
+    dynamicvla_opst_camera_name: str = "dynamicvla_opst_camera"
+    dynamicvla_wrist_camera_name: str = "dynamicvla_wrist_camera"
+    dynamicvla_camera_width: int = 480
+    dynamicvla_camera_height: int = 360
+    dynamicvla_camera_fovy: float = 73.7397952917
+    dynamicvla_opst_camera_pos: tuple[float, float, float] = (1.0, 0.0, 0.6)
+    dynamicvla_opst_camera_quat: tuple[float, float, float, float] = (
+        0.6123724357, 0.3535533906, 0.3535533906, 0.6123724357,
+    )
+    dynamicvla_wrist_camera_pos: tuple[float, float, float] = (0.065, 0.0, 0.0)
+    dynamicvla_wrist_camera_quat: tuple[float, float, float, float] = (
+        0.0, 0.7071067812, 0.7071067812, 0.0,
+    )
+
+    # 环境统一限制机器人能力，脚本、RL与VLA都不能绕过。关节与手指速度
+    # 直接对齐DynamicVLA的Panda仿真配置，不再额外乘80%或提前在65%处制动。
+    robot_motion_limit_profile: str = "dynamicvla_panda_v4"
     arm_joint_velocity_limits: tuple[float, ...] = (
-        1.74, 1.74, 1.74, 1.74, 2.09, 2.09, 2.09,
+        2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61,
     )
+    # DynamicVLA只设置执行器关节速度上限，没有额外的动作加速度裁剪。
+    # 保留这组参数供特殊安全回归显式启用，但正式默认配置不使用它。
+    arm_acceleration_limit_enabled: bool = False
     arm_joint_acceleration_limits: tuple[float, ...] = (
-        12.0, 6.0, 8.0, 10.0, 12.0, 16.0, 16.0,
+        15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0,
     )
+    hand_cartesian_velocity_limit_enabled: bool = False
     hand_linear_velocity_limit: float = 1.0
     hand_angular_velocity_limit: float = 2.0
     gripper_finger_velocity_limit: float = 0.20
     arm_position_tracking_error_limit: float = 0.03
-    low_level_velocity_guard_fraction: float = 0.65
+    low_level_velocity_guard_fraction: float = 1.0
 
     # 合法性检查
     def __post_init__(self) -> None:
@@ -260,6 +285,8 @@ class EnvConfig:
             raise ValueError("frame_skip must be positive")
         if not isinstance(self.camera_observation_enabled, bool):
             raise ValueError("camera_observation_enabled must be boolean")
+        if not isinstance(self.dynamicvla_cameras_enabled, bool):
+            raise ValueError("dynamicvla_cameras_enabled must be boolean")
         if not self.global_camera_name.strip():
             raise ValueError("global_camera_name must be non-empty")
         for name in ("global_camera_width", "global_camera_height"):
@@ -278,6 +305,36 @@ class EnvConfig:
             or not math.isclose(float(np.linalg.norm(camera_quat)), 1.0, abs_tol=1e-6)
         ):
             raise ValueError("global_camera_quat must be a normalized quaternion")
+        if self.dynamicvla_cameras_enabled:
+            for name in (
+                "dynamicvla_opst_camera_name", "dynamicvla_wrist_camera_name",
+            ):
+                if not getattr(self, name).strip():
+                    raise ValueError(f"{name} must be non-empty")
+            for name in (
+                "dynamicvla_camera_width", "dynamicvla_camera_height",
+            ):
+                value = getattr(self, name)
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f"{name} must be a positive integer")
+            if not 0.0 < self.dynamicvla_camera_fovy < 180.0:
+                raise ValueError("dynamicvla_camera_fovy must be in (0, 180) degrees")
+            for name in (
+                "dynamicvla_opst_camera_pos", "dynamicvla_wrist_camera_pos",
+            ):
+                value = np.asarray(getattr(self, name), dtype=float)
+                if value.shape != (3,) or not np.all(np.isfinite(value)):
+                    raise ValueError(f"{name} must contain 3 finite values")
+            for name in (
+                "dynamicvla_opst_camera_quat", "dynamicvla_wrist_camera_quat",
+            ):
+                value = np.asarray(getattr(self, name), dtype=float)
+                if (
+                    value.shape != (4,)
+                    or not np.all(np.isfinite(value))
+                    or not math.isclose(float(np.linalg.norm(value)), 1.0, abs_tol=1e-6)
+                ):
+                    raise ValueError(f"{name} must be a normalized quaternion")
         if self.grasp_candidate_gap_seconds < 0.0:
             raise ValueError("grasp_candidate_gap_seconds must be non-negative")
         if (
@@ -296,6 +353,12 @@ class EnvConfig:
                 raise ValueError(f"{name} must contain exactly 7 values")
             if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
                 raise ValueError(f"{name} values must be finite and positive")
+        if not isinstance(self.arm_acceleration_limit_enabled, bool):
+            raise ValueError("arm_acceleration_limit_enabled must be boolean")
+        if not isinstance(self.hand_cartesian_velocity_limit_enabled, bool):
+            raise ValueError(
+                "hand_cartesian_velocity_limit_enabled must be boolean"
+            )
         table_half_size = np.asarray(self.table_half_size, dtype=float)
         if (
             table_half_size.shape != (2,)
@@ -357,6 +420,15 @@ class CableGraspEnv:
         self.model.vis.global_.offheight = max(
             int(self.model.vis.global_.offheight), self.config.global_camera_height
         )
+        if self.config.dynamicvla_cameras_enabled:
+            self.model.vis.global_.offwidth = max(
+                int(self.model.vis.global_.offwidth),
+                self.config.dynamicvla_camera_width,
+            )
+            self.model.vis.global_.offheight = max(
+                int(self.model.vis.global_.offheight),
+                self.config.dynamicvla_camera_height,
+            )
 
         # 控制夹爪力度
         grip_scale = self.config.gripper_force_scale
@@ -377,6 +449,17 @@ class CableGraspEnv:
         self.global_camera_id = id_of(
             self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.config.global_camera_name
         )
+        self.dynamicvla_opst_camera_id: int | None = None
+        self.dynamicvla_wrist_camera_id: int | None = None
+        if self.config.dynamicvla_cameras_enabled:
+            self.dynamicvla_opst_camera_id = id_of(
+                self.model, mujoco.mjtObj.mjOBJ_CAMERA,
+                self.config.dynamicvla_opst_camera_name,
+            )
+            self.dynamicvla_wrist_camera_id = id_of(
+                self.model, mujoco.mjtObj.mjOBJ_CAMERA,
+                self.config.dynamicvla_wrist_camera_name,
+            )
         self.table_geom_id = id_of(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table")
         table_center = self.model.geom_pos[self.table_geom_id, :2]
         table_half_size = self.model.geom_size[self.table_geom_id, :2]
@@ -389,6 +472,14 @@ class CableGraspEnv:
             self.model, mujoco.mjtObj.mjOBJ_BODY, "right_finger"
         )
         self.finger_ids = {self.left_finger_id, self.right_finger_id}
+        self.finger_collision_geom_ids = {
+            geom_id
+            for geom_id in range(self.model.ngeom)
+            if (
+                int(self.model.geom_bodyid[geom_id]) in self.finger_ids
+                and self.model.geom_contype[geom_id] != 0
+            )
+        }
 
         # 提升指垫的摩擦
         self.pad_geom_ids = {
@@ -546,6 +637,9 @@ class CableGraspEnv:
         self._camera_renderer: mujoco.Renderer | None = None
         self._camera_frame_time: float | None = None
         self._camera_frame: np.ndarray | None = None
+        self._dynamicvla_camera_renderer: mujoco.Renderer | None = None
+        self._dynamicvla_camera_frame_time: float | None = None
+        self._dynamicvla_camera_frames: dict[str, np.ndarray] = {}
         self.reset()
         # 上面的 reset 只用于让刚构造的对象拥有完整、可查询的初始物理状态，
         # 不是调用方实际运行的 episode。首次显式 reset 应编号为 trial=1。
@@ -636,6 +730,7 @@ class CableGraspEnv:
             f"{self.config.motion_regularity}|"
             f"{self.config.disturbance_strength:.17g}|"
             f"{self.config.motion_frequency_scale:.17g}|"
+            f"{self.config.shape_motion_scale:.17g}|"
             f"{self.phase_offset:.17g}|{self.spatial_phase:.17g}"
         ).encode("ascii")
         mujoco.mj_forward(self.model, self.data)
@@ -693,6 +788,8 @@ class CableGraspEnv:
         self._max_actual_hand_angular_speed = 0.0
         self._camera_frame_time = None
         self._camera_frame = None
+        self._dynamicvla_camera_frame_time = None
+        self._dynamicvla_camera_frames.clear()
         self.trial_index += 1
         return self.observation(), self.info()
 
@@ -792,34 +889,40 @@ class CableGraspEnv:
         # change.  Independent component clipping can rotate a resolved-rate
         # IK command substantially at phase changes (for example, turning a
         # requested descent into an upward end-effector transient).
-        velocity_delta = (
-            requested_velocity - self._previous_arm_command_velocity
-        )
-        allowed_delta = self._arm_acceleration_limits * control_dt
-        acceleration_scale = min(
+        if self.config.arm_acceleration_limit_enabled:
+            velocity_delta = (
+                requested_velocity - self._previous_arm_command_velocity
+            )
+            allowed_delta = self._arm_acceleration_limits * control_dt
+            acceleration_scale = min(
+                1.0,
+                float(np.min(
+                    allowed_delta / np.maximum(np.abs(velocity_delta), 1e-12)
+                )),
+            )
+            acceleration_limited_velocity = (
+                self._previous_arm_command_velocity
+                + acceleration_scale * velocity_delta
+            )
+            acceleration_limited = not np.allclose(
+                acceleration_limited_velocity, requested_velocity,
+                rtol=0.0, atol=1e-12,
+            )
+        else:
+            acceleration_limited_velocity = requested_velocity
+            acceleration_limited = False
+
+        joint_velocity_scale = min(
             1.0,
             float(np.min(
-                allowed_delta / np.maximum(np.abs(velocity_delta), 1e-12)
+                self._arm_velocity_limits
+                / np.maximum(np.abs(acceleration_limited_velocity), 1e-12)
             )),
         )
-        acceleration_limited_velocity = (
-            self._previous_arm_command_velocity
-            + acceleration_scale * velocity_delta
+        joint_limited_velocity = (
+            acceleration_limited_velocity * joint_velocity_scale
         )
-        acceleration_limited = not np.allclose(
-            acceleration_limited_velocity, requested_velocity,
-            rtol=0.0, atol=1e-12,
-        )
-
-        joint_limited_velocity = np.clip(
-            acceleration_limited_velocity,
-            -self._arm_velocity_limits,
-            self._arm_velocity_limits,
-        )
-        joint_velocity_limited = not np.allclose(
-            joint_limited_velocity, acceleration_limited_velocity,
-            rtol=0.0, atol=1e-12,
-        )
+        joint_velocity_limited = joint_velocity_scale < 1.0 - 1e-12
 
         joint_range = self.model.jnt_range[self.arm_joint_ids]
         position_target = np.clip(
@@ -831,16 +934,22 @@ class CableGraspEnv:
         ) / control_dt
 
         jacp, jacr = self._hand_jacobian()
-        linear_velocity = jacp[:, self.arm_dof_adr] @ bounded_velocity
-        angular_velocity = jacr[:, self.arm_dof_adr] @ bounded_velocity
-        linear_speed = float(np.linalg.norm(linear_velocity))
-        angular_speed = float(np.linalg.norm(angular_velocity))
-        cartesian_scale = min(
-            1.0,
-            self.config.hand_linear_velocity_limit / max(linear_speed, 1e-12),
-            self.config.hand_angular_velocity_limit / max(angular_speed, 1e-12),
-        )
-        cartesian_velocity_limited = cartesian_scale < 1.0 - 1e-12
+        if self.config.hand_cartesian_velocity_limit_enabled:
+            linear_velocity = jacp[:, self.arm_dof_adr] @ bounded_velocity
+            angular_velocity = jacr[:, self.arm_dof_adr] @ bounded_velocity
+            linear_speed = float(np.linalg.norm(linear_velocity))
+            angular_speed = float(np.linalg.norm(angular_velocity))
+            cartesian_scale = min(
+                1.0,
+                self.config.hand_linear_velocity_limit
+                / max(linear_speed, 1e-12),
+                self.config.hand_angular_velocity_limit
+                / max(angular_speed, 1e-12),
+            )
+            cartesian_velocity_limited = cartesian_scale < 1.0 - 1e-12
+        else:
+            cartesian_scale = 1.0
+            cartesian_velocity_limited = False
         applied_velocity = bounded_velocity * cartesian_scale
         position_target = (
             previous_position_target + applied_velocity * control_dt
@@ -941,12 +1050,15 @@ class CableGraspEnv:
         hand_linear_speed = float(np.linalg.norm(jacp @ self.data.qvel))
         hand_angular_speed = float(np.linalg.norm(jacr @ self.data.qvel))
         cartesian_guard_active = bool(
-            hand_linear_speed
-            >= self.config.low_level_velocity_guard_fraction
-            * self.config.hand_linear_velocity_limit
-            or hand_angular_speed
-            >= self.config.low_level_velocity_guard_fraction
-            * self.config.hand_angular_velocity_limit
+            self.config.hand_cartesian_velocity_limit_enabled
+            and (
+                hand_linear_speed
+                >= self.config.low_level_velocity_guard_fraction
+                * self.config.hand_linear_velocity_limit
+                or hand_angular_speed
+                >= self.config.low_level_velocity_guard_fraction
+                * self.config.hand_angular_velocity_limit
+            )
         )
         if cartesian_guard_active:
             guarded_action[:7] = current_qpos
@@ -996,6 +1108,43 @@ class CableGraspEnv:
             self._camera_frame_time = current_time
         return self._camera_frame.copy()
 
+    def dynamicvla_camera_rgb(self) -> dict[str, np.ndarray]:
+        """Return the opposite/wrist RGB pair expected by DynamicVLA.
+
+        Both arrays are uint8 ``(360, 480, 3)`` by default. The cameras only
+        exist when ``dynamicvla_cameras_enabled`` was selected before model
+        compilation and therefore cannot be enabled in the middle of a run.
+        """
+
+        if not self.config.dynamicvla_cameras_enabled:
+            raise RuntimeError("DynamicVLA cameras are disabled for this environment")
+        current_time = float(self.data.time)
+        if (
+            not self._dynamicvla_camera_frames
+            or self._dynamicvla_camera_frame_time != current_time
+        ):
+            if self._dynamicvla_camera_renderer is None:
+                self._dynamicvla_camera_renderer = mujoco.Renderer(
+                    self.model,
+                    height=self.config.dynamicvla_camera_height,
+                    width=self.config.dynamicvla_camera_width,
+                )
+            frames: dict[str, np.ndarray] = {}
+            for key, camera_name in (
+                ("opst_cam", self.config.dynamicvla_opst_camera_name),
+                ("wrist_cam", self.config.dynamicvla_wrist_camera_name),
+            ):
+                self._dynamicvla_camera_renderer.update_scene(
+                    self.data, camera=camera_name
+                )
+                frames[key] = self._dynamicvla_camera_renderer.render().copy()
+            self._dynamicvla_camera_frames = frames
+            self._dynamicvla_camera_frame_time = current_time
+        return {
+            name: frame.copy()
+            for name, frame in self._dynamicvla_camera_frames.items()
+        }
+
     def observation(self) -> dict:
         observation = {
             "time": float(self.data.time),
@@ -1017,8 +1166,14 @@ class CableGraspEnv:
         if renderer is not None:
             renderer.close()
             self._camera_renderer = None
+        dynamicvla_renderer = getattr(self, "_dynamicvla_camera_renderer", None)
+        if dynamicvla_renderer is not None:
+            dynamicvla_renderer.close()
+            self._dynamicvla_camera_renderer = None
         self._camera_frame = None
         self._camera_frame_time = None
+        self._dynamicvla_camera_frames = {}
+        self._dynamicvla_camera_frame_time = None
 
     def __del__(self) -> None:
         try:
@@ -1110,7 +1265,13 @@ class CableGraspEnv:
             "cable_friction_scale": self.config.cable_friction_scale,
             "robot_motion_limit_profile": self.config.robot_motion_limit_profile,
             "arm_joint_velocity_limits": self._arm_velocity_limits.copy(),
+            "arm_acceleration_limit_enabled": (
+                self.config.arm_acceleration_limit_enabled
+            ),
             "arm_joint_acceleration_limits": self._arm_acceleration_limits.copy(),
+            "hand_cartesian_velocity_limit_enabled": (
+                self.config.hand_cartesian_velocity_limit_enabled
+            ),
             "hand_linear_velocity_limit": (
                 self.config.hand_linear_velocity_limit
             ),
@@ -1278,7 +1439,13 @@ class CableGraspEnv:
             # 首次确认仍要求两侧法向力达到阈值；但确认后的高速动态接触中，
             # 求解器法向力可能短暂低于阈值，而真实碰撞仍同时存在于左右指垫。
             # 这种情况不是滑脱，不能把它累计成“无接触”并清除抓取状态。
-            raw_pairs = self._finger_contact_pairs()
+            center_index = self.cable_index[self.grasp_state.body_id]
+            radius = self.config.grasp_contact_index_radius
+            raw_pairs = [
+                (body_id, finger_id)
+                for body_id, finger_id in self._finger_body_contact_pairs()
+                if abs(self.cable_index[body_id] - center_index) <= radius
+            ]
             raw_fingers = {finger for _, finger in raw_pairs}
             raw_bilateral = (
                 self.left_finger_id in raw_fingers
@@ -1409,7 +1576,7 @@ class CableGraspEnv:
         if self.grasp_state is None:
             return
         state = self.grasp_state
-        all_pairs = self._finger_contact_pairs()
+        all_pairs = self._finger_body_contact_pairs()
         grasp_error = self._current_grasp_error()
         contacting_fingers = {finger for _, finger in all_pairs}
         unique_nodes = {body for body, _ in all_pairs}
@@ -2127,6 +2294,39 @@ class CableGraspEnv:
             for body_id, finger_id, _ in self._pad_contact_samples()
             if cable_body is None or body_id == cable_body
         ]
+
+    def _finger_body_contact_pairs(
+        self, cable_body: int | None = None,
+    ) -> list[tuple[int, int]]:
+        """Return cable contacts with any collidable surface of either finger.
+
+        Initial grasp confirmation deliberately remains pad-only. This broader
+        contact set is used only after bilateral confirmation so a cable that
+        shifts from the inner pads while remaining trapped between both finger
+        bodies is not mislabeled as a physical slip.
+        """
+
+        pairs: list[tuple[int, int]] = []
+        for contact in self.data.contact[:self.data.ncon]:
+            finger_geom = None
+            contacted_cable = None
+            if contact.geom1 in self.finger_collision_geom_ids:
+                other_body = int(self.model.geom_bodyid[contact.geom2])
+                if other_body in self.cable_set:
+                    finger_geom, contacted_cable = int(contact.geom1), other_body
+            elif contact.geom2 in self.finger_collision_geom_ids:
+                other_body = int(self.model.geom_bodyid[contact.geom1])
+                if other_body in self.cable_set:
+                    finger_geom, contacted_cable = int(contact.geom2), other_body
+            if finger_geom is None:
+                continue
+            if cable_body is not None and contacted_cable != cable_body:
+                continue
+            pairs.append((
+                contacted_cable,
+                int(self.model.geom_bodyid[finger_geom]),
+            ))
+        return pairs
     @staticmethod
     def _load_model(config: EnvConfig) -> mujoco.MjModel:
         # The wheel uses platform-specific library names (.dll/.so/.dylib).
@@ -2169,6 +2369,40 @@ class CableGraspEnv:
         global_camera.resolution[:] = (
             config.global_camera_width, config.global_camera_height,
         )
+
+        if config.dynamicvla_cameras_enabled:
+            # The yellow cable_marker is a scripted-policy debug aid, not part
+            # of DOM observations. Hide it from the zero-shot visual input so
+            # the model cannot mistake it for a trained fruit category.
+            marker = next(site for site in spec.sites if site.name == "cable_marker")
+            marker.rgba[3] = 0.0
+
+            # DOM's fixed camera is expressed in the Panda base frame. This
+            # project's Panda base coincides with the MuJoCo world frame.
+            opst_camera = spec.worldbody.add_camera()
+            opst_camera.name = config.dynamicvla_opst_camera_name
+            opst_camera.pos[:] = config.dynamicvla_opst_camera_pos
+            opst_camera.quat[:] = config.dynamicvla_opst_camera_quat
+            opst_camera.fovy = config.dynamicvla_camera_fovy
+            opst_camera.resolution[:] = (
+                config.dynamicvla_camera_width,
+                config.dynamicvla_camera_height,
+            )
+
+            # DynamicVLA attaches its wrist camera directly to panda_hand.
+            # Isaac Lab and MuJoCo both use an OpenGL optical convention here
+            # (camera looks along local -Z), so no extra axis conversion is
+            # required for this body-local pose.
+            hand_spec = next(body for body in spec.bodies if body.name == "hand")
+            wrist_camera = hand_spec.add_camera()
+            wrist_camera.name = config.dynamicvla_wrist_camera_name
+            wrist_camera.pos[:] = config.dynamicvla_wrist_camera_pos
+            wrist_camera.quat[:] = config.dynamicvla_wrist_camera_quat
+            wrist_camera.fovy = config.dynamicvla_camera_fovy
+            wrist_camera.resolution[:] = (
+                config.dynamicvla_camera_width,
+                config.dynamicvla_camera_height,
+            )
 
         # 修改线缆 OOD 属性
         # 长度

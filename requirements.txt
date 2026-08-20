@@ -3,3 +3,4 @@
 mujoco==3.11.0
 numpy>=2.0,<3
 opencv-python-headless>=4.12,<6
+pyzmq>=26,<28
