@@ -33,6 +33,10 @@ class TrainingMetricsCallback(BaseCallback):
         self.episode_count = 0
         self._file = None
         self._writer = None
+        self._rollout_actions: list[np.ndarray] = []
+        self._rollout_ik_scales: list[float] = []
+        self._rollout_joint_limit_ratios: list[float] = []
+        self._rollout_gripper_switches: list[float] = []
 
     def _on_training_start(self) -> None:
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +70,22 @@ class TrainingMetricsCallback(BaseCallback):
     def _on_step(self) -> bool:
         dones = self.locals.get("dones", [])
         infos = self.locals.get("infos", [])
+        actions = self.locals.get("actions")
+        if actions is not None:
+            action_batch = np.asarray(actions, dtype=float)
+            if action_batch.ndim == 1:
+                action_batch = action_batch[None, :]
+            self._rollout_actions.append(action_batch.copy())
+        for info in infos:
+            self._rollout_ik_scales.append(
+                float(info.get("ik_velocity_scale", 1.0))
+            )
+            self._rollout_joint_limit_ratios.append(
+                float(info.get("joint_velocity_limit_ratio", 0.0))
+            )
+            self._rollout_gripper_switches.append(
+                float(bool(info.get("gripper_switch_event", False)))
+            )
         for done, info in zip(dones, infos):
             if not done:
                 continue
@@ -114,6 +134,16 @@ class TrainingMetricsCallback(BaseCallback):
             self.logger.record("task/grasp_rate_100", grasp_rate)
             self.logger.record("task/mean_return_100", mean_return)
             self.logger.record("task/mean_lifted_fraction_100", mean_lift)
+            self.logger.record(
+                "task/pinch_to_secured_conversion_100",
+                float(np.sum(self.grasp_window))
+                / max(float(np.sum(self.pinch_window)), 1.0),
+            )
+            self.logger.record(
+                "task/secured_to_success_conversion_100",
+                float(np.sum(self.success_window))
+                / max(float(np.sum(self.grasp_window)), 1.0),
+            )
 
             if self.episode_count % self.print_every_episodes == 0:
                 print(
@@ -127,6 +157,50 @@ class TrainingMetricsCallback(BaseCallback):
                     flush=True,
                 )
         return True
+
+    def _on_rollout_end(self) -> None:
+        if self._rollout_actions:
+            actions = np.concatenate(self._rollout_actions, axis=0)
+            for index in range(actions.shape[1]):
+                self.logger.record(
+                    f"action/dim_{index}_mean", float(np.mean(actions[:, index]))
+                )
+                self.logger.record(
+                    f"action/dim_{index}_std", float(np.std(actions[:, index]))
+                )
+                self.logger.record(
+                    f"action/dim_{index}_saturation",
+                    float(np.mean(np.abs(actions[:, index]) >= 0.98)),
+                )
+        if self._rollout_ik_scales:
+            self.logger.record(
+                "control/ik_velocity_scale_mean",
+                float(np.mean(self._rollout_ik_scales)),
+            )
+            self.logger.record(
+                "control/ik_velocity_limited_fraction",
+                float(np.mean(np.asarray(self._rollout_ik_scales) < 1.0 - 1e-9)),
+            )
+        if self._rollout_joint_limit_ratios:
+            self.logger.record(
+                "control/joint_velocity_limit_ratio_mean",
+                float(np.mean(self._rollout_joint_limit_ratios)),
+            )
+        if self._rollout_gripper_switches:
+            self.logger.record(
+                "control/gripper_switch_fraction",
+                float(np.mean(self._rollout_gripper_switches)),
+            )
+        log_std = getattr(self.model.policy, "log_std", None)
+        if log_std is not None:
+            policy_std = np.exp(log_std.detach().cpu().numpy())
+            self.logger.record("policy/action_std_mean", float(np.mean(policy_std)))
+            for index, value in enumerate(policy_std.reshape(-1)):
+                self.logger.record(f"policy/action_std_{index}", float(value))
+        self._rollout_actions.clear()
+        self._rollout_ik_scales.clear()
+        self._rollout_joint_limit_ratios.clear()
+        self._rollout_gripper_switches.clear()
 
     def _on_training_end(self) -> None:
         if self._file is not None:

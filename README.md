@@ -196,33 +196,29 @@ HOLD只接受当前连续0.80秒举升资格，不使用历史成功掩盖后续
 
 ## PPO强化学习策略
 
-RL环境完全绕过 `dynamic_grasp_policy.py` 的脚本状态机。PPO输出8维归一化动作：前7维
-控制Panda关节位置目标增量，每步范围为±0.04 rad；第8维通过`-0.35/+0.35`开合滞回控制
-夹爪，闭合目标为`ctrl=20`、张开目标为255，避免单一阈值附近反复开合。
+RL环境完全绕过 `dynamic_grasp_policy.py` 的脚本状态机。PPO输出5维归一化动作：TCP局部坐标系
+下的三维位置增量、绕TCP轴的yaw增量和夹爪命令。位置增量每步最多0.010 m，yaw每步最多
+0.020 rad；动作经阻尼IK转换，最终关节速度和末端速度仍由环境统一限制。闭爪目标为`ctrl=0`。
 
-48维归一化特权观测包括：
+99维归一化观测不包含规则策略的`target_segment/target_body`：
 
-- 目标线段的世界位置和线速度；
-- 目标线段相对真实指垫中心的位置；
-- 7个机械臂关节的位置和速度；
-- 两个手指关节的位置和速度；
-- 真实指垫中心的位置、手部四元数、线速度和角速度。
-- 左右指垫接触、法向力、pinch、secured grasp、相对抬升量和严格成功保持进度。
+- 沿整根DLO按弧长均匀采样14个点，各点给出TCP相对坐标系中的位置和相对速度，共84维；
+- 7个机械臂关节角和7个关节速度；
+- 1维夹爪开度。
 
-策略看不到完整线缆形状，也不读取脚本策略阶段。RL将双侧真实接触确认记为`pinch`，不再直接
-记作抓取；只有线段相对pinch建立时的高度上升至少30 mm，并在真实双侧接触、开度和中心距离
+策略能看到稀疏采样的整根线缆状态，但不读取脚本策略阶段或规则策略目标段。RL将双侧真实接触确认记为`pinch`，不再直接
+记作抓取；只有线段相对该节点episode初始高度上升至少30 mm，并在真实双侧接触、开度和中心距离
 均合格时连续保持0.10 s，才成为`secured grasp`。抓取率和抓取/抬升奖励只采用secured grasp。
 RL成功还要求secured grasp下线段高度、整线离桌比例和55 mm中心距离连续满足0.80 s。
 训练态允许已确认secured grasp吸收最多0.06 s的接触求解抖动，但这段滞回不会延长严格成功
 计时；当前原始双侧接触一旦缺失，RL保持计时立即清零。最终终止还要求底层当前500 Hz
 高度、整线离桌比例和中心距离连续计时同时达到0.80 s，避免50 Hz策略采样漏掉几何子步
-间断。pinch形成后，目标位置、
-速度和接近进度切换到当前实际夹持线段，不再追逐原随机节点。
+间断。接近奖励始终使用夹持中心到最近可抓线段的距离，不会切换或锁定预设目标节点。
 
 奖励采用事件和单调高水位形式：首次单/双指接触、首次pinch和首次secured grasp只奖励一次；
 抓取段相对抬升在120 mm封顶，整线抬升比例在30%封顶，掉落后重抓不会再次领取旧高度奖励。
 secured后纯主动张爪、闭爪物理滑脱和“接触已丢失时又张爪”分别记录；主动张爪惩罚为-8，
-后两类为-3。物理/歧义接触丢失合计每回合最多罚一次，纯主动张爪另最多罚一次，全部事件仍
+物理滑脱为-3，接触丢失期间张爪只作诊断而不惩罚。物理滑脱和主动张爪各自每回合最多罚一次，全部事件仍
 写入诊断。严格保持奖励也按整回合高水位发放，总额封顶0.8分。另有抓后机械臂动作
 幅值/变化率代价、严格保持小奖励和25分终止成功奖励。这样保留真实滑脱，但不让一串接触
 事件主导整回合回报。
@@ -236,10 +232,16 @@ secured后纯主动张爪、闭爪物理滑脱和“接触已丢失时又张爪�
 python -m pip install -r .\rl\requirements_rl.txt
 ```
 
-默认用6个独立MuJoCo进程训练200万步并写入`rl/runs/ppo_cable_v3/`。前100万步把训练扰动
-从0.30线性增加到完整的1.50，之后保持完整扰动；学习率从3e-4线性降到3e-5，熵系数从
-0.01降到0.001，PPO每批更新5轮并用`target_kl=0.015`提前停止过大的更新。每10万步在
-10个固定新种子上以完整扰动独立评估，并按严格成功率保存`evaluation/best/best_model.zip`：
+默认用12个独立MuJoCo进程训练200万步并写入`rl/runs/ppo_dlo_baseline_v2/`。该默认值针对
+8核/16线程、16 GB内存机器实测确定；14/16环境虽略快，但长跑可用内存不足。默认只采用L1：
+
+1. `id_static`累计10次严格成功；
+2. `id_shape_nominal_current`与`id_rigid_l1_nominal`随机采样，并在50万步内从low强度升到nominal；
+3. 达到完整强度且本阶段累计10次严格成功后，进入`id_combined_l1_nominal`，再用50万步从low升到nominal。
+
+low到nominal同时提升形变力幅值（0.75到1.50）和运动频率/刚体速度（标称值的2/3到1）。课程只前进、
+不自动降级。学习率从3e-4线性降到3e-5，熵系数从0.01降到0.001，PPO每批更新5轮，`target_kl`
+默认关闭。每10万步在四个L1 nominal场景各评估6次；候选最佳模型另用50回合固定种子确认：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1
@@ -249,7 +251,7 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `
-  --timesteps 200000 --workers 6 --output .\rl\runs\ppo_cable_v3_200k
+  --timesteps 200000 --workers 12 --output .\rl\runs\ppo_dlo_baseline_v2_200k
 ```
 
 训练时每完成20轮会在终端输出最近100轮的成功率、pinch率、有效抓取率、平均回报和平均线缆抬升比例；
@@ -266,24 +268,24 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `
 
 ```powershell
 python -m tensorboard.main `
-  --logdir .\rl\runs\ppo_cable_v3\tensorboard
+  --logdir .\rl\runs\ppo_dlo_baseline_v2\tensorboard
 ```
 
 仅对采用当前抓取语义的新模型继续训练可使用：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `
-  --resume .\rl\runs\ppo_cable_v3\final_model.zip --timesteps 1000000 `
-  --output .\rl\runs\ppo_cable_v3
+  --resume .\rl\runs\ppo_dlo_baseline_v2\final_model.zip --timesteps 1000000 `
+  --output .\rl\runs\ppo_dlo_baseline_v2
 ```
 
-旧`ppo_cable`模型和`ppo_cable_v2`都不应resume到v3奖励继续正式训练；它们只用于回归测试。
+旧48维/8维动作PPO模型与当前99维/5维接口不兼容，不能resume，必须从头训练。
 
 无界面测试20个新随机场景：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\rl\run_rl_test.ps1 `
-  --model .\rl\runs\ppo_cable_v3\evaluation\best\best_model.zip --headless --episodes 20
+  --model .\rl\runs\ppo_dlo_baseline_v2\evaluation\best\best_model.zip --headless --episodes 20
 ```
 
 大批量统计时可关闭录像。每回合仍写入`episodes.csv`，并保存含checkpoint/XML/源码哈希、
@@ -291,7 +293,7 @@ powershell -ExecutionPolicy Bypass -File .\rl\run_rl_test.ps1 `
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\rl\run_rl_test.ps1 `
-  --model .\rl\runs\ppo_cable_v3\evaluation\best\best_model.zip `
+  --model .\rl\runs\ppo_dlo_baseline_v2\evaluation\best\best_model.zip `
   --headless --episodes 100 --no-video
 ```
 
@@ -305,7 +307,7 @@ CSV同时记录公共任务成功、PPO内部严格成功、场景指纹、动�
 ```powershell
 python .\benchmark.py `
   --suite core --methods scripted ppo --episodes 100 --seed 20280804 `
-  --ppo-model .\rl\runs\ppo_cable_v3\evaluation\best\best_model.zip
+  --ppo-model .\rl\runs\ppo_dlo_baseline_v2\evaluation\best\best_model.zip
 ```
 
 `--episodes`表示每个场景的重复次数。可将`core`换成`motion_sweep`、`ood`或`paper`；
@@ -319,8 +321,8 @@ python .\benchmark.py `
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\rl\run_rl_train.ps1 `
-  --training-distribution id --eval-distribution core `
-  --timesteps 2000000 --workers 6 --output .\rl\runs\ppo_cable_matrix_v1
+  --training-distribution l1 --eval-distribution l1 `
+  --timesteps 2000000 --workers 12 --output .\rl\runs\ppo_dlo_baseline_v2
 ```
 
 先运行无策略运动诊断，确认四类场景的实际响应可区分：
@@ -343,7 +345,7 @@ python .\motion_diagnostics.py `
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\rl\run_rl_test.ps1 `
-  --model .\rl\runs\ppo_cable_v3\evaluation\best\best_model.zip `
+  --model .\rl\runs\ppo_dlo_baseline_v2\evaluation\best\best_model.zip `
   --headless --episodes 20 --video-dir .\rl_test_videos `
   --video-fps 25 --video-width 960 --video-height 540
 ```
@@ -359,7 +361,7 @@ python .\replay_recording.py `
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\rl\run_rl_test.ps1 `
-  --model .\rl\runs\ppo_cable_v3\evaluation\best\best_model.zip --episodes 5 --speed 1
+  --model .\rl\runs\ppo_dlo_baseline_v2\evaluation\best\best_model.zip --episodes 5 --speed 1
 ```
 
 `rl/runs/smoke_test`只是2048步程序链路检查，不是已经学会抓取的模型；正式效果需要运行足够长的训练。

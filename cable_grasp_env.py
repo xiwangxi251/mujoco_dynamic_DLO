@@ -912,15 +912,17 @@ class CableGraspEnv:
             acceleration_limited_velocity = requested_velocity
             acceleration_limited = False
 
-        joint_limited_velocity = np.clip(
-            acceleration_limited_velocity,
-            -self._arm_velocity_limits,
-            self._arm_velocity_limits,
+        joint_velocity_scale = min(
+            1.0,
+            float(np.min(
+                self._arm_velocity_limits
+                / np.maximum(np.abs(acceleration_limited_velocity), 1e-12)
+            )),
         )
-        joint_velocity_limited = not np.allclose(
-            joint_limited_velocity, acceleration_limited_velocity,
-            rtol=0.0, atol=1e-12,
+        joint_limited_velocity = (
+            acceleration_limited_velocity * joint_velocity_scale
         )
+        joint_velocity_limited = joint_velocity_scale < 1.0 - 1e-12
 
         joint_range = self.model.jnt_range[self.arm_joint_ids]
         position_target = np.clip(

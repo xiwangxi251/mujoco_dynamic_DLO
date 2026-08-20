@@ -67,7 +67,7 @@ EPISODE_FIELDS = (
     "disturbance_phase",
     "disturbance_spatial_phase",
     "target_body_id",
-    "rl_target_body_id",
+    "rl_grasped_body_id",
     "grasped_body_id",
     "ever_pinch",
     "ever_secured",
@@ -545,7 +545,7 @@ def _episode_row(
             initial_info.get("disturbance_spatial_phase")
         ),
         "target_body_id": _finite_or_none(initial_info.get("target_body_id")),
-        "rl_target_body_id": _finite_or_none(final_info.get("rl_target_body_id")),
+        "rl_grasped_body_id": _finite_or_none(final_info.get("rl_grasped_body_id")),
         "grasped_body_id": _finite_or_none(final_info.get("grasped_body_id")),
         "ever_pinch": diagnostics.ever_pinch,
         "ever_secured": diagnostics.ever_secured,
