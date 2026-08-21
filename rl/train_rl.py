@@ -34,6 +34,19 @@ RL_L1_CURRICULUM_STAGES = (
     ("id_shape_nominal_current", "id_rigid_l1_nominal"),
     ("id_combined_l1_nominal",),
 )
+RL_INTERFACE_VERSION = "baseline_v3"
+
+
+def checkpoint_interface_version(checkpoint: Path) -> str | None:
+    """Find the nearest training manifest associated with a checkpoint."""
+    checkpoint = Path(checkpoint).resolve()
+    for directory in (checkpoint.parent, *checkpoint.parents):
+        config_path = directory / "training_config.json"
+        if not config_path.is_file():
+            continue
+        with config_path.open("r", encoding="utf-8") as source:
+            return str(json.load(source).get("rl_interface_version", "")) or None
+    return None
 
 
 def linear_schedule(
@@ -90,75 +103,104 @@ def make_worker(rank: int, args: argparse.Namespace):
 
 
 class MotionCurriculumCallback(BaseCallback):
-    """Advance static -> component motions -> combined L1 without regression."""
+    """Advance static -> component motions -> combined L1 from strict evals."""
 
     def __init__(
         self,
         stages: tuple[tuple[str, ...], ...],
-        stage_steps: int,
         update_every: int = 10_000,
-        successes_per_stage: int = 10,
+        required_evaluations: int = 2,
+        aligned_pinch_rate: float = 0.50,
+        secured_rate: float = 0.20,
+        success_rate: float = 0.10,
     ):
         super().__init__(verbose=0)
         if not stages:
             raise ValueError("motion curriculum requires at least one stage")
         self.stages = stages
-        self.stage_steps = max(1, int(stage_steps))
         self.update_every = max(1, int(update_every))
-        self.successes_per_stage = max(0, int(successes_per_stage))
-        self.stage_index = 0
-        self.stage_successes = 0
-        self.stage_start_timesteps = 0
+        self.required_evaluations = max(1, int(required_evaluations))
+        self.aligned_pinch_rate = float(aligned_pinch_rate)
+        self.secured_rate = float(secured_rate)
+        self.success_rate = float(success_rate)
+        self.phases = (
+            (0, 0.0),
+            *((stage, difficulty) for stage in range(1, len(stages))
+              for difficulty in (1.0 / 3.0, 2.0 / 3.0, 1.0)),
+        )
+        self.phase_index = 0
+        self.qualifying_evaluations = 0
         self._last_update = -self.update_every
 
-    def _difficulty(self) -> float:
-        if self.stage_index == 0:
-            return 0.0
-        return min(
-            1.0,
-            max(0, self.num_timesteps - self.stage_start_timesteps)
-            / self.stage_steps,
-        )
+    @property
+    def stage_index(self) -> int:
+        return int(self.phases[self.phase_index][0])
+
+    @property
+    def difficulty(self) -> float:
+        return float(self.phases[self.phase_index][1])
+
+    @property
+    def current_scenarios(self) -> tuple[str, ...]:
+        return self.stages[self.stage_index]
 
     def _apply(self) -> None:
-        difficulty = self._difficulty()
         self.training_env.env_method(
-            "set_training_scenarios", self.stages[self.stage_index]
+            "set_training_scenarios", self.current_scenarios
         )
-        self.training_env.env_method("set_motion_difficulty", difficulty)
+        self.training_env.env_method("set_motion_difficulty", self.difficulty)
+        self.logger.record("curriculum/phase", self.phase_index)
         self.logger.record("curriculum/stage", self.stage_index)
-        self.logger.record("curriculum/motion_difficulty", difficulty)
-        self.logger.record("curriculum/stage_successes", self.stage_successes)
+        self.logger.record("curriculum/motion_difficulty", self.difficulty)
+        self.logger.record(
+            "curriculum/qualifying_evaluations", self.qualifying_evaluations
+        )
         self._last_update = self.num_timesteps
 
-    def _advance_stage(self) -> None:
-        self.stage_index += 1
-        self.stage_successes = 0
-        self.stage_start_timesteps = self.num_timesteps
+    def configure_evaluation_env(self, env: RLCableGraspEnv) -> None:
+        env.set_training_scenarios(self.current_scenarios)
+        env.set_motion_difficulty(self.difficulty)
+
+    def restore_phase(self, phase_index: int) -> None:
+        phase_index = int(phase_index)
+        if not 0 <= phase_index < len(self.phases):
+            raise ValueError(f"invalid curriculum phase: {phase_index}")
+        self.phase_index = phase_index
+        self.qualifying_evaluations = 0
+        self._apply()
+
+    def evaluation_qualifies(self, metrics: dict[str, float]) -> bool:
+        return bool(
+            metrics["aligned_pinch_rate"] >= self.aligned_pinch_rate
+            and metrics["grasp_rate"] >= self.secured_rate
+            and metrics["success_rate"] >= self.success_rate
+        )
+
+    def observe_evaluation(self, metrics: dict[str, float]) -> None:
+        if self.phase_index == len(self.phases) - 1:
+            return
+        if self.evaluation_qualifies(metrics):
+            self.qualifying_evaluations += 1
+        else:
+            self.qualifying_evaluations = 0
+        if self.qualifying_evaluations < self.required_evaluations:
+            self._apply()
+            return
+        self.phase_index += 1
+        self.qualifying_evaluations = 0
         self._apply()
         print(
-            f"curriculum_stage={self.stage_index} "
-            f"scenarios={','.join(self.stages[self.stage_index])}",
+            f"curriculum_phase={self.phase_index} stage={self.stage_index} "
+            f"difficulty={self.difficulty:.3f} "
+            f"scenarios={','.join(self.current_scenarios)}",
             flush=True,
         )
 
     def _on_training_start(self) -> None:
-        self.stage_start_timesteps = self.num_timesteps
         self._apply()
 
     def _on_step(self) -> bool:
-        dones = self.locals.get("dones", [])
-        infos = self.locals.get("infos", [])
-        for done, info in zip(dones, infos):
-            if done and bool(info.get("success", False)):
-                self.stage_successes += 1
-
-        final_stage = self.stage_index == len(self.stages) - 1
-        success_gate = self.stage_successes >= self.successes_per_stage
-        intensity_gate = self.stage_index == 0 or self._difficulty() >= 1.0
-        if not final_stage and success_gate and intensity_gate:
-            self._advance_stage()
-        elif self.num_timesteps - self._last_update >= self.update_every:
+        if self.num_timesteps - self._last_update >= self.update_every:
             self._apply()
         return True
 
@@ -204,6 +246,7 @@ class StrictSuccessEvalCallback(BaseCallback):
         episodes: int,
         confirmation_episodes: int,
         seed: int,
+        curriculum: MotionCurriculumCallback | None = None,
     ):
         super().__init__(verbose=0)
         self.env = env
@@ -212,53 +255,79 @@ class StrictSuccessEvalCallback(BaseCallback):
         self.episodes = max(1, int(episodes))
         self.confirmation_episodes = max(1, int(confirmation_episodes))
         self.seed = int(seed)
+        self.curriculum = curriculum
         # Do not spend 50 confirmation episodes on a policy with no strict
         # success and no secured grasp merely because its shaped return moved.
         self.best_success_rate = 0.0
         self.best_grasp_rate = 0.0
-        self.best_slip_rate = 0.0
+        self.best_aligned_pinch_rate = 0.0
         self.best_mean_return = -np.inf
+        self.best_phase = -1
         self._last_eval = 0
         self.csv_path = self.output_dir / "strict_eval.csv"
 
     def _on_training_start(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._last_eval = self.num_timesteps
+        previous_rows: list[dict[str, str]] = []
         if self.csv_path.exists():
             with self.csv_path.open("r", encoding="utf-8", newline="") as source:
                 for row in csv.DictReader(source):
+                    previous_rows.append(row)
                     rate = float(row["success_rate"])
                     grasp_rate = float(row["grasp_rate"])
-                    slip_rate = float(row.get("physical_slip_rate", 1.0))
+                    aligned_pinch_rate = float(row.get("aligned_pinch_rate", 0.0))
                     mean_return = float(row["mean_return"])
-                    score = (rate, grasp_rate, -slip_rate)
+                    phase = int(row.get("curriculum_phase", 0))
+                    score = (
+                        phase, rate, grasp_rate, aligned_pinch_rate, mean_return
+                    )
                     best_score = (
-                        self.best_success_rate, self.best_grasp_rate,
-                        -self.best_slip_rate,
+                        self.best_phase, self.best_success_rate,
+                        self.best_grasp_rate, self.best_aligned_pinch_rate,
+                        self.best_mean_return,
                     )
                     if score > best_score:
+                        self.best_phase = phase
                         self.best_success_rate = rate
                         self.best_grasp_rate = grasp_rate
-                        self.best_slip_rate = slip_rate
+                        self.best_aligned_pinch_rate = aligned_pinch_rate
                         self.best_mean_return = mean_return
         else:
             with self.csv_path.open("w", encoding="utf-8", newline="") as target:
                 csv.writer(target).writerow([
-                    "timesteps", "success_rate", "pinch_rate", "grasp_rate",
-                    "physical_slip_rate", "mean_return", "mean_length", "episodes",
+                    "timesteps", "curriculum_phase", "next_curriculum_phase",
+                    "curriculum_stage",
+                    "motion_difficulty", "success_rate", "pinch_rate",
+                    "aligned_pinch_rate", "lift_attempt_rate", "loaded_lift_rate",
+                    "grasp_rate", "physical_slip_rate", "mean_return",
+                    "mean_length", "episodes",
                 ])
+        if self.curriculum is not None and previous_rows:
+            self.curriculum.restore_phase(int(
+                previous_rows[-1].get(
+                    "next_curriculum_phase",
+                    previous_rows[-1].get("curriculum_phase", 0),
+                )
+            ))
         confirmation_path = self.output_dir / "best" / "confirmation.json"
         if confirmation_path.is_file():
             with confirmation_path.open("r", encoding="utf-8") as source:
                 confirmed = json.load(source)
             self.best_success_rate = float(confirmed["success_rate"])
             self.best_grasp_rate = float(confirmed["grasp_rate"])
-            self.best_slip_rate = float(confirmed["slip_rate"])
+            self.best_aligned_pinch_rate = float(
+                confirmed.get("aligned_pinch_rate", 0.0)
+            )
             self.best_mean_return = float(confirmed["mean_return"])
+            self.best_phase = int(confirmed.get("curriculum_phase", 0))
 
     def _evaluate(self, episodes: int, *, seed_offset: int = 0) -> dict[str, float]:
         successes = 0
         pinches = 0
+        aligned_pinches = 0
+        lift_attempts = 0
+        loaded_lifts = 0
         grasps = 0
         slips = 0
         returns: list[float] = []
@@ -278,6 +347,9 @@ class StrictSuccessEvalCallback(BaseCallback):
                     break
             successes += int(bool(info["success"]))
             pinches += int(bool(info["ever_pinched"]))
+            aligned_pinches += int(bool(info.get("ever_aligned_pinch", False)))
+            lift_attempts += int(bool(info.get("lift_attempt", False)))
+            loaded_lifts += int(bool(info.get("loaded_lift", False)))
             grasps += int(bool(info["ever_grasped"]))
             slips += int(int(info.get("physical_slip_after_secured_count", 0)) > 0)
             returns.append(episode_return)
@@ -285,6 +357,9 @@ class StrictSuccessEvalCallback(BaseCallback):
         return {
             "success_rate": successes / episodes,
             "pinch_rate": pinches / episodes,
+            "aligned_pinch_rate": aligned_pinches / episodes,
+            "lift_attempt_rate": lift_attempts / episodes,
+            "loaded_lift_rate": loaded_lifts / episodes,
             "grasp_rate": grasps / episodes,
             "slip_rate": slips / episodes,
             "mean_return": float(np.mean(returns)),
@@ -296,45 +371,71 @@ class StrictSuccessEvalCallback(BaseCallback):
             return True
         self._last_eval = self.num_timesteps
 
+        if self.curriculum is not None:
+            self.curriculum.configure_evaluation_env(self.env)
         metrics = self._evaluate(self.episodes)
         success_rate = metrics["success_rate"]
         pinch_rate = metrics["pinch_rate"]
+        aligned_pinch_rate = metrics["aligned_pinch_rate"]
+        lift_attempt_rate = metrics["lift_attempt_rate"]
+        loaded_lift_rate = metrics["loaded_lift_rate"]
         grasp_rate = metrics["grasp_rate"]
         slip_rate = metrics["slip_rate"]
         mean_return = metrics["mean_return"]
         mean_length = metrics["mean_length"]
+        curriculum_phase = (
+            self.curriculum.phase_index if self.curriculum is not None else 0
+        )
+        curriculum_stage = (
+            self.curriculum.stage_index if self.curriculum is not None else 0
+        )
+        motion_difficulty = (
+            self.curriculum.difficulty if self.curriculum is not None else 1.0
+        )
+        if self.curriculum is not None:
+            self.curriculum.observe_evaluation(metrics)
+        next_curriculum_phase = (
+            self.curriculum.phase_index if self.curriculum is not None else 0
+        )
         with self.csv_path.open("a", encoding="utf-8", newline="") as target:
             csv.writer(target).writerow([
-                self.num_timesteps, success_rate, pinch_rate, grasp_rate,
-                slip_rate, mean_return, mean_length, self.episodes,
+                self.num_timesteps, curriculum_phase, next_curriculum_phase,
+                curriculum_stage,
+                motion_difficulty, success_rate, pinch_rate, aligned_pinch_rate,
+                lift_attempt_rate, loaded_lift_rate, grasp_rate, slip_rate,
+                mean_return, mean_length, self.episodes,
             ])
         self.logger.record("eval/strict_success_rate", success_rate)
         self.logger.record("eval/pinch_rate", pinch_rate)
+        self.logger.record("eval/aligned_pinch_rate", aligned_pinch_rate)
+        self.logger.record("eval/lift_attempt_rate", lift_attempt_rate)
+        self.logger.record("eval/loaded_lift_rate", loaded_lift_rate)
         self.logger.record("eval/secured_grasp_rate", grasp_rate)
         self.logger.record("eval/physical_slip_rate", slip_rate)
         self.logger.record("eval/mean_return", mean_return)
 
-        routine_score = (success_rate, grasp_rate, -slip_rate)
+        routine_score = (
+            curriculum_phase, success_rate, grasp_rate,
+            aligned_pinch_rate, mean_return,
+        )
         best_score = (
-            self.best_success_rate, self.best_grasp_rate,
-            -self.best_slip_rate,
+            self.best_phase, self.best_success_rate, self.best_grasp_rate,
+            self.best_aligned_pinch_rate, self.best_mean_return,
         )
         if routine_score > best_score:
             confirmed = self._evaluate(
                 self.confirmation_episodes, seed_offset=100_000
             )
-            confirmed_primary_score = (
-                confirmed["success_rate"], confirmed["grasp_rate"],
-                -confirmed["slip_rate"],
-            )
             confirmed_score = (
-                *confirmed_primary_score, confirmed["mean_return"],
+                curriculum_phase, confirmed["success_rate"],
+                confirmed["grasp_rate"], confirmed["aligned_pinch_rate"],
+                confirmed["mean_return"],
             )
-            full_best_score = (*best_score, self.best_mean_return)
-            if confirmed_score > full_best_score:
+            if confirmed_score > best_score:
+                self.best_phase = curriculum_phase
                 self.best_success_rate = confirmed["success_rate"]
                 self.best_grasp_rate = confirmed["grasp_rate"]
-                self.best_slip_rate = confirmed["slip_rate"]
+                self.best_aligned_pinch_rate = confirmed["aligned_pinch_rate"]
                 self.best_mean_return = confirmed["mean_return"]
                 best_dir = self.output_dir / "best"
                 best_dir.mkdir(parents=True, exist_ok=True)
@@ -346,6 +447,9 @@ class StrictSuccessEvalCallback(BaseCallback):
                         {
                             "timesteps": self.num_timesteps,
                             "episodes": self.confirmation_episodes,
+                            "curriculum_phase": curriculum_phase,
+                            "curriculum_stage": curriculum_stage,
+                            "motion_difficulty": motion_difficulty,
                             **confirmed,
                         },
                         target,
@@ -355,6 +459,7 @@ class StrictSuccessEvalCallback(BaseCallback):
         print(
             f"strict_eval timesteps={self.num_timesteps} "
             f"success={success_rate:.1%} pinch={pinch_rate:.1%} "
+            f"aligned={aligned_pinch_rate:.1%} loaded={loaded_lift_rate:.1%} "
             f"grasp={grasp_rate:.1%} slip={slip_rate:.1%} "
             f"mean_return={mean_return:.3f}",
             flush=True,
@@ -389,7 +494,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path,
-        default=output_path("rl", "runs", "ppo_dlo_baseline_v2")
+        default=output_path("rl", "runs", "ppo_dlo_baseline_v3")
     )
     parser.add_argument("--checkpoint-steps", type=int, default=100_000)
     parser.add_argument("--n-steps", type=int, default=1024,
@@ -424,16 +529,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--curriculum-stage-steps", "--curriculum-steps",
         dest="curriculum_stage_steps", type=int, default=500_000,
-        help="steps to ramp each moving stage from low to nominal; 0 disables curriculum",
+        help=(
+            "positive enables evaluation-driven L1 curriculum; 0 disables it "
+            "(the numeric value is retained for CLI compatibility)"
+        ),
     )
     parser.add_argument("--curriculum-update-steps", type=int, default=10_000)
     parser.add_argument(
-        "--curriculum-successes-per-stage", "--curriculum-success-warmup",
-        dest="curriculum_successes_per_stage", type=int, default=10,
+        "--curriculum-required-evals", type=int, default=2,
+        help="consecutive qualifying deterministic evaluations required to advance",
     )
+    parser.add_argument("--curriculum-aligned-pinch-rate", type=float, default=0.50)
+    parser.add_argument("--curriculum-secured-rate", type=float, default=0.20)
+    parser.add_argument("--curriculum-success-rate", type=float, default=0.10)
     parser.add_argument("--eval-freq", type=int, default=100_000,
                         help="environment timesteps between strict evaluations; 0 disables")
-    parser.add_argument("--eval-episodes", type=int, default=24)
+    parser.add_argument("--eval-episodes", type=int, default=50)
     parser.add_argument("--eval-confirmation-episodes", type=int, default=50)
     parser.add_argument("--eval-seed", type=int, default=20270804)
     parser.add_argument("--device", default="cpu", help="cpu, cuda or auto")
@@ -502,9 +613,16 @@ def parse_args() -> argparse.Namespace:
     if (
         args.curriculum_stage_steps < 0
         or args.curriculum_update_steps < 1
-        or args.curriculum_successes_per_stage < 0
+        or args.curriculum_required_evals < 1
     ):
         parser.error("curriculum steps must be non-negative and update steps positive")
+    curriculum_rates = (
+        args.curriculum_aligned_pinch_rate,
+        args.curriculum_secured_rate,
+        args.curriculum_success_rate,
+    )
+    if not all(0.0 <= value <= 1.0 for value in curriculum_rates):
+        parser.error("curriculum rate thresholds must be in [0, 1]")
     if (
         args.training_distribution != "l1"
         and args.curriculum_stage_steps > 0
@@ -523,6 +641,14 @@ def parse_args() -> argparse.Namespace:
         resume_with_zip = Path(f"{args.resume}.zip")
         if not args.resume.is_file() and not resume_with_zip.is_file():
             parser.error(f"--resume checkpoint does not exist: {args.resume}")
+        version = checkpoint_interface_version(
+            args.resume if args.resume.is_file() else resume_with_zip
+        )
+        if version != RL_INTERFACE_VERSION:
+            parser.error(
+                "--resume checkpoint predates the baseline_v3 action/reward "
+                "interface and cannot be continued safely"
+            )
     return args
 
 
@@ -552,7 +678,8 @@ def main() -> None:
         vector_env,
         filename=str(args.output / "monitor.csv"),
         info_keywords=(
-            "success", "ever_pinched", "ever_grasped", "lifted_fraction",
+            "success", "ever_pinched", "ever_aligned_pinch", "lift_attempt",
+            "loaded_lift", "ever_grasped", "lifted_fraction",
         ),
     )
 
@@ -651,16 +778,20 @@ def main() -> None:
             args.timesteps,
         ),
     ]
+    curriculum_callback: MotionCurriculumCallback | None = None
     if (
         args.training_distribution == "l1"
         and args.curriculum_stage_steps > 0
     ):
-        callback_items.append(MotionCurriculumCallback(
+        curriculum_callback = MotionCurriculumCallback(
             RL_L1_CURRICULUM_STAGES,
-            args.curriculum_stage_steps,
             args.curriculum_update_steps,
-            args.curriculum_successes_per_stage,
-        ))
+            args.curriculum_required_evals,
+            args.curriculum_aligned_pinch_rate,
+            args.curriculum_secured_rate,
+            args.curriculum_success_rate,
+        )
+        callback_items.append(curriculum_callback)
     eval_env: RLCableGraspEnv | None = None
     if args.eval_freq > 0:
         eval_env = RLCableGraspEnv(
@@ -676,10 +807,12 @@ def main() -> None:
             episodes=args.eval_episodes,
             confirmation_episodes=args.eval_confirmation_episodes,
             seed=args.eval_seed,
+            curriculum=curriculum_callback,
         ))
     callbacks = CallbackList(callback_items)
     configuration = {
         "algorithm": "PPO",
+        "rl_interface_version": RL_INTERFACE_VERSION,
         "grasp_model": "physical_friction_v1",
         "output": str(args.output.resolve()),
         "timesteps": args.timesteps,
@@ -727,10 +860,13 @@ def main() -> None:
         "curriculum_stages": RL_L1_CURRICULUM_STAGES,
         "curriculum_stage_steps": args.curriculum_stage_steps,
         "curriculum_update_steps": args.curriculum_update_steps,
-        "curriculum_successes_per_stage": args.curriculum_successes_per_stage,
+        "curriculum_required_evals": args.curriculum_required_evals,
+        "curriculum_aligned_pinch_rate": args.curriculum_aligned_pinch_rate,
+        "curriculum_secured_rate": args.curriculum_secured_rate,
+        "curriculum_success_rate": args.curriculum_success_rate,
         "curriculum_motion_difficulty": (
-            "each moving stage ramps low (0.75 shape-force, 2/3 nominal speed) "
-            "to nominal (1.5 shape-force, nominal speed)"
+            "strict-eval-driven static -> component L1 -> combined L1; each "
+            "moving stage advances through difficulty 1/3, 2/3 and 1"
         ),
         "curriculum_final_disturbance": args.disturbance,
         "eval_freq": args.eval_freq,
@@ -753,15 +889,14 @@ def main() -> None:
         "action_names": list(RLCableGraspEnv.ACTION_NAMES),
         "rl_config": asdict(RLConfig()),
         "reward": (
-            "nearest-graspable-segment reach progress + gated smooth-tangent "
-            "alignment progress + one-shot contact/pinch/secured bonuses + episode-global "
-            "lift high-water credit + strict terminal reward + active-open and physical-slip "
-            "penalties + gripper-switch and action regularization; ambiguous opening during "
-            "contact loss is diagnostic only"
+            "pre-pinch nearest-segment reach progress + planar perpendicular "
+            "alignment potential progress + aligned-pinch bonus + capped unloaded-pinch "
+            "penalties + episode-global lift high-water credit + strict success; "
+            "post-secured active-open and physical-slip penalties remain causal"
         ),
         "action": (
-            "TCP-local delta xyz (0.010 m vector-norm cap), TCP-local yaw "
-            "(0.020 rad), and one hysteretic gripper command; damped resolved-rate "
+            "base-frame delta xyz (0.010 m vector-norm cap), world-z yaw "
+            "(0.020 rad), and one continuous gripper target; damped resolved-rate "
             "IK with uniform joint-velocity scaling"
         ),
     }
