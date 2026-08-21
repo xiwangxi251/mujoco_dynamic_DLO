@@ -15,7 +15,12 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.utils import set_random_seed
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecEnv,
+    VecMonitor,
+)
 
 from ..scenarios.registry import list_scenario_names
 from ..paths import output_path
@@ -102,6 +107,18 @@ def make_worker(rank: int, args: argparse.Namespace):
     return initialize
 
 
+def make_eval_worker(rank: int, args: argparse.Namespace):
+    """Build one deterministic strict-evaluation environment."""
+    def initialize():
+        return RLCableGraspEnv(
+            seed=args.eval_seed + rank,
+            disturbance_strength=args.disturbance,
+            episode_seconds=args.episode_seconds,
+            scenario_names=args.eval_scenario_names,
+        )
+    return initialize
+
+
 class MotionCurriculumCallback(BaseCallback):
     """Advance static -> component motions -> combined L1 from strict evals."""
 
@@ -157,7 +174,11 @@ class MotionCurriculumCallback(BaseCallback):
         )
         self._last_update = self.num_timesteps
 
-    def configure_evaluation_env(self, env: RLCableGraspEnv) -> None:
+    def configure_evaluation_env(self, env: RLCableGraspEnv | VecEnv) -> None:
+        if isinstance(env, VecEnv):
+            env.env_method("set_training_scenarios", self.current_scenarios)
+            env.env_method("set_motion_difficulty", self.difficulty)
+            return
         env.set_training_scenarios(self.current_scenarios)
         env.set_motion_difficulty(self.difficulty)
 
@@ -239,7 +260,7 @@ class StrictSuccessEvalCallback(BaseCallback):
 
     def __init__(
         self,
-        env: RLCableGraspEnv,
+        env: VecEnv,
         output_dir: Path,
         *,
         eval_freq: int,
@@ -256,6 +277,9 @@ class StrictSuccessEvalCallback(BaseCallback):
         self.confirmation_episodes = max(1, int(confirmation_episodes))
         self.seed = int(seed)
         self.curriculum = curriculum
+        self.eval_workers = int(env.num_envs)
+        if self.eval_workers < 1:
+            raise ValueError("strict evaluation requires at least one worker")
         # Do not spend 50 confirmation episodes on a policy with no strict
         # success and no secured grasp merely because its shaped return moved.
         self.best_success_rate = 0.0
@@ -332,28 +356,53 @@ class StrictSuccessEvalCallback(BaseCallback):
         slips = 0
         returns: list[float] = []
         lengths: list[int] = []
-        for episode in range(episodes):
-            observation, info = self.env.reset(
-                seed=self.seed + seed_offset + episode
+        completed = 0
+        print(
+            f"strict_eval_start episodes={episodes} workers={self.eval_workers}",
+            flush=True,
+        )
+        while completed < episodes:
+            batch_size = min(self.eval_workers, episodes - completed)
+            batch_seed = self.seed + seed_offset + completed
+            # VecEnv.seed(N) assigns N + rank on the following reset. Each
+            # requested episode therefore keeps the exact seeds used by the
+            # former serial evaluator, independent of worker count.
+            self.env.seed(batch_seed)
+            observations = self.env.reset()
+            active = np.arange(self.eval_workers) < batch_size
+            batch_returns = np.zeros(self.eval_workers, dtype=np.float64)
+            batch_lengths = np.zeros(self.eval_workers, dtype=np.int64)
+
+            while bool(np.any(active)):
+                actions, _ = self.model.predict(
+                    observations, deterministic=True
+                )
+                observations, rewards, dones, infos = self.env.step(actions)
+                batch_returns[active] += np.asarray(rewards)[active]
+                batch_lengths[active] += 1
+                finished = np.flatnonzero(active & np.asarray(dones, dtype=bool))
+                for worker in finished:
+                    info = infos[int(worker)]
+                    successes += int(bool(info["success"]))
+                    pinches += int(bool(info["ever_pinched"]))
+                    aligned_pinches += int(bool(
+                        info.get("ever_aligned_pinch", False)
+                    ))
+                    lift_attempts += int(bool(info.get("lift_attempt", False)))
+                    loaded_lifts += int(bool(info.get("loaded_lift", False)))
+                    grasps += int(bool(info["ever_grasped"]))
+                    slips += int(
+                        int(info.get("physical_slip_after_secured_count", 0)) > 0
+                    )
+                    returns.append(float(batch_returns[worker]))
+                    lengths.append(int(batch_lengths[worker]))
+                    active[worker] = False
+
+            completed += batch_size
+            print(
+                f"strict_eval_progress completed={completed}/{episodes}",
+                flush=True,
             )
-            episode_return = 0.0
-            length = 0
-            while True:
-                action, _ = self.model.predict(observation, deterministic=True)
-                observation, reward, terminated, truncated, info = self.env.step(action)
-                episode_return += reward
-                length += 1
-                if terminated or truncated:
-                    break
-            successes += int(bool(info["success"]))
-            pinches += int(bool(info["ever_pinched"]))
-            aligned_pinches += int(bool(info.get("ever_aligned_pinch", False)))
-            lift_attempts += int(bool(info.get("lift_attempt", False)))
-            loaded_lifts += int(bool(info.get("loaded_lift", False)))
-            grasps += int(bool(info["ever_grasped"]))
-            slips += int(int(info.get("physical_slip_after_secured_count", 0)) > 0)
-            returns.append(episode_return)
-            lengths.append(length)
         return {
             "success_rate": successes / episodes,
             "pinch_rate": pinches / episodes,
@@ -422,7 +471,8 @@ class StrictSuccessEvalCallback(BaseCallback):
             self.best_phase, self.best_success_rate, self.best_grasp_rate,
             self.best_aligned_pinch_rate, self.best_mean_return,
         )
-        if routine_score > best_score:
+        has_task_progress = success_rate > 0.0 or grasp_rate > 0.0
+        if has_task_progress and routine_score > best_score:
             confirmed = self._evaluate(
                 self.confirmation_episodes, seed_offset=100_000
             )
@@ -431,7 +481,11 @@ class StrictSuccessEvalCallback(BaseCallback):
                 confirmed["grasp_rate"], confirmed["aligned_pinch_rate"],
                 confirmed["mean_return"],
             )
-            if confirmed_score > best_score:
+            confirmed_task_progress = (
+                confirmed["success_rate"] > 0.0
+                or confirmed["grasp_rate"] > 0.0
+            )
+            if confirmed_task_progress and confirmed_score > best_score:
                 self.best_phase = curriculum_phase
                 self.best_success_rate = confirmed["success_rate"]
                 self.best_grasp_rate = confirmed["grasp_rate"]
@@ -546,6 +600,10 @@ def parse_args() -> argparse.Namespace:
                         help="environment timesteps between strict evaluations; 0 disables")
     parser.add_argument("--eval-episodes", type=int, default=50)
     parser.add_argument("--eval-confirmation-episodes", type=int, default=50)
+    parser.add_argument(
+        "--eval-workers", type=int, default=4,
+        help="parallel MuJoCo environments used only by strict evaluation",
+    )
     parser.add_argument("--eval-seed", type=int, default=20270804)
     parser.add_argument("--device", default="cpu", help="cpu, cuda or auto")
     parser.add_argument("--resume", type=Path, default=None)
@@ -635,8 +693,12 @@ def parse_args() -> argparse.Namespace:
         args.eval_freq < 0
         or args.eval_episodes < 1
         or args.eval_confirmation_episodes < 1
+        or args.eval_workers < 1
     ):
-        parser.error("evaluation frequency/counts must be non-negative/positive")
+        parser.error(
+            "evaluation frequency must be non-negative; episode counts and "
+            "--eval-workers must be positive"
+        )
     if args.resume is not None:
         resume_with_zip = Path(f"{args.resume}.zip")
         if not args.resume.is_file() and not resume_with_zip.is_file():
@@ -792,14 +854,15 @@ def main() -> None:
             args.curriculum_success_rate,
         )
         callback_items.append(curriculum_callback)
-    eval_env: RLCableGraspEnv | None = None
+    eval_env: VecEnv | None = None
     if args.eval_freq > 0:
-        eval_env = RLCableGraspEnv(
-            seed=args.eval_seed,
-            disturbance_strength=args.disturbance,
-            episode_seconds=args.episode_seconds,
-            scenario_names=args.eval_scenario_names,
-        )
+        eval_factories = [
+            make_eval_worker(rank, args) for rank in range(args.eval_workers)
+        ]
+        if args.eval_workers == 1:
+            eval_env = DummyVecEnv(eval_factories)
+        else:
+            eval_env = SubprocVecEnv(eval_factories, start_method="spawn")
         callback_items.append(StrictSuccessEvalCallback(
             eval_env,
             args.output / "evaluation",
@@ -872,6 +935,7 @@ def main() -> None:
         "eval_freq": args.eval_freq,
         "eval_episodes": args.eval_episodes,
         "eval_confirmation_episodes": args.eval_confirmation_episodes,
+        "eval_workers": args.eval_workers,
         "eval_seed": args.eval_seed,
         "rl_grasp_definition": (
             "bilateral confirmed pinch + 30 mm lift from that cable body's "

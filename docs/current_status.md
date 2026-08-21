@@ -25,6 +25,7 @@
 ```bash
 python -m rl.train_rl \
   --workers 12 \
+  --eval-workers 4 \
   --timesteps 2000000 \
   --training-distribution l1 \
   --eval-distribution l1 \
@@ -33,6 +34,7 @@ python -m rl.train_rl \
 ```
 
 服务器上先运行 10–20 万步 pilot。逐级提高 `--workers`，当 CPU 已接近饱和、内存压力明显或 steps/s 不再增长时停止增加。
+严格评估默认使用 4 个独立进程；可通过 `--eval-workers` 调整，设为 1 时恢复串行评估。
 
 ## 评估重点
 

@@ -35,11 +35,12 @@ python motion_diagnostics.py --help
 PPO 训练与评估：
 
 ```bash
-python -m rl.train_rl --workers 12 --timesteps 2000000 --device cpu
+python -m rl.train_rl --workers 12 --eval-workers 4 --timesteps 2000000 --device cpu
 python -m rl.test_rl --model outputs/rl/train/ppo_dlo_baseline_v3/best_model.zip --headless
 ```
 
 `--workers` 是并行 MuJoCo 环境进程数，不是 GPU 数。服务器上应逐级测试 8、12、16……，以总采样吞吐、内存和 CPU 利用率决定，而不是盲目设成 CPU 线程数。
+`--eval-workers` 独立控制严格评估的并行环境数，默认为 4；设为 1 可恢复串行评估。
 
 特权专家和 DynamicVLA 微调：
 
