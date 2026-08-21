@@ -29,6 +29,7 @@ def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
             seed=args.seed,
             episode_seconds=args.episode_seconds,
             disturbance_strength=args.disturbance,
+            dynamicvla_cameras_enabled=True,
         )
     scenario = get_scenario(args.scenario)
     return EnvConfig(
@@ -37,6 +38,7 @@ def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
         scenario_name=scenario.name,
         scenario_id=scenario.scenario_id,
         scenario_split=scenario.split.value,
+        dynamicvla_cameras_enabled=True,
         **scenario.to_env_overrides(),
     )
 
@@ -101,6 +103,11 @@ def run_headless(args: argparse.Namespace) -> None:
     renderer = mujoco.Renderer(
         env.model, height=args.video_height, width=args.video_width
     )
+    wrist_renderer = mujoco.Renderer(
+        env.model,
+        height=env.config.dynamicvla_camera_height,
+        width=env.config.dynamicvla_camera_width,
+    )
     model_path = video_dir / f"{env.config.scenario_name}.mjb"
     mujoco.mj_saveModel(env.model, str(model_path), None)
     state_spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
@@ -115,6 +122,7 @@ def run_headless(args: argparse.Namespace) -> None:
     def write_frame(
         writer: cv2.VideoWriter,
         global_writer: cv2.VideoWriter,
+        wrist_writer: cv2.VideoWriter,
         recorded_states: list[np.ndarray],
     ) -> None:
         """同步保存物理状态、诊断总览画面和固定全局相机画面。"""
@@ -126,6 +134,11 @@ def run_headless(args: argparse.Namespace) -> None:
         writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
         global_rgb = env.camera_rgb()
         global_writer.write(cv2.cvtColor(global_rgb, cv2.COLOR_RGB2BGR))
+        wrist_renderer.update_scene(
+            env.data, camera=env.config.dynamicvla_wrist_camera_name
+        )
+        wrist_rgb = wrist_renderer.render()
+        wrist_writer.write(cv2.cvtColor(wrist_rgb, cv2.COLOR_RGB2BGR))
 
     print(f"model={XML_PATH}", flush=True)
     print(f"headless_run={run_dir.resolve()}", flush=True)
@@ -139,6 +152,9 @@ def run_headless(args: argparse.Namespace) -> None:
         global_video_path = (
             video_dir / f"trial_{env.trial_index:03d}_global.mp4"
         )
+        wrist_video_path = (
+            video_dir / f"trial_{env.trial_index:03d}_wrist.mp4"
+        )
         writer = cv2.VideoWriter(
             str(video_path),
             cv2.VideoWriter_fourcc(*"mp4v"),
@@ -147,6 +163,7 @@ def run_headless(args: argparse.Namespace) -> None:
         )
         if not writer.isOpened():
             renderer.close()
+            wrist_renderer.close()
             env.close()
             raise RuntimeError(f"无法创建视频文件: {video_path}")
         global_writer = cv2.VideoWriter(
@@ -161,8 +178,27 @@ def run_headless(args: argparse.Namespace) -> None:
         if not global_writer.isOpened():
             writer.release()
             renderer.close()
+            wrist_renderer.close()
             env.close()
             raise RuntimeError(f"无法创建固定全局相机视频文件: {global_video_path}")
+        wrist_writer = cv2.VideoWriter(
+            str(wrist_video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            args.video_fps,
+            (
+                env.config.dynamicvla_camera_width,
+                env.config.dynamicvla_camera_height,
+            ),
+        )
+        if not wrist_writer.isOpened():
+            writer.release()
+            global_writer.release()
+            renderer.close()
+            wrist_renderer.close()
+            env.close()
+            raise RuntimeError(
+                f"cannot create wrist-camera video: {wrist_video_path}"
+            )
         previous_phase = policy.phase
         next_frame_time = 0.0
         recorded_states: list[np.ndarray] = []
@@ -170,7 +206,7 @@ def run_headless(args: argparse.Namespace) -> None:
         steps = 0
         termination_reason: str | None = None
         # 保存重置后的初始画面；之后按仿真时间而不是计算耗时采样。
-        write_frame(writer, global_writer, recorded_states)
+        write_frame(writer, global_writer, wrist_writer, recorded_states)
         next_frame_time += 1.0 / args.video_fps
         while not policy.finished and env.data.time < env.config.episode_seconds:
             # 标准交互循环：策略产生动作 -> 环境执行动作并推进物理。
@@ -184,7 +220,7 @@ def run_headless(args: argparse.Namespace) -> None:
                 )),
             )
             if env.data.time + 1e-9 >= next_frame_time:
-                write_frame(writer, global_writer, recorded_states)
+                write_frame(writer, global_writer, wrist_writer, recorded_states)
                 next_frame_time += 1.0 / args.video_fps
             if policy.phase is not previous_phase:
                 tracking_error = ((env.hand_position - policy.last_desired) ** 2).sum() ** 0.5
@@ -208,6 +244,7 @@ def run_headless(args: argparse.Namespace) -> None:
                 policy.finished = True
         writer.release()
         global_writer.release()
+        wrist_writer.release()
         task_result = "success" if env.ever_success else policy.result
         states_path = video_dir / f"trial_{env.trial_index:03d}_states.npz"
         np.savez_compressed(
@@ -225,6 +262,19 @@ def run_headless(args: argparse.Namespace) -> None:
             global_camera_pos=np.asarray(env.config.global_camera_pos),
             global_camera_quat=np.asarray(env.config.global_camera_quat),
             global_video_file=np.asarray(global_video_path.name),
+            wrist_camera_name=np.asarray(
+                env.config.dynamicvla_wrist_camera_name
+            ),
+            wrist_camera_width=np.int64(env.config.dynamicvla_camera_width),
+            wrist_camera_height=np.int64(env.config.dynamicvla_camera_height),
+            wrist_camera_fovy=np.float64(env.config.dynamicvla_camera_fovy),
+            wrist_camera_pos_in_hand=np.asarray(
+                env.config.dynamicvla_wrist_camera_pos
+            ),
+            wrist_camera_quat_in_hand=np.asarray(
+                env.config.dynamicvla_wrist_camera_quat
+            ),
+            wrist_video_file=np.asarray(wrist_video_path.name),
             model_file=np.asarray(model_path.name),
             source_xml=np.asarray(str(XML_PATH.resolve())),
             mujoco_version=np.asarray(mujoco.__version__),
@@ -260,6 +310,7 @@ def run_headless(args: argparse.Namespace) -> None:
             "truncated": termination_reason is not None,
             "video_path": str(video_path.resolve()),
             "global_video_path": str(global_video_path.resolve()),
+            "wrist_video_path": str(wrist_video_path.resolve()),
             "states_path": str(states_path.resolve()),
             "model_path": str(model_path.resolve()),
         })
@@ -268,9 +319,11 @@ def run_headless(args: argparse.Namespace) -> None:
         print(policy.summary(), flush=True)
         print(f"  video={video_path.resolve()}", flush=True)
         print(f"  global_video={global_video_path.resolve()}", flush=True)
+        print(f"  wrist_video={wrist_video_path.resolve()}", flush=True)
         print(f"  states={states_path.resolve()}", flush=True)
 
     renderer.close()
+    wrist_renderer.close()
     env.close()
     summary = _summary(rows)
     episodes_path = video_dir / "episodes.csv"
@@ -303,6 +356,14 @@ def run_headless(args: argparse.Namespace) -> None:
                 "pos_in_world": env.config.global_camera_pos,
                 "quat_in_world": env.config.global_camera_quat,
             },
+            "wrist_camera": {
+                "name": env.config.dynamicvla_wrist_camera_name,
+                "width": env.config.dynamicvla_camera_width,
+                "height": env.config.dynamicvla_camera_height,
+                "fovy": env.config.dynamicvla_camera_fovy,
+                "pos_in_hand": env.config.dynamicvla_wrist_camera_pos,
+                "quat_in_hand": env.config.dynamicvla_wrist_camera_quat,
+            },
         },
         "artifacts": {
             "model": {
@@ -312,6 +373,7 @@ def run_headless(args: argparse.Namespace) -> None:
             "episodes_csv": str(episodes_path.resolve()),
             "videos": [row["video_path"] for row in rows],
             "global_videos": [row["global_video_path"] for row in rows],
+            "wrist_videos": [row["wrist_video_path"] for row in rows],
             "states": [row["states_path"] for row in rows],
         },
         "source_xml": {

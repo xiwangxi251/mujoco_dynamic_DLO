@@ -40,10 +40,12 @@ or use `--workers 1` for the original serial behavior. A single scenario is
 still collected sequentially so its replacement-seed order stays deterministic.
 
 The run directory contains one subdirectory per scenario. Each successful
-episode has a fixed-global-camera MP4, an aligned NPZ containing full MuJoCo
-state, requested/applied actions, robot state, cable state, and teacher labels,
-plus a JSON metadata file. Failed attempts remain in `episodes.csv` for audit
-but their large video/state artifacts are discarded. Run-level and
+episode has synchronized DynamicVLA-style `*_opst.mp4` and `*_wrist.mp4`
+videos. Its aligned NPZ contains full MuJoCo state, requested/applied actions,
+robot state, cable state, teacher labels, frame indices, and both video file
+names; the RGB frames are not duplicated inside the NPZ. A JSON metadata file
+records both camera extrinsics. Failed attempts remain in `episodes.csv` for
+audit but their large video/state artifacts are discarded. Run-level and
 scenario-level manifests record configs, hashes, seeds, and collection
 completeness. Privileged cable fields are teacher/debug labels and must not be
 provided to the deployed student policy.
