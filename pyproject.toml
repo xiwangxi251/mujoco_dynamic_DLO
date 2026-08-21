@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panda-cable-grasp"
+version = "0.3.0"
+description = "MuJoCo dynamic deformable cable grasping with scripted, PPO, and DynamicVLA policies"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mujoco==3.11.0",
+  "numpy>=2.0,<3",
+  "opencv-python-headless>=4.12,<6",
+  "pyzmq>=26,<28",
+]
+
+[project.optional-dependencies]
+rl = [
+  "gymnasium>=1.0,<2",
+  "stable-baselines3>=2.7,<3",
+  "torch>=2.6",
+  "tqdm>=4.66",
+  "rich>=13.9",
+  "tensorboard>=2.18",
+  "matplotlib>=3.9",
+]
+dynamicvla = ["scipy>=1.13", "pyyaml>=6.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+panda-cable-grasp = "panda_cable_grasp.cli.run_grasp:main"
+panda-cable-benchmark = "panda_cable_grasp.evaluation.benchmark:main"
+panda-cable-motion-diagnostics = "panda_cable_grasp.evaluation.motion_diagnostics:main"
+panda-cable-rl-train = "panda_cable_grasp.rl.train:main"
+panda-cable-rl-eval = "panda_cable_grasp.rl.evaluate:main"
+panda-cable-dynamicvla = "panda_cable_grasp.cli.run_dynamicvla:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+

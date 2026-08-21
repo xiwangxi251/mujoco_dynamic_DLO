@@ -18,8 +18,12 @@ from project_paths import OUTPUT_ROOT_ENV_VAR, output_path
 
 class PortabilityTests(unittest.TestCase):
     def test_model_sources_are_owned_by_repository(self) -> None:
-        self.assertEqual(XML_PATH, ROOT / "panda_cable_grasp.xml")
-        self.assertEqual(PANDA_XML_PATH, ROOT / "models" / "panda.xml")
+        self.assertEqual(
+            XML_PATH, ROOT / "assets" / "mujoco" / "panda_cable_grasp.xml"
+        )
+        self.assertEqual(
+            PANDA_XML_PATH, ROOT / "assets" / "mujoco" / "panda.xml"
+        )
         self.assertTrue(XML_PATH.is_file())
         self.assertTrue(PANDA_XML_PATH.is_file())
 

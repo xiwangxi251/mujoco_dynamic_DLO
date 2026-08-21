@@ -9,7 +9,7 @@ from dynamic_grasp_policy import DynamicCableGraspPolicy, Phase
 from experiment_scenarios import get_scenario
 from motion_diagnostics import env_config_for_scenario
 
-from .formula_intercept_policy import (
+from panda_cable_grasp.expert.formula_intercept_policy import (
     FormulaInterceptConfig,
     FormulaInterceptExpert,
 )
