@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from runtime_config import configure_mujoco_runtime
+from _bootstrap import bootstrap
+
+bootstrap()
+
+from panda_cable_grasp.runtime import configure_mujoco_runtime
 
 configure_mujoco_runtime()
 

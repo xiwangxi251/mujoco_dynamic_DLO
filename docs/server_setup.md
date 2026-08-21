@@ -45,7 +45,7 @@ export MUJOCO_MENAGERIE_PATH=/absolute/path/to/mujoco_menagerie
 ```
 
 变量也可以直接指向 `franka_emika_panda` 子目录。不要再向 Menagerie 复制或修改本项目
-XML；定制指垫已经保存在 `models/panda.xml`。
+XML；定制指垫已经保存在 `assets/mujoco/panda.xml`。
 
 ## 3. 创建 Python 环境
 
@@ -53,7 +53,7 @@ XML；定制指垫已经保存在 `models/panda.xml`。
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip wheel setuptools
-python -m pip install -r requirements.txt
+python -m pip install -e ".[rl,dynamicvla]"
 ```
 
 如果需要 PPO 训练和评估：
@@ -95,13 +95,13 @@ mkdir -p "$PANDA_CABLE_OUTPUT_ROOT"
 完整检查会加载 elasticity 插件、编译模型、执行一个物理控制步并渲染固定相机：
 
 ```bash
-python scripts/check_install.py
+python -m tools.installation.check_install
 ```
 
 最后应输出 `installation_check=OK`。仅检查模型和物理、不检查 OpenGL：
 
 ```bash
-python scripts/check_install.py --no-render
+python -m tools.installation.check_install --no-render
 ```
 
 然后运行代码回归：
@@ -124,7 +124,7 @@ bash run_demo.sh --scenario id_combined_l1_nominal --headless --trials 3
 python run_grasp.py \
   --scenario id_shape_nominal_current \
   --headless --trials 20 --seed 20260804 \
-  --video-dir "$PANDA_CABLE_OUTPUT_ROOT/headless_videos"
+  --video-dir "$PANDA_CABLE_OUTPUT_ROOT/scripted"
 ```
 
 运行 `id_static` 和所有 ID nominal 场景：

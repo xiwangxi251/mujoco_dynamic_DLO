@@ -39,7 +39,7 @@ python -m pip install mujoco torchcodec
 
 ```bash
 python -m dynamicvla_finetune.convert_dataset \
-  benchmark_runs/privileged_expert_dataset/run_YYYYMMDD_HHMMSS_seed20260804 \
+  outputs/datasets/privileged_expert/run_YYYYMMDD_HHMMSS_seed20260804 \
   --output /data1/hxai/datasets/panda_cable_dynamicvla \
   --repo-id local/panda-cable-dynamicvla \
   --target-fps 25
@@ -49,7 +49,7 @@ python -m dynamicvla_finetune.convert_dataset \
 
 ```bash
 python -m dynamicvla_finetune.convert_dataset \
-  benchmark_runs/privileged_expert_dataset/run_YYYYMMDD_HHMMSS_seed20260804 \
+  outputs/datasets/privileged_expert/run_YYYYMMDD_HHMMSS_seed20260804 \
   --scenarios id_static \
   --output /data1/hxai/datasets/panda_cable_static_dynamicvla \
   --repo-id local/panda-cable-static-dynamicvla

@@ -11,16 +11,16 @@ import platform
 import sys
 import time
 
-from cable_grasp_env import (
+from ..env.environment import (
     CableGraspEnv,
     EnvConfig,
     PANDA_XML_PATH,
     XML_PATH,
     resolve_menagerie_panda_dir,
 )
-from dynamic_grasp_policy import DynamicCableGraspPolicy
-from experiment_scenarios import get_scenario, list_scenario_names
-from project_paths import output_path
+from ..policies.scripted import DynamicCableGraspPolicy
+from ..scenarios.registry import get_scenario, list_scenario_names
+from ..paths import output_path
 
 
 def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
@@ -389,14 +389,14 @@ def run_headless(args: argparse.Namespace) -> None:
             name: {"path": str(path.resolve()), "sha256": _sha256(path)}
             for name, path in {
                 "runner": Path(__file__),
-                "base_environment": Path(__file__).resolve().parent
-                / "cable_grasp_env.py",
-                "scripted_policy": Path(__file__).resolve().parent
-                / "dynamic_grasp_policy.py",
-                "scenario_registry": Path(__file__).resolve().parent
-                / "experiment_scenarios.py",
-                "benchmark_schema": Path(__file__).resolve().parent
-                / "benchmark.py",
+                "base_environment": Path(__file__).resolve().parents[1]
+                / "env" / "environment.py",
+                "scripted_policy": Path(__file__).resolve().parents[1]
+                / "policies" / "scripted.py",
+                "scenario_registry": Path(__file__).resolve().parents[1]
+                / "scenarios" / "registry.py",
+                "benchmark_schema": Path(__file__).resolve().parents[1]
+                / "evaluation" / "benchmark.py",
             }.items()
         },
         "configs": {
@@ -617,7 +617,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-seconds", type=float, default=15.0,
                         help="maximum simulated seconds per trial")
     parser.add_argument("--seed", type=int, default=20260804)
-    parser.add_argument("--video-dir", type=Path, default=output_path("headless_videos"),
+    parser.add_argument("--video-dir", type=Path, default=output_path("scripted"),
                         help="headless视频根目录；每次运行会建立独立子目录")
     parser.add_argument(
         "--run-name",
@@ -651,9 +651,13 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-if __name__ == "__main__":
+def main() -> None:
     arguments = parse_args()
     if arguments.headless:
         run_headless(arguments)
     else:
         run_viewer(arguments)
+
+
+if __name__ == "__main__":
+    main()

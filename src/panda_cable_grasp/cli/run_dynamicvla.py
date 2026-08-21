@@ -18,27 +18,27 @@ import time
 
 import numpy as np
 
-from benchmark import (
+from ..evaluation.benchmark import (
     _base_row,
     _git_text,
     _sha256,
     _summary,
     _write_csv,
 )
-from cable_grasp_env import (
+from ..env.environment import (
     CableGraspEnv,
     EnvConfig,
     PANDA_XML_PATH,
     XML_PATH,
     resolve_menagerie_panda_dir,
 )
-from dynamicvla_adapter import (
+from ..dynamicvla.adapter import (
     DynamicVLAAdapterConfig,
     DynamicVLATaskSpaceAdapter,
     make_dynamicvla_observation,
 )
-from experiment_scenarios import get_scenario, list_scenario_names
-from project_paths import output_path
+from ..scenarios.registry import get_scenario, list_scenario_names
+from ..paths import output_path
 
 
 def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
@@ -457,9 +457,12 @@ def run_server(args: argparse.Namespace) -> None:
                 name: {"path": str(path.resolve()), "sha256": _sha256(path)}
                 for name, path in {
                     "runner": Path(__file__),
-                    "adapter": Path(__file__).resolve().parent / "dynamicvla_adapter.py",
-                    "environment": Path(__file__).resolve().parent / "cable_grasp_env.py",
-                    "scenario_registry": Path(__file__).resolve().parent / "experiment_scenarios.py",
+                    "adapter": Path(__file__).resolve().parents[1]
+                    / "dynamicvla" / "adapter.py",
+                    "environment": Path(__file__).resolve().parents[1]
+                    / "env" / "environment.py",
+                    "scenario_registry": Path(__file__).resolve().parents[1]
+                    / "scenarios" / "registry.py",
                 }.items()
             },
             "configs": {
@@ -519,7 +522,7 @@ def parse_args() -> argparse.Namespace:
         help="seconds to wait for the model client; 0 waits indefinitely",
     )
     parser.add_argument("--ack-timeout", type=float, default=60.0)
-    parser.add_argument("--video-dir", type=Path, default=output_path("headless_videos"))
+    parser.add_argument("--video-dir", type=Path, default=output_path("dynamicvla", "evaluation"))
     parser.add_argument("--run-name")
     parser.add_argument(
         "--check-only", action="store_true",
@@ -535,9 +538,13 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-if __name__ == "__main__":
+def main() -> None:
     parsed_args = parse_args()
     if parsed_args.check_only:
         check_bridge(parsed_args)
     else:
         run_server(parsed_args)
+
+
+if __name__ == "__main__":
+    main()

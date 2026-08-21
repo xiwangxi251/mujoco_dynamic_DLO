@@ -23,18 +23,18 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.utils import set_random_seed
 
-from cable_grasp_env import PANDA_XML_PATH, XML_PATH, resolve_menagerie_panda_dir
-from failure_taxonomy import (
+from ..env.environment import PANDA_XML_PATH, XML_PATH, resolve_menagerie_panda_dir
+from ..evaluation.failure_taxonomy import (
     TASK_OUTCOME_TYPES,
     break_causal_class,
     classify_task_outcome,
     confirmed_break_times,
     scene_fingerprint,
 )
-from experiment_scenarios import list_scenario_names
-from project_paths import output_path
-from .rl_cable_env import RLCableGraspEnv
-from .train_rl import RL_L1_SCENARIOS
+from ..scenarios.registry import list_scenario_names
+from ..paths import output_path
+from .environment import RLCableGraspEnv
+from .train import RL_L1_SCENARIOS
 
 
 FAILURE_TYPES = (
@@ -1219,7 +1219,7 @@ def parse_args() -> argparse.Namespace:
             "its actions may be semantically incompatible"
         ),
     )
-    parser.add_argument("--video-dir", type=Path, default=output_path("rl_test_videos"),
+    parser.add_argument("--video-dir", type=Path, default=output_path("rl", "eval"),
                         help="headless结果根目录；每次测试建立独立子目录")
     parser.add_argument(
         "--no-video",
@@ -1248,7 +1248,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-if __name__ == "__main__":
+def main() -> None:
     arguments = parse_args()
     arguments.model = _resolve_model_file(arguments.model)
     interface_version = checkpoint_interface_version(arguments.model)
@@ -1266,3 +1266,7 @@ if __name__ == "__main__":
         run_headless(arguments, policy)
     else:
         run_viewer(arguments, policy)
+
+
+if __name__ == "__main__":
+    main()

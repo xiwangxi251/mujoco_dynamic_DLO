@@ -17,10 +17,10 @@ from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
-from experiment_scenarios import list_scenario_names
-from project_paths import output_path
-from .rl_cable_env import RLCableGraspEnv, RLConfig
-from .rl_training_metrics import TrainingMetricsCallback, plot_training_curves
+from ..scenarios.registry import list_scenario_names
+from ..paths import output_path
+from .environment import RLCableGraspEnv, RLConfig
+from .metrics import TrainingMetricsCallback, plot_training_curves
 
 
 RL_L1_SCENARIOS = (
@@ -494,7 +494,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path,
-        default=output_path("rl", "runs", "ppo_dlo_baseline_v3")
+        default=output_path("rl", "train", "ppo_dlo_baseline_v3")
     )
     parser.add_argument("--checkpoint-steps", type=int, default=100_000)
     parser.add_argument("--n-steps", type=int, default=1024,

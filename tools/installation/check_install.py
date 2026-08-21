@@ -8,17 +8,25 @@ from pathlib import Path
 import platform
 import sys
 
+from _bootstrap import bootstrap
+
+bootstrap()
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from runtime_config import configure_mujoco_runtime
+from panda_cable_grasp.runtime import configure_mujoco_runtime
 
 configure_mujoco_runtime()
 
 import mujoco
 
-from cable_grasp_env import CableGraspEnv, EnvConfig, resolve_menagerie_panda_dir
+from panda_cable_grasp.env.environment import (
+    CableGraspEnv,
+    EnvConfig,
+    resolve_menagerie_panda_dir,
+)
 
 
 def main() -> None:

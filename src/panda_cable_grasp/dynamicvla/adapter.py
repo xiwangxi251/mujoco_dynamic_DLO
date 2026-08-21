@@ -13,12 +13,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from cable_grasp_env import (
-    CableGraspEnv,
-    point_jacobian,
-    quat_error,
-    rotation_to_quat,
-)
+from ..env.environment import CableGraspEnv
+from ..env.kinematics import point_jacobian, quat_error, rotation_to_quat
 
 
 @dataclass(frozen=True)

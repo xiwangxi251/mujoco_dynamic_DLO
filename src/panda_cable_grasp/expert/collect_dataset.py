@@ -18,11 +18,12 @@ import cv2
 import mujoco
 import numpy as np
 
-from benchmark import _base_row, _git_text, _summary, _write_csv
-from cable_grasp_env import CableGraspEnv, rotation_to_quat
-from experiment_scenarios import get_scenario, list_scenario_names
-from motion_diagnostics import env_config_for_scenario
-from project_paths import output_path
+from ..evaluation.benchmark import base_row, git_text, summarize, write_csv
+from ..env.environment import CableGraspEnv
+from ..env.kinematics import rotation_to_quat
+from ..scenarios.registry import get_scenario, list_scenario_names
+from ..evaluation.motion_diagnostics import env_config_for_scenario
+from ..paths import output_path
 
 from .formula_intercept_policy import FormulaInterceptExpert
 from .run_experiment import DEFAULT_SCENARIOS
@@ -237,7 +238,7 @@ def _collect_attempt(
     info["base_success"] = env.ever_success
     info["success"] = policy.result == "success"
     scenario = get_scenario(env.config.scenario_name)
-    row = _base_row(
+    row = base_row(
         POLICY_NAME, attempt, seed, scenario, initial_info, info,
         env.grasp_break_history,
     )
@@ -375,7 +376,7 @@ def _collect_scenario(
         env.close()
 
     episodes_path = scenario_dir / "episodes.csv"
-    _write_csv(episodes_path, rows)
+    write_csv(episodes_path, rows)
     scenario_manifest = {
         "schema_version": SCHEMA_VERSION,
         "scenario": scenario.asdict(),
@@ -417,7 +418,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--instruction", default="Grasp and lift the cable.")
     parser.add_argument(
         "--output", type=Path,
-        default=output_path("benchmark_runs", "privileged_expert_dataset"),
+        default=output_path("datasets", "privileged_expert"),
     )
     parser.add_argument("--run-name")
     args = parser.parse_args()
@@ -488,8 +489,8 @@ def main() -> None:
     all_rows, scenario_manifests = _collect_all_scenarios(args, run_dir)
 
     episodes_path = run_dir / "episodes.csv"
-    _write_csv(episodes_path, all_rows)
-    git_status = _git_text("status", "--porcelain=v1")
+    write_csv(episodes_path, all_rows)
+    git_status = git_text("status", "--porcelain=v1")
     source_dir = Path(__file__).resolve().parent
     manifest = {
         "schema_version": SCHEMA_VERSION,
@@ -516,18 +517,18 @@ def main() -> None:
         "action_label": "environment_limited_joint_position_command",
         "scenario_manifests": scenario_manifests,
         "episodes_csv": str(episodes_path.resolve()),
-        "summary_all_attempts": _summary(all_rows),
+        "summary_all_attempts": summarize(all_rows),
         "source_files": {
             path.name: {"path": str(path), "sha256": _sha256(path)}
             for path in (
                 source_dir / "collect_dataset.py",
                 source_dir / "formula_intercept_policy.py",
                 source_dir / "shadow_rollout.py",
-                source_dir.parent / "cable_grasp_env.py",
-                source_dir.parent / "dynamic_grasp_policy.py",
+                source_dir.parent / "env" / "environment.py",
+                source_dir.parent / "policies" / "scripted.py",
             )
         },
-        "git_commit": _git_text("rev-parse", "HEAD"),
+        "git_commit": git_text("rev-parse", "HEAD"),
         "git_dirty": bool(git_status),
         "python": platform.python_version(),
         "mujoco": mujoco.__version__,

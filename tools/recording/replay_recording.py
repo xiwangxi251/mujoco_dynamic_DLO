@@ -7,7 +7,11 @@ from datetime import datetime
 from pathlib import Path
 import time
 
-from runtime_config import configure_mujoco_runtime
+from _bootstrap import bootstrap
+
+bootstrap()
+
+from panda_cable_grasp.runtime import configure_mujoco_runtime
 
 configure_mujoco_runtime()
 

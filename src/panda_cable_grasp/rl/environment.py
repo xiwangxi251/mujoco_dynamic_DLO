@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Sequence
 
-from runtime_config import configure_mujoco_runtime
+from ..runtime import configure_mujoco_runtime
 
 configure_mujoco_runtime()
 
@@ -17,8 +17,9 @@ import gymnasium as gym
 import mujoco
 import numpy as np
 
-from cable_grasp_env import CableGraspEnv, EnvConfig, quat_error, rotation_to_quat
-from experiment_scenarios import ScenarioConfig, get_scenario
+from ..env.environment import CableGraspEnv, EnvConfig
+from ..env.kinematics import quat_error, rotation_to_quat
+from ..scenarios.registry import ScenarioConfig, get_scenario
 
 
 @dataclass

@@ -1,12 +1,10 @@
 __pycache__/
 *.py[cod]
 .venv/
+*.egg-info/
+build/
+dist/
 /mujoco_menagerie/
 /third_party/mujoco_menagerie/
 MUJOCO_LOG.TXT
-rl/runs/
-headless_videos/
-rl_test_videos*/
-benchmark_runs/
-/artifacts/motion_diagnostics/
-dynamicvla_model_outputs/
+/outputs/

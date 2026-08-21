@@ -13,8 +13,9 @@ import math
 
 import numpy as np
 
-from cable_grasp_env import RIGID_MOTION_PROFILES, rotation_to_quat
-from dynamic_grasp_policy import DynamicCableGraspPolicy, Phase, PolicyConfig
+from ..env.environment import RIGID_MOTION_PROFILES
+from ..env.kinematics import rotation_to_quat
+from ..policies.scripted import DynamicCableGraspPolicy, Phase, PolicyConfig
 
 from .shadow_rollout import ShadowCableRollout, ShadowTrajectory
 

@@ -17,37 +17,37 @@ import subprocess
 import sys
 from typing import Any
 
-from runtime_config import configure_mujoco_runtime
+from ..runtime import configure_mujoco_runtime
 
 configure_mujoco_runtime()
 
 import mujoco
 import numpy as np
 
-from cable_grasp_env import (
+from ..env.environment import (
     CableGraspEnv,
     EnvConfig,
     PANDA_XML_PATH,
     XML_PATH,
     resolve_menagerie_panda_dir,
 )
-from dynamic_grasp_policy import DynamicCableGraspPolicy, PolicyConfig
-from experiment_scenarios import (
+from ..policies.scripted import DynamicCableGraspPolicy, PolicyConfig
+from ..scenarios.registry import (
     SCENARIO_SUITE_NAMES,
     ScenarioConfig,
     get_scenario,
     list_scenario_names,
     list_suite_scenarios,
 )
-from failure_taxonomy import (
+from .failure_taxonomy import (
     TASK_OUTCOME_TYPES,
     base_scene_fingerprint,
     classify_task_outcome,
     confirmed_break_times,
     scene_fingerprint,
 )
-from motion_diagnostics import env_config_for_scenario
-from project_paths import output_path
+from .motion_diagnostics import env_config_for_scenario
+from ..paths import output_path
 
 
 ROOT = Path(__file__).resolve().parent
@@ -390,7 +390,7 @@ def _run_ppo(
     device: str,
 ) -> list[dict[str, Any]]:
     from stable_baselines3 import PPO
-    from rl.rl_cable_env import RLCableGraspEnv
+    from ..rl.environment import RLCableGraspEnv
 
     config = _scenario_config(
         scenario, seed=seeds[0], disturbance=disturbance, seconds=episode_seconds,
@@ -564,7 +564,7 @@ def parse_args() -> argparse.Namespace:
         help="parallel isolated environments (scripted method only)",
     )
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--output", type=Path, default=output_path("benchmark_runs"))
+    parser.add_argument("--output", type=Path, default=output_path("benchmarks"))
     args = parser.parse_args()
     args.methods = list(dict.fromkeys(args.methods))
     if args.episodes < 1 or args.episode_seconds <= 0.0 or args.workers < 1:
@@ -711,12 +711,12 @@ def main() -> None:
             name: {"path": str(path.resolve()), "sha256": _sha256(path)}
             for name, path in {
                 "benchmark": Path(__file__),
-                "base_environment": ROOT / "cable_grasp_env.py",
-                "scenario_registry": ROOT / "experiment_scenarios.py",
+            "base_environment": ROOT / "src" / "panda_cable_grasp" / "env" / "environment.py",
+            "scenario_registry": ROOT / "src" / "panda_cable_grasp" / "scenarios" / "registry.py",
                 "motion_diagnostics": ROOT / "motion_diagnostics.py",
-                "scripted_policy": ROOT / "dynamic_grasp_policy.py",
+            "scripted_policy": ROOT / "src" / "panda_cable_grasp" / "policies" / "scripted.py",
                 "failure_taxonomy": ROOT / "failure_taxonomy.py",
-                "rl_environment": ROOT / "rl" / "rl_cable_env.py",
+            "rl_environment": ROOT / "src" / "panda_cable_grasp" / "rl" / "environment.py",
             }.items()
         },
         "configs": {"scripted_policy": asdict(PolicyConfig())},
@@ -737,13 +737,21 @@ def main() -> None:
         "summary": summary,
     }
     if "ppo" in args.methods:
-        from rl.rl_cable_env import RLConfig
+        from ..rl.environment import RLConfig
         manifest["configs"]["rl"] = asdict(RLConfig())
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     print(f"benchmark_output={output_dir.resolve()}", flush=True)
+
+
+# Public experiment helpers shared by benchmark and expert collectors.  The
+# underscored names remain internal aliases for compatibility with old runs.
+git_text = _git_text
+base_row = _base_row
+write_csv = _write_csv
+summarize = _summary
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@ import math
 import os
 from pathlib import Path
 
-from runtime_config import configure_mujoco_runtime
+from ..paths import PROJECT_ROOT
+from ..runtime import configure_mujoco_runtime
 
 configure_mujoco_runtime()
 
@@ -18,9 +19,9 @@ import mujoco
 import numpy as np
 
 
-ROOT = Path(__file__).resolve().parent
-XML_PATH = ROOT / "panda_cable_grasp.xml"
-PANDA_XML_PATH = ROOT / "models" / "panda.xml"
+ROOT = PROJECT_ROOT
+XML_PATH = ROOT / "assets" / "mujoco" / "panda_cable_grasp.xml"
+PANDA_XML_PATH = ROOT / "assets" / "mujoco" / "panda.xml"
 MENAGERIE_ENV_VAR = "MUJOCO_MENAGERIE_PATH"
 
 

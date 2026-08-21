@@ -19,14 +19,21 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from _bootstrap import bootstrap
+
+bootstrap()
+
 import numpy as np
 
-from cable_grasp_env import CableGraspEnv
-from dynamic_grasp_policy import DynamicCableGraspPolicy
-from experiment_scenarios import get_scenario, list_scenario_names
-from failure_taxonomy import classify_task_outcome, scene_fingerprint
-from motion_diagnostics import env_config_for_scenario
-from project_paths import output_path
+from panda_cable_grasp.env.environment import CableGraspEnv
+from panda_cable_grasp.policies.scripted import DynamicCableGraspPolicy
+from panda_cable_grasp.scenarios.registry import get_scenario, list_scenario_names
+from panda_cable_grasp.evaluation.failure_taxonomy import (
+    classify_task_outcome,
+    scene_fingerprint,
+)
+from panda_cable_grasp.evaluation.motion_diagnostics import env_config_for_scenario
+from panda_cable_grasp.paths import output_path
 
 
 ROOT = Path(__file__).resolve().parent
@@ -264,7 +271,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--sample-every", type=int, default=5)
     parser.add_argument(
-        "--output", type=Path, default=output_path("gripper_ctrl_ablation")
+        "--output", type=Path, default=output_path("ablations", "gripper_control")
     )
     args = parser.parse_args()
     if args.seeds < 1 or args.workers < 1 or args.sample_every < 1:

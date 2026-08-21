@@ -13,11 +13,11 @@ from typing import Any
 
 import numpy as np
 
-from benchmark import _base_row, _summary
-from cable_grasp_env import CableGraspEnv
-from experiment_scenarios import get_scenario, list_scenario_names
-from motion_diagnostics import env_config_for_scenario
-from project_paths import output_path
+from ..evaluation.benchmark import base_row, summarize
+from ..env.environment import CableGraspEnv
+from ..scenarios.registry import get_scenario, list_scenario_names
+from ..evaluation.motion_diagnostics import env_config_for_scenario
+from ..paths import output_path
 
 from .formula_intercept_policy import FormulaInterceptExpert
 
@@ -78,7 +78,7 @@ def run_episode(
         info["ever_pinched"] = env.last_grasped_body_id is not None
         info["base_success"] = env.ever_success
         info["success"] = policy.result == "success"
-        row = _base_row(
+        row = base_row(
             "privileged_formula_expert", episode, seed, scenario,
             initial_info, info, env.grasp_break_history,
         )
@@ -111,7 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument(
         "--output", type=Path,
-        default=output_path("benchmark_runs", "privileged_formula_expert"),
+        default=output_path("benchmarks", "privileged_formula_expert"),
     )
     args = parser.parse_args()
     if args.episodes <= 0 or args.workers <= 0 or args.episode_seconds <= 0.0:
@@ -159,7 +159,7 @@ def main() -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    summary = _summary(rows)
+    summary = summarize(rows)
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )

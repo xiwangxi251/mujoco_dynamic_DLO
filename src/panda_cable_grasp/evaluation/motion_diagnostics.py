@@ -17,31 +17,31 @@ import math
 from pathlib import Path
 from typing import Any
 
-from runtime_config import configure_mujoco_runtime
+from ..runtime import configure_mujoco_runtime
 
 configure_mujoco_runtime()
 
 import numpy as np
 import mujoco
 
-from cable_grasp_env import (
+from ..env.environment import (
     CableGraspEnv,
     EnvConfig,
     PANDA_XML_PATH,
     XML_PATH,
     resolve_menagerie_panda_dir,
 )
-from experiment_scenarios import (
+from ..scenarios.registry import (
     SCENARIO_SUITE_NAMES,
     ScenarioConfig,
     get_scenario,
     list_suite_scenarios,
 )
-from project_paths import output_path
+from ..paths import output_path
 
 
 ROOT = Path(__file__).resolve().parent
-DIAGNOSTIC_OUTPUT_ROOT = output_path("artifacts", "motion_diagnostics")
+DIAGNOSTIC_OUTPUT_ROOT = output_path("diagnostics", "motion")
 
 
 def _sha256(path: Path) -> str:
@@ -374,8 +374,8 @@ def main() -> None:
             }
             for name, path in {
                 "motion_diagnostics": Path(__file__),
-                "base_environment": ROOT / "cable_grasp_env.py",
-                "scenario_registry": ROOT / "experiment_scenarios.py",
+                "base_environment": ROOT / "src" / "panda_cable_grasp" / "env" / "environment.py",
+                "scenario_registry": ROOT / "src" / "panda_cable_grasp" / "scenarios" / "registry.py",
             }.items()
         },
         "mujoco": mujoco.__version__,

@@ -9,7 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-import yaml
+from ...paths import PROJECT_ROOT
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +31,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    try:
+        import yaml
+    except ImportError as error:
+        raise RuntimeError(
+            "Fine-tuning setup requires PyYAML; install the dynamicvla extra "
+            "with `pip install -e '.[dynamicvla]'`."
+        ) from error
     root = args.dynamicvla_root.expanduser().resolve()
     dataset = args.dataset.expanduser().resolve()
     checkpoint = (
@@ -38,7 +45,7 @@ def main() -> None:
         if args.checkpoint
         else root / "ckt" / "dynamic-vla-DOM"
     )
-    template = Path(__file__).with_name("cable_finetune.yaml")
+    template = PROJECT_ROOT / "configs" / "dynamicvla" / "cable_finetune.yaml"
     for required in (root / "run.py", dataset / "meta" / "info.json", checkpoint / "config.json", template):
         if not required.exists():
             raise FileNotFoundError(required)

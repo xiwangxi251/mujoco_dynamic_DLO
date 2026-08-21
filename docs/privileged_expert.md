@@ -19,7 +19,7 @@ Run a small four-scenario experiment from the repository root:
 python -m privileged_expert.run_experiment --episodes 3 --workers 4
 ```
 
-Outputs are written under `benchmark_runs/privileged_formula_expert/`, which is
+Outputs are written under `outputs/benchmarks/privileged_formula_expert/`, which is
 already ignored by Git. This first runner records metrics only; use the
 collector below when image/action training artifacts are required.
 
