@@ -32,32 +32,36 @@ class RLConfig:
     yaw_delta_scale: float = 0.020
     ik_damping: float = 0.05
     graspable_end_fraction: float = 0.25
-    alignment_gate_distance: float = 0.10
-    gripper_close_threshold: float = -0.35
-    gripper_open_threshold: float = 0.35
     gripper_closed_ctrl: float = 0.0
+    alignment_distance_scale: float = 0.08
+    aligned_pinch_threshold: float = 0.90
     secured_lift_delta: float = 0.03
     secured_confirm_seconds: float = 0.10
     secured_contact_loss_grace_seconds: float = 0.06
     lift_credit_cap: float = 0.12
     cable_lift_credit_cap: float = 0.30
     reward_reach_progress: float = 6.0
-    reward_alignment_progress: float = 0.5
+    pinch_minimum_lift: float = 0.005
+    pinch_stall_grace_seconds: float = 0.40
+    pinch_stall_step_penalty: float = -0.005
+    pinch_stall_penalty_cap: float = 0.50
+    failed_unloaded_pinch_penalty: float = -0.50
+    unloaded_pinch_episode_penalty_cap: float = 1.00
+    reward_alignment_progress: float = 2.0
     reward_new_contact: float = 0.15
-    reward_new_pinch: float = 0.75
-    reward_new_secured_grasp: float = 3.0
-    reward_lift_progress: float = 20.0
+    reward_new_pinch: float = 0.25
+    reward_new_aligned_pinch: float = 1.0
+    reward_new_secured_grasp: float = 4.0
+    reward_lift_progress: float = 40.0
     reward_cable_lift_progress: float = 3.0
-    reward_strict_hold_progress: float = 0.8
+    reward_strict_hold_progress: float = 2.0
     reward_success: float = 25.0
     reward_slip: float = -3.0
     reward_active_open_after_secured: float = -8.0
     reward_gripper_switch: float = -0.02
-    reward_time_step: float = -0.002
+    reward_time_step: float = -0.0005
     reward_action_magnitude: float = -0.0005
     reward_action_rate: float = -0.01
-    reward_post_grasp_arm_action_magnitude: float = -0.02
-    reward_post_grasp_arm_action_rate: float = -0.05
 
     def __post_init__(self) -> None:
         if self.cable_sample_count != 14:
@@ -65,7 +69,9 @@ class RLConfig:
         for name in (
             "cable_position_scale", "cable_velocity_scale",
             "translation_delta_scale", "yaw_delta_scale", "ik_damping",
-            "alignment_gate_distance", "secured_lift_delta",
+            "alignment_distance_scale",
+            "secured_lift_delta", "pinch_minimum_lift",
+            "pinch_stall_grace_seconds",
             "secured_confirm_seconds", "secured_contact_loss_grace_seconds",
         ):
             value = float(getattr(self, name))
@@ -73,8 +79,18 @@ class RLConfig:
                 raise ValueError(f"{name} must be finite and positive")
         if not 0.0 <= self.graspable_end_fraction < 0.5:
             raise ValueError("graspable_end_fraction must be in [0, 0.5)")
-        if not self.gripper_close_threshold < self.gripper_open_threshold:
-            raise ValueError("gripper hysteresis thresholds must be increasing")
+        if not 0.0 <= self.aligned_pinch_threshold <= 1.0:
+            raise ValueError("aligned_pinch_threshold must be in [0, 1]")
+        if self.pinch_stall_step_penalty > 0.0:
+            raise ValueError("pinch_stall_step_penalty must be non-positive")
+        if self.failed_unloaded_pinch_penalty > 0.0:
+            raise ValueError("failed_unloaded_pinch_penalty must be non-positive")
+        for name in (
+            "pinch_stall_penalty_cap",
+            "unloaded_pinch_episode_penalty_cap",
+        ):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
 
 
 class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
@@ -100,8 +116,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         "gripper_aperture",
     )
     ACTION_NAMES = (
-        "delta_tcp_x", "delta_tcp_y", "delta_tcp_z",
-        "delta_tcp_yaw", "gripper",
+        "delta_base_x", "delta_base_y", "delta_base_z",
+        "delta_world_yaw", "gripper_target",
     )
 
     def __init__(
@@ -189,16 +205,21 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._locked_body_id: int | None = None
         self._gripper_closed = False
         self._previous_action = np.zeros(5)
-        self._previous_alignment_score: float | None = None
+        self._previous_alignment_potential: float | None = None
         self._nearest_graspable_distance = 0.0
         self._nearest_graspable_segment_index = -1
         self._alignment_score = 0.0
+        self._alignment_potential = 0.0
         self._desired_hand_rotation = np.eye(3)
         self._last_ik_velocity_scale = 1.0
         self._gripper_switch_event = False
         self._gripper_switch_count = 0
         self._max_contacting_fingers = 0
         self._pinch_rewarded = False
+        self._aligned_pinch_rewarded = False
+        self._aligned_pinch_event = False
+        self._ever_aligned_pinch = False
+        self._alignment_score_at_first_pinch: float | None = None
         self._secured_rewarded = False
         self._lift_credit_high_water = 0.0
         self._cable_lift_credit_high_water = 0.0
@@ -215,9 +236,20 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._contact_loss_penalty_applied = False
         self._active_open_penalty_applied = False
         self._strict_hold_credit_high_water = 0.0
-        self._previous_secured_grasp = False
-        self._post_grasp_arm_action_magnitude = 0.0
-        self._post_grasp_arm_action_rate = 0.0
+        self._previous_pinch_confirmed = False
+        self._pinch_session_elapsed = 0.0
+        self._pinch_session_lift_high_water = 0.0
+        self._pinch_session_lift_peak_global = 0.0
+        self._pinch_session_stall_penalty = 0.0
+        self._unloaded_pinch_penalty_total = 0.0
+        self._failed_unloaded_pinch_count = 0
+        self._failed_unloaded_pinch_event = False
+        self._lift_attempt = False
+        self._loaded_lift = False
+        self._pinch_session_start_hand_z: float | None = None
+        self._post_pinch_world_z_action_sum = 0.0
+        self._post_pinch_world_z_action_count = 0
+        self._last_commanded_world_translation = np.zeros(3)
 
         joint_range = self.base_env.model.jnt_range[self.base_env.arm_joint_ids]
         self._arm_center = joint_range.mean(axis=1)
@@ -409,8 +441,40 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             [0.0, 0.0, 1.0],
         ])
 
+    @staticmethod
+    def _planar_perpendicular_alignment(
+        hand_rotation: np.ndarray, tangent: np.ndarray,
+    ) -> float:
+        """Return 1 when the finger closing axis is perpendicular to the DLO.
+
+        Panda fingers close along hand-local y.  Grasp alignment is therefore a
+        table-plane relationship between that axis and the local cable tangent;
+        using a 3-D dot product lets tool tilt contaminate the yaw objective.
+        """
+        closing_axis = np.asarray(hand_rotation, dtype=float)[:2, 1]
+        cable_axis = np.asarray(tangent, dtype=float)[:2]
+        closing_norm = float(np.linalg.norm(closing_axis))
+        cable_norm = float(np.linalg.norm(cable_axis))
+        if closing_norm <= 1e-9 or cable_norm <= 1e-9:
+            return 0.0
+        closing_axis = closing_axis / closing_norm
+        cable_axis = cable_axis / cable_norm
+        return float(abs(
+            closing_axis[0] * cable_axis[1]
+            - closing_axis[1] * cable_axis[0]
+        ))
+
+    def _alignment_terms(
+        self, distance: float, tangent: np.ndarray,
+    ) -> tuple[float, float]:
+        hand_rotation = self.data.xmat[self.base_env.hand_id].reshape(3, 3)
+        score = self._planar_perpendicular_alignment(hand_rotation, tangent)
+        distance_scale = self.rl_config.alignment_distance_scale
+        proximity = float(np.exp(-np.square(distance / distance_scale)))
+        return score, proximity * score
+
     def _convert_action(self, action: np.ndarray) -> np.ndarray:
-        """Map a 5-D TCP-local delta action to a velocity-safe joint target."""
+        """Map a 5-D base-frame delta action to a velocity-safe joint target."""
         normalized = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
         if normalized.shape != (5,):
             raise ValueError(f"Expected RL action shape (5,), got {normalized.shape}")
@@ -419,18 +483,19 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self.model.opt.timestep * max(1, self.base_env.config.frame_skip)
         )
         hand_rotation = self.data.xmat[self.base_env.hand_id].reshape(3, 3)
-        local_direction = normalized[:3]
-        direction_norm = float(np.linalg.norm(local_direction))
+        base_direction = normalized[:3]
+        direction_norm = float(np.linalg.norm(base_direction))
         if direction_norm > 1.0:
-            local_direction = local_direction / direction_norm
-        local_translation = (
-            self.rl_config.translation_delta_scale * local_direction
+            base_direction = base_direction / direction_norm
+        world_translation = (
+            self.rl_config.translation_delta_scale * base_direction
         )
-        linear_velocity = hand_rotation @ local_translation / control_dt
+        self._last_commanded_world_translation = world_translation.copy()
+        linear_velocity = world_translation / control_dt
 
         yaw_delta = self.rl_config.yaw_delta_scale * float(normalized[3])
         self._desired_hand_rotation = (
-            self._desired_hand_rotation @ self._rotation_about_z(yaw_delta)
+            self._rotation_about_z(yaw_delta) @ self._desired_hand_rotation
         )
         current_quat = rotation_to_quat(hand_rotation)
         desired_quat = rotation_to_quat(self._desired_hand_rotation)
@@ -469,24 +534,20 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             target_qpos, joint_range[:, 0], joint_range[:, 1]
         )
 
+        open_fraction = 0.5 * (float(normalized[4]) + 1.0)
         previous_gripper_closed = self._gripper_closed
-        if normalized[4] <= self.rl_config.gripper_close_threshold:
-            self._gripper_closed = True
-        elif normalized[4] >= self.rl_config.gripper_open_threshold:
-            self._gripper_closed = False
+        self._gripper_closed = bool(open_fraction <= 0.25)
         self._gripper_switch_event = bool(
             self._gripper_closed != previous_gripper_closed
         )
         self._gripper_switch_count += int(self._gripper_switch_event)
         gripper_range = self.model.actuator_ctrlrange[7]
-        mujoco_action[7] = (
-            np.clip(
-                self.rl_config.gripper_closed_ctrl,
-                gripper_range[0],
-                gripper_range[1],
-            )
-            if self._gripper_closed
-            else gripper_range[1]
+        closed_ctrl = float(np.clip(
+            self.rl_config.gripper_closed_ctrl,
+            gripper_range[0], gripper_range[1],
+        ))
+        mujoco_action[7] = closed_ctrl + open_fraction * (
+            float(gripper_range[1]) - closed_ctrl
         )
         return mujoco_action
 
@@ -664,6 +725,102 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._open_during_contact_loss_event,
         )
 
+    def _update_pinch_session(
+        self,
+        action: np.ndarray,
+        grasp_status: dict[str, float | bool],
+    ) -> tuple[float, float]:
+        """Penalize an unloaded pinch without making avoiding pinch optimal."""
+        pinch_now = bool(grasp_status["pinch_confirmed"])
+        lift_delta = max(0.0, float(grasp_status["grasp_lift_delta"]))
+        action_seconds = float(
+            self.model.opt.timestep * max(1, self.base_env.config.frame_skip)
+        )
+        self._failed_unloaded_pinch_event = False
+        stall_reward = 0.0
+        failed_reward = 0.0
+
+        if pinch_now:
+            if not self._previous_pinch_confirmed:
+                self._pinch_session_elapsed = 0.0
+                self._pinch_session_lift_high_water = 0.0
+                self._pinch_session_stall_penalty = 0.0
+                self._pinch_session_start_hand_z = float(
+                    self._grasp_center_position()[2]
+                )
+            self._pinch_session_elapsed += action_seconds
+            self._pinch_session_lift_high_water = max(
+                self._pinch_session_lift_high_water, lift_delta
+            )
+            self._pinch_session_lift_peak_global = max(
+                self._pinch_session_lift_peak_global,
+                self._pinch_session_lift_high_water,
+            )
+            self._loaded_lift = bool(
+                self._loaded_lift
+                or self._pinch_session_lift_high_water
+                >= self.rl_config.pinch_minimum_lift
+            )
+            self._post_pinch_world_z_action_sum += float(action[2])
+            self._post_pinch_world_z_action_count += 1
+            if self._pinch_session_start_hand_z is not None:
+                self._lift_attempt = bool(
+                    self._lift_attempt
+                    or float(self._grasp_center_position()[2])
+                    - self._pinch_session_start_hand_z >= 0.01
+                )
+
+            stalled = bool(
+                self._pinch_session_elapsed
+                > self.rl_config.pinch_stall_grace_seconds + 1e-9
+                and self._pinch_session_lift_high_water
+                < self.rl_config.pinch_minimum_lift
+            )
+            if stalled:
+                session_remaining = max(
+                    0.0,
+                    self.rl_config.pinch_stall_penalty_cap
+                    - self._pinch_session_stall_penalty,
+                )
+                episode_remaining = max(
+                    0.0,
+                    self.rl_config.unloaded_pinch_episode_penalty_cap
+                    - self._unloaded_pinch_penalty_total,
+                )
+                magnitude = min(
+                    abs(self.rl_config.pinch_stall_step_penalty),
+                    session_remaining,
+                    episode_remaining,
+                )
+                self._pinch_session_stall_penalty += magnitude
+                self._unloaded_pinch_penalty_total += magnitude
+                stall_reward = -magnitude
+        elif self._previous_pinch_confirmed:
+            if (
+                self._pinch_session_lift_high_water
+                < self.rl_config.pinch_minimum_lift
+            ):
+                self._failed_unloaded_pinch_event = True
+                self._failed_unloaded_pinch_count += 1
+                episode_remaining = max(
+                    0.0,
+                    self.rl_config.unloaded_pinch_episode_penalty_cap
+                    - self._unloaded_pinch_penalty_total,
+                )
+                magnitude = min(
+                    abs(self.rl_config.failed_unloaded_pinch_penalty),
+                    episode_remaining,
+                )
+                self._unloaded_pinch_penalty_total += magnitude
+                failed_reward = -magnitude
+            self._pinch_session_elapsed = 0.0
+            self._pinch_session_lift_high_water = 0.0
+            self._pinch_session_stall_penalty = 0.0
+            self._pinch_session_start_hand_z = None
+
+        self._previous_pinch_confirmed = pinch_now
+        return stall_reward, failed_reward
+
     def _reward(
         self,
         action: np.ndarray,
@@ -675,23 +832,27 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         _, distance, tangent, segment_index, _ = self._nearest_graspable_segment(
             self._grasp_center_position()
         )
-        progress = self._previous_distance - distance
+        pinch_confirmed = bool(grasp_status["pinch_confirmed"])
+        pregrasp = not pinch_confirmed
+        progress = self._previous_distance - distance if pregrasp else 0.0
         self._previous_distance = distance
 
-        hand_rotation = self.data.xmat[self.base_env.hand_id].reshape(3, 3)
-        alignment_score = float(abs(np.dot(hand_rotation[:, 0], tangent)))
-        alignment_gate = bool(
-            distance < self.rl_config.alignment_gate_distance
-            and not bool(grasp_status["secured_grasp"])
+        alignment_score, alignment_potential = self._alignment_terms(
+            distance, tangent
         )
-        if alignment_gate and self._previous_alignment_score is not None:
-            alignment_progress = alignment_score - self._previous_alignment_score
+        if pregrasp and self._previous_alignment_potential is not None:
+            alignment_progress = (
+                alignment_potential - self._previous_alignment_potential
+            )
         else:
             alignment_progress = 0.0
-        self._previous_alignment_score = alignment_score if alignment_gate else None
+        self._previous_alignment_potential = (
+            alignment_potential if pregrasp else None
+        )
         self._nearest_graspable_distance = distance
         self._nearest_graspable_segment_index = segment_index
         self._alignment_score = alignment_score
+        self._alignment_potential = alignment_potential
 
         pairs = self.base_env._finger_contact_pairs()
         contacting_fingers = len({finger for _, finger in pairs})
@@ -700,9 +861,24 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._max_contacting_fingers, contacting_fingers
         )
 
-        pinch_confirmed = bool(grasp_status["pinch_confirmed"])
         secured_grasp = bool(grasp_status["secured_grasp"])
         new_pinch = pinch_confirmed and not self._pinch_rewarded
+        pinch_transition = bool(
+            pinch_confirmed and not self._previous_pinch_confirmed
+        )
+        self._aligned_pinch_event = bool(
+            pinch_transition
+            and not self._aligned_pinch_rewarded
+            and alignment_score >= self.rl_config.aligned_pinch_threshold
+        )
+        if new_pinch and self._alignment_score_at_first_pinch is None:
+            self._alignment_score_at_first_pinch = alignment_score
+        self._ever_aligned_pinch = bool(
+            self._ever_aligned_pinch or self._aligned_pinch_event
+        )
+        self._aligned_pinch_rewarded = bool(
+            self._aligned_pinch_rewarded or self._aligned_pinch_event
+        )
         new_secured = secured_grasp and not self._secured_rewarded
         self._pinch_rewarded = self._pinch_rewarded or pinch_confirmed
         self._secured_rewarded = self._secured_rewarded or secured_grasp
@@ -741,6 +917,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         active_open, physical_slip, _ = (
             self._classify_secured_grasp_break()
         )
+        stall_reward, failed_unloaded_reward = self._update_pinch_session(
+            action, grasp_status
+        )
         # 多次重抓/断开仍完整计入诊断。外力滑脱与歧义张爪共用一次较轻惩罚；
         # 明确主动张爪另有一次较重惩罚，避免先制造低成本滑脱后免费张爪。
         penalize_active_open = bool(
@@ -770,19 +949,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
 
         action_rate = float(np.mean(np.square(action - self._previous_action)))
-        arm_action_magnitude = float(np.mean(np.square(action[:4])))
-        arm_action_rate = float(np.mean(np.square(
-            action[:4] - self._previous_action[:4]
-        )))
-        post_grasp_control = bool(secured_grasp or self._previous_secured_grasp)
-        self._post_grasp_arm_action_magnitude = (
-            arm_action_magnitude if post_grasp_control else 0.0
-        )
-        self._post_grasp_arm_action_rate = (
-            arm_action_rate if post_grasp_control else 0.0
-        )
         self._previous_action = action.copy()
-        self._previous_secured_grasp = secured_grasp
 
         components = {
             "reward_reach_progress": self.rl_config.reward_reach_progress * progress,
@@ -791,6 +958,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             ),
             "reward_new_contact": self.rl_config.reward_new_contact * new_contact_count,
             "reward_new_pinch": self.rl_config.reward_new_pinch * float(new_pinch),
+            "reward_new_aligned_pinch": (
+                self.rl_config.reward_new_aligned_pinch
+                * float(self._aligned_pinch_event)
+            ),
             "reward_new_secured_grasp": (
                 self.rl_config.reward_new_secured_grasp * float(new_secured)
             ),
@@ -810,6 +981,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 self.rl_config.reward_active_open_after_secured
                 * float(penalize_active_open)
             ),
+            "reward_pinch_stall": stall_reward,
+            "reward_failed_unloaded_pinch": failed_unloaded_reward,
             "reward_gripper_switch": (
                 self.rl_config.reward_gripper_switch
                 * float(self._gripper_switch_event)
@@ -820,14 +993,6 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 * float(np.mean(np.square(action)))
             ),
             "reward_action_rate": self.rl_config.reward_action_rate * action_rate,
-            "reward_post_grasp_arm_action_magnitude": (
-                self.rl_config.reward_post_grasp_arm_action_magnitude
-                * self._post_grasp_arm_action_magnitude
-            ),
-            "reward_post_grasp_arm_action_rate": (
-                self.rl_config.reward_post_grasp_arm_action_rate
-                * self._post_grasp_arm_action_rate
-            ),
         }
         return float(sum(components.values())), components
 
@@ -855,10 +1020,11 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._locked_body_id = None
         self._gripper_closed = False
         self._previous_action = np.zeros(5)
-        self._previous_alignment_score = None
+        self._previous_alignment_potential = None
         self._nearest_graspable_distance = 0.0
         self._nearest_graspable_segment_index = -1
         self._alignment_score = 0.0
+        self._alignment_potential = 0.0
         self._desired_hand_rotation = self.data.xmat[
             self.base_env.hand_id
         ].reshape(3, 3).copy()
@@ -867,6 +1033,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._gripper_switch_count = 0
         self._max_contacting_fingers = 0
         self._pinch_rewarded = False
+        self._aligned_pinch_rewarded = False
+        self._aligned_pinch_event = False
+        self._ever_aligned_pinch = False
+        self._alignment_score_at_first_pinch = None
         self._secured_rewarded = False
         self._lift_credit_high_water = 0.0
         self._cable_lift_credit_high_water = float(np.clip(
@@ -887,16 +1057,29 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._contact_loss_penalty_applied = False
         self._active_open_penalty_applied = False
         self._strict_hold_credit_high_water = 0.0
-        self._previous_secured_grasp = False
-        self._post_grasp_arm_action_magnitude = 0.0
-        self._post_grasp_arm_action_rate = 0.0
+        self._previous_pinch_confirmed = False
+        self._pinch_session_elapsed = 0.0
+        self._pinch_session_lift_high_water = 0.0
+        self._pinch_session_lift_peak_global = 0.0
+        self._pinch_session_stall_penalty = 0.0
+        self._unloaded_pinch_penalty_total = 0.0
+        self._failed_unloaded_pinch_count = 0
+        self._failed_unloaded_pinch_event = False
+        self._lift_attempt = False
+        self._loaded_lift = False
+        self._pinch_session_start_hand_z = None
+        self._post_pinch_world_z_action_sum = 0.0
+        self._post_pinch_world_z_action_count = 0
+        self._last_commanded_world_translation = np.zeros(3)
         (
             _, self._previous_distance, tangent,
             self._nearest_graspable_segment_index, _,
         ) = self._nearest_graspable_segment(self._grasp_center_position())
         self._nearest_graspable_distance = self._previous_distance
-        hand_rotation = self.data.xmat[self.base_env.hand_id].reshape(3, 3)
-        self._alignment_score = float(abs(np.dot(hand_rotation[:, 0], tangent)))
+        self._alignment_score, self._alignment_potential = self._alignment_terms(
+            self._previous_distance, tangent
+        )
+        self._previous_alignment_potential = self._alignment_potential
         return self._observation(), self._augment_info(info)
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
@@ -933,13 +1116,17 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._nearest_graspable_segment_index
         )
         result["alignment_score"] = self._alignment_score
+        result["alignment_potential"] = self._alignment_potential
         result["alignment_reward_active"] = bool(
-            self._previous_alignment_score is not None
+            self._previous_alignment_potential is not None
         )
         result["rl_grasped_body_id"] = self._locked_body_id
         result["ik_velocity_scale"] = self._last_ik_velocity_scale
         result["gripper_switch_event"] = self._gripper_switch_event
         result["gripper_switch_count"] = self._gripper_switch_count
+        result["commanded_world_translation"] = (
+            self._last_commanded_world_translation.copy()
+        )
         result["motion_curriculum_difficulty"] = self._motion_difficulty
         result["motion_curriculum_scenarios"] = self._active_scenario_names
         result["raw_finger_contacts"] = len(self.base_env.finger_contacts())
@@ -992,10 +1179,33 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         result["strict_hold_credit_high_water"] = (
             self._strict_hold_credit_high_water
         )
-        result["post_grasp_arm_action_magnitude"] = (
-            self._post_grasp_arm_action_magnitude
+        result["aligned_pinch_event"] = self._aligned_pinch_event
+        result["ever_aligned_pinch"] = self._ever_aligned_pinch
+        result["alignment_score_at_first_pinch"] = (
+            self._alignment_score_at_first_pinch
         )
-        result["post_grasp_arm_action_rate"] = self._post_grasp_arm_action_rate
+        result["pinch_session_elapsed"] = self._pinch_session_elapsed
+        result["pinch_session_lift_high_water"] = (
+            self._pinch_session_lift_high_water
+        )
+        result["pinch_session_lift_peak"] = self._pinch_session_lift_peak_global
+        result["failed_unloaded_pinch_event"] = (
+            self._failed_unloaded_pinch_event
+        )
+        result["failed_unloaded_pinch_count"] = (
+            self._failed_unloaded_pinch_count
+        )
+        result["unloaded_pinch_penalty_total"] = (
+            self._unloaded_pinch_penalty_total
+        )
+        result["lift_attempt"] = self._lift_attempt
+        result["loaded_lift"] = self._loaded_lift
+        result["post_pinch_world_z_action_mean"] = (
+            self._post_pinch_world_z_action_sum
+            / self._post_pinch_world_z_action_count
+            if self._post_pinch_world_z_action_count
+            else 0.0
+        )
         result["success"] = bool(self._last_grasp_status["strict_success"])
         return result
 

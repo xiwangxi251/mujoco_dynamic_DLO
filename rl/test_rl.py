@@ -31,8 +31,10 @@ from failure_taxonomy import (
     confirmed_break_times,
     scene_fingerprint,
 )
+from experiment_scenarios import list_scenario_names
 from project_paths import output_path
 from .rl_cable_env import RLCableGraspEnv
+from .train_rl import RL_L1_SCENARIOS
 
 
 FAILURE_TYPES = (
@@ -49,6 +51,10 @@ EPISODE_FIELDS = (
     "episode",
     "seed",
     "actual_episode_seed",
+    "scenario_name",
+    "scenario_id",
+    "scenario_split",
+    "motion_profile_version",
     "scene_fingerprint",
     "success",
     "failure_type",
@@ -74,6 +80,8 @@ EPISODE_FIELDS = (
     "ever_bilateral_candidate",
     "ever_confirmed_grasp",
     "first_pinch_time_s",
+    "alignment_score_at_first_pinch",
+    "ever_aligned_pinch",
     "first_secured_time_s",
     "active_open_after_secured",
     "first_active_open_time_s",
@@ -99,6 +107,12 @@ EPISODE_FIELDS = (
     "finger_aperture_final_m",
     "grasp_lift_delta_final_m",
     "grasp_lift_delta_peak_m",
+    "pinch_session_lift_peak_m",
+    "lift_attempt",
+    "loaded_lift",
+    "post_pinch_world_z_action_mean",
+    "failed_unloaded_pinch_count",
+    "unloaded_pinch_penalty_total",
     "strict_success_hold_final_s",
     "strict_success_hold_peak_s",
     "lifted_fraction_final",
@@ -111,6 +125,35 @@ EPISODE_FIELDS = (
     "policy_inference_mean_ms",
     "policy_inference_p95_ms",
 )
+RL_INTERFACE_VERSION = "baseline_v3"
+
+
+def checkpoint_interface_version(checkpoint: Path) -> str | None:
+    checkpoint = Path(checkpoint).resolve()
+    for directory in (checkpoint.parent, *checkpoint.parents):
+        config_path = directory / "training_config.json"
+        if not config_path.is_file():
+            continue
+        with config_path.open("r", encoding="utf-8") as source:
+            return str(json.load(source).get("rl_interface_version", "")) or None
+    return None
+
+
+def resolve_scenario_names(
+    scenario: str | None,
+    distribution: str,
+) -> tuple[str, ...] | None:
+    """Resolve an explicit registered test selection; legacy is opt-in only."""
+
+    if scenario is not None:
+        return (scenario,)
+    if distribution == "l1":
+        return tuple(RL_L1_SCENARIOS)
+    if distribution == "id":
+        return tuple(list_scenario_names("id"))
+    if distribution == "legacy":
+        return None
+    raise ValueError(f"unsupported test distribution: {distribution!r}")
 
 
 def _finite_or_none(value: object) -> float | int | str | None:
@@ -214,6 +257,7 @@ class EpisodeDiagnostics:
     ever_pinch: bool = False
     ever_secured: bool = False
     first_pinch_time: float | None = None
+    alignment_score_at_first_pinch: float | None = None
     first_secured_time: float | None = None
     first_active_open_time: float | None = None
     first_active_open_command_time: float | None = None
@@ -251,6 +295,9 @@ class EpisodeDiagnostics:
         ever_pinch_now = pinch_now or bool(info.get("ever_pinched", False))
         if ever_pinch_now and not self.ever_pinch:
             self.first_pinch_time = sim_time
+            self.alignment_score_at_first_pinch = _finite_or_none(
+                info.get("alignment_score")
+            )
         self.ever_pinch = self.ever_pinch or ever_pinch_now
 
         secured_now = bool(info.get("secured_grasp", False))
@@ -337,7 +384,6 @@ class EpisodeDiagnostics:
         action: np.ndarray,
         sim_time: float,
         inference_seconds: float,
-        open_threshold: float,
     ) -> None:
         action = np.asarray(action, dtype=np.float64)
         self.action_square_sum += float(np.sum(np.square(action)))
@@ -351,7 +397,7 @@ class EpisodeDiagnostics:
         self.previous_action = action.copy()
         self.inference_seconds.append(float(inference_seconds))
 
-        if self.ever_secured and float(action[7]) >= open_threshold:
+        if self.ever_secured and float(action[4]) >= 0.5:
             self.active_open_command_steps += 1
             if self.first_active_open_command_time is None:
                 self.first_active_open_command_time = sim_time
@@ -413,6 +459,16 @@ def _manifest(
         "run_directory": str(output_dir.resolve()),
         "command": [sys.executable, *sys.argv],
         "arguments": _json_arguments(args),
+        "scenario_selection": {
+            "scenario": args.scenario,
+            "distribution": args.distribution,
+            "registered_scenario_names": (
+                list(args.scenario_names)
+                if args.scenario_names is not None
+                else None
+            ),
+            "legacy_opt_in": args.scenario_names is None,
+        },
         "episode_seed_rule": {
             "first_seed": args.seed,
             "count": args.episodes,
@@ -422,6 +478,7 @@ def _manifest(
         "failure_taxonomy_source": _file_record(taxonomy_source),
         "checkpoint": _file_record(args.model),
         "environment": {
+            "rl_interface_version": RL_INTERFACE_VERSION,
             "source_xml": _file_record(XML_PATH),
             "panda_xml": _file_record(PANDA_XML_PATH),
             "menagerie_panda_assets": str(resolve_menagerie_panda_dir()),
@@ -434,6 +491,7 @@ def _manifest(
             "rl_config": asdict(env.rl_config),
             "action_seconds": action_seconds,
             "observation_names": list(env.OBSERVATION_NAMES),
+            "action_names": list(env.ACTION_NAMES),
             "observation_space": str(env.observation_space),
             "action_space": str(env.action_space),
         },
@@ -525,6 +583,10 @@ def _episode_row(
         "episode": episode,
         "seed": episode_seed,
         "actual_episode_seed": actual_episode_seed,
+        "scenario_name": initial_info.get("scenario_name"),
+        "scenario_id": initial_info.get("scenario_id"),
+        "scenario_split": initial_info.get("scenario_split"),
+        "motion_profile_version": initial_info.get("motion_profile_version"),
         "scene_fingerprint": scene_fingerprint(initial_info),
         "success": success,
         "failure_type": failure_type,
@@ -556,6 +618,12 @@ def _episode_row(
             final_info.get("ever_confirmed_grasp", False)
         ),
         "first_pinch_time_s": diagnostics.first_pinch_time,
+        "alignment_score_at_first_pinch": (
+            diagnostics.alignment_score_at_first_pinch
+        ),
+        "ever_aligned_pinch": bool(
+            final_info.get("ever_aligned_pinch", False)
+        ),
         "first_secured_time_s": diagnostics.first_secured_time,
         "active_open_after_secured": diagnostics.active_open_after_secured,
         "first_active_open_time_s": diagnostics.first_active_open_time,
@@ -603,6 +671,20 @@ def _episode_row(
             final_info.get("grasp_lift_delta")
         ),
         "grasp_lift_delta_peak_m": diagnostics.peak_grasp_lift_delta,
+        "pinch_session_lift_peak_m": _finite_or_none(
+            final_info.get("pinch_session_lift_peak")
+        ),
+        "lift_attempt": bool(final_info.get("lift_attempt", False)),
+        "loaded_lift": bool(final_info.get("loaded_lift", False)),
+        "post_pinch_world_z_action_mean": _finite_or_none(
+            final_info.get("post_pinch_world_z_action_mean")
+        ),
+        "failed_unloaded_pinch_count": int(
+            final_info.get("failed_unloaded_pinch_count", 0)
+        ),
+        "unloaded_pinch_penalty_total": _finite_or_none(
+            final_info.get("unloaded_pinch_penalty_total")
+        ),
         "strict_success_hold_final_s": _finite_or_none(
             final_info.get("strict_success_hold")
         ),
@@ -640,6 +722,7 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         seed=args.seed,
         disturbance_strength=args.disturbance,
         episode_seconds=args.episode_seconds,
+        scenario_names=args.scenario_names,
     )
 
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
@@ -760,7 +843,6 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                             action,
                             float(env.data.time),
                             inference_seconds,
-                            env.rl_config.gripper_open_threshold,
                         )
                         observation, reward, terminated, truncated, info = env.step(action)
                         diagnostics.observe_info(info, float(env.data.time), env)
@@ -1039,6 +1121,7 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         seed=args.seed,
         disturbance_strength=args.disturbance,
         episode_seconds=args.episode_seconds,
+        scenario_names=args.scenario_names,
     )
     observation, info = env.reset(seed=args.seed)
     episode = 1
@@ -1110,9 +1193,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20270804)
     parser.add_argument("--disturbance", type=float, default=1.5)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument(
+        "--scenario",
+        choices=list_scenario_names(),
+        help="evaluate one frozen registered scenario",
+    )
+    selection.add_argument(
+        "--distribution",
+        choices=("l1", "id", "legacy"),
+        default="l1",
+        help=(
+            "scenario distribution; l1 matches the current PPO strict evaluation, "
+            "while legacy must be selected explicitly"
+        ),
+    )
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--stochastic", action="store_true")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--allow-incompatible-interface",
+        action="store_true",
+        help=(
+            "explicitly load a checkpoint without a baseline_v3 training manifest; "
+            "its actions may be semantically incompatible"
+        ),
+    )
     parser.add_argument("--video-dir", type=Path, default=output_path("rl_test_videos"),
                         help="headless结果根目录；每次测试建立独立子目录")
     parser.add_argument(
@@ -1131,12 +1237,29 @@ def parse_args() -> argparse.Namespace:
         parser.error("--video-fps must be greater than zero")
     if args.video_width <= 0 or args.video_height <= 0:
         parser.error("--video-width and --video-height must be greater than zero")
+    if args.scenario is not None:
+        # A named scenario is the complete selection; do not leave the default
+        # distribution in the manifest where it could be mistaken for sampling.
+        args.distribution = None
+    args.scenario_names = resolve_scenario_names(
+        args.scenario,
+        args.distribution or "l1",
+    )
     return args
 
 
 if __name__ == "__main__":
     arguments = parse_args()
     arguments.model = _resolve_model_file(arguments.model)
+    interface_version = checkpoint_interface_version(arguments.model)
+    if (
+        interface_version != RL_INTERFACE_VERSION
+        and not arguments.allow_incompatible_interface
+    ):
+        raise SystemExit(
+            "checkpoint is not marked baseline_v3; use its saved historical videos "
+            "or pass --allow-incompatible-interface only for deliberate diagnostics"
+        )
     set_random_seed(arguments.seed)
     policy = PPO.load(arguments.model, device=arguments.device)
     if arguments.headless:

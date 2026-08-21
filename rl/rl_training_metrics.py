@@ -27,6 +27,9 @@ class TrainingMetricsCallback(BaseCallback):
         self.print_every_episodes = print_every_episodes
         self.success_window: deque[float] = deque(maxlen=window)
         self.pinch_window: deque[float] = deque(maxlen=window)
+        self.aligned_pinch_window: deque[float] = deque(maxlen=window)
+        self.loaded_lift_window: deque[float] = deque(maxlen=window)
+        self.lift_attempt_window: deque[float] = deque(maxlen=window)
         self.grasp_window: deque[float] = deque(maxlen=window)
         self.return_window: deque[float] = deque(maxlen=window)
         self.lift_window: deque[float] = deque(maxlen=window)
@@ -49,17 +52,30 @@ class TrainingMetricsCallback(BaseCallback):
             for row in previous_rows[-self.window:]:
                 self.success_window.append(float(row["success"]))
                 self.pinch_window.append(float(row.get("ever_pinched", 0.0)))
+                self.aligned_pinch_window.append(float(
+                    row.get("ever_aligned_pinch", 0.0)
+                ))
+                self.loaded_lift_window.append(float(row.get("loaded_lift", 0.0)))
+                self.lift_attempt_window.append(float(row.get("lift_attempt", 0.0)))
                 self.grasp_window.append(float(row["ever_grasped"]))
                 self.return_window.append(float(row["episode_return"]))
                 self.lift_window.append(float(row["lifted_fraction"]))
         fieldnames = [
-            "episode", "timesteps", "success", "ever_pinched", "ever_grasped",
+            "episode", "timesteps", "success", "ever_pinched",
+            "ever_aligned_pinch", "lift_attempt", "loaded_lift", "ever_grasped",
             "episode_return", "episode_length", "lifted_fraction",
         ]
-        if file_exists and previous_rows and "ever_pinched" not in previous_rows[0]:
+        required_v3_fields = {
+            "ever_pinched", "ever_aligned_pinch", "lift_attempt", "loaded_lift",
+        }
+        if (
+            file_exists
+            and previous_rows
+            and not required_v3_fields.issubset(previous_rows[0])
+        ):
             raise RuntimeError(
-                f"Existing metrics use the old grasp definition: {self.csv_path}. "
-                "Start the corrected RL run in a new output directory."
+                f"Existing metrics use an older RL interface: {self.csv_path}. "
+                "Start baseline v3 in a new output directory."
             )
         self._file = self.csv_path.open("a", encoding="utf-8", newline="")
         self._writer = csv.DictWriter(self._file, fieldnames=fieldnames)
@@ -97,6 +113,15 @@ class TrainingMetricsCallback(BaseCallback):
             grasped = float(bool(
                 episode_info.get("ever_grasped", info.get("ever_grasped", False))
             ))
+            aligned_pinched = float(bool(episode_info.get(
+                "ever_aligned_pinch", info.get("ever_aligned_pinch", False)
+            )))
+            lift_attempt = float(bool(episode_info.get(
+                "lift_attempt", info.get("lift_attempt", False)
+            )))
+            loaded_lift = float(bool(episode_info.get(
+                "loaded_lift", info.get("loaded_lift", False)
+            )))
             episode_return = float(episode_info.get("r", 0.0))
             episode_length = int(episode_info.get("l", 0))
             lifted_fraction = float(
@@ -106,6 +131,9 @@ class TrainingMetricsCallback(BaseCallback):
             self.episode_count += 1
             self.success_window.append(success)
             self.pinch_window.append(pinched)
+            self.aligned_pinch_window.append(aligned_pinched)
+            self.lift_attempt_window.append(lift_attempt)
+            self.loaded_lift_window.append(loaded_lift)
             self.grasp_window.append(grasped)
             self.return_window.append(episode_return)
             self.lift_window.append(lifted_fraction)
@@ -115,6 +143,9 @@ class TrainingMetricsCallback(BaseCallback):
                 "timesteps": self.num_timesteps,
                 "success": int(success),
                 "ever_pinched": int(pinched),
+                "ever_aligned_pinch": int(aligned_pinched),
+                "lift_attempt": int(lift_attempt),
+                "loaded_lift": int(loaded_lift),
                 "ever_grasped": int(grasped),
                 "episode_return": episode_return,
                 "episode_length": episode_length,
@@ -125,12 +156,18 @@ class TrainingMetricsCallback(BaseCallback):
             success_rate = float(np.mean(self.success_window))
             pinch_rate = float(np.mean(self.pinch_window))
             grasp_rate = float(np.mean(self.grasp_window))
+            aligned_pinch_rate = float(np.mean(self.aligned_pinch_window))
+            lift_attempt_rate = float(np.mean(self.lift_attempt_window))
+            loaded_lift_rate = float(np.mean(self.loaded_lift_window))
             mean_return = float(np.mean(self.return_window))
             mean_lift = float(np.mean(self.lift_window))
             # logger记录会同时进入PPO终端表格和TensorBoard。
             self.logger.record("task/episodes", self.episode_count)
             self.logger.record("task/success_rate_100", success_rate)
             self.logger.record("task/pinch_rate_100", pinch_rate)
+            self.logger.record("task/aligned_pinch_rate_100", aligned_pinch_rate)
+            self.logger.record("task/lift_attempt_rate_100", lift_attempt_rate)
+            self.logger.record("task/loaded_lift_rate_100", loaded_lift_rate)
             self.logger.record("task/grasp_rate_100", grasp_rate)
             self.logger.record("task/mean_return_100", mean_return)
             self.logger.record("task/mean_lifted_fraction_100", mean_lift)
@@ -151,6 +188,8 @@ class TrainingMetricsCallback(BaseCallback):
                     f"timesteps={self.num_timesteps} "
                     f"success_rate_{self.window}={success_rate:.1%} "
                     f"pinch_rate_{self.window}={pinch_rate:.1%} "
+                    f"aligned_pinch_rate_{self.window}={aligned_pinch_rate:.1%} "
+                    f"loaded_lift_rate_{self.window}={loaded_lift_rate:.1%} "
                     f"grasp_rate_{self.window}={grasp_rate:.1%} "
                     f"mean_return_{self.window}={mean_return:.3f} "
                     f"mean_lifted_fraction_{self.window}={mean_lift:.3f}",
@@ -240,12 +279,18 @@ def plot_training_curves(csv_path: Path, output_dir: Path, window: int = 100) ->
     timesteps = np.array([int(row["timesteps"]) for row in rows])
     successes = np.array([float(row["success"]) for row in rows])
     pinches = np.array([float(row.get("ever_pinched", 0.0)) for row in rows])
+    aligned_pinches = np.array([
+        float(row.get("ever_aligned_pinch", 0.0)) for row in rows
+    ])
+    loaded_lifts = np.array([float(row.get("loaded_lift", 0.0)) for row in rows])
     grasps = np.array([float(row["ever_grasped"]) for row in rows])
     returns = np.array([float(row["episode_return"]) for row in rows])
     lifted = np.array([float(row["lifted_fraction"]) for row in rows])
 
     success_rate = _rolling_mean(successes, window)
     pinch_rate = _rolling_mean(pinches, window)
+    aligned_pinch_rate = _rolling_mean(aligned_pinches, window)
+    loaded_lift_rate = _rolling_mean(loaded_lifts, window)
     grasp_rate = _rolling_mean(grasps, window)
     return_mean = _rolling_mean(returns, window)
     lifted_mean = _rolling_mean(lifted, window)
@@ -256,11 +301,13 @@ def plot_training_curves(csv_path: Path, output_dir: Path, window: int = 100) ->
         writer.writerow([
             "episode", "timesteps", f"success_rate_{window}",
             f"pinch_rate_{window}",
+            f"aligned_pinch_rate_{window}", f"loaded_lift_rate_{window}",
             f"grasp_rate_{window}", f"mean_return_{window}",
             f"mean_lifted_fraction_{window}",
         ])
         writer.writerows(zip(
-            episodes, timesteps, success_rate, pinch_rate, grasp_rate,
+            episodes, timesteps, success_rate, pinch_rate, aligned_pinch_rate,
+            loaded_lift_rate, grasp_rate,
             return_mean, lifted_mean
         ))
 
@@ -274,6 +321,14 @@ def plot_training_curves(csv_path: Path, output_dir: Path, window: int = 100) ->
     figure, axis = plt.subplots(figsize=(9, 5))
     axis.plot(timesteps, success_rate, label=f"Success rate (last {window})")
     axis.plot(timesteps, pinch_rate, label=f"Pinch rate (last {window})", alpha=0.75)
+    axis.plot(
+        timesteps, aligned_pinch_rate,
+        label=f"Aligned pinch rate (last {window})", alpha=0.8,
+    )
+    axis.plot(
+        timesteps, loaded_lift_rate,
+        label=f"Loaded lift rate (last {window})", alpha=0.8,
+    )
     axis.plot(timesteps, grasp_rate, label=f"Grasp rate (last {window})", alpha=0.8)
     axis.set_xlabel("Environment timesteps")
     axis.set_ylabel("Rate")
