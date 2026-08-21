@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 import hashlib
 import json
@@ -28,7 +28,7 @@ from .formula_intercept_policy import FormulaInterceptExpert
 from .run_experiment import DEFAULT_SCENARIOS
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 POLICY_NAME = "privileged_shadow_expert"
 
 
@@ -122,7 +122,8 @@ class EpisodeBuffer:
         seed: int,
         scenario_name: str,
         instruction: str,
-        video_file: str,
+        opst_video_file: str,
+        wrist_video_file: str,
         model_file: str,
         result: str,
     ) -> None:
@@ -151,10 +152,14 @@ class EpisodeBuffer:
             ),
             expert_prediction_horizons=np.asarray(self.expert_horizons),
             expert_candidate_scores=np.asarray(self.expert_scores),
+            image_frame_indices=np.arange(len(self.states), dtype=np.int64),
             seed=np.int64(seed),
             scenario_name=np.asarray(scenario_name),
             instruction=np.asarray(instruction),
-            video_file=np.asarray(video_file),
+            video_file=np.asarray(opst_video_file),
+            opst_video_file=np.asarray(opst_video_file),
+            wrist_video_file=np.asarray(wrist_video_file),
+            camera_names=np.asarray(["opst_cam", "wrist_cam"]),
             model_file=np.asarray(model_file),
             result=np.asarray(result),
         )
@@ -168,23 +173,32 @@ def _collect_attempt(
     attempt: int,
     instruction: str,
     scenario_dir: Path,
-) -> tuple[dict[str, Any], EpisodeBuffer, Path, dict[str, Any]]:
+) -> tuple[dict[str, Any], EpisodeBuffer, dict[str, Path], dict[str, Any]]:
     _, initial_info = env.reset(seed=seed)
     policy.reset()
     control_dt = float(env.model.opt.timestep * env.config.frame_skip)
     video_size = (
-        env.config.global_camera_width,
-        env.config.global_camera_height,
+        env.config.dynamicvla_camera_width,
+        env.config.dynamicvla_camera_height,
     )
-    temporary_video = scenario_dir / f"_attempt_{attempt:04d}_seed{seed}.mp4"
-    writer = cv2.VideoWriter(
-        str(temporary_video),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        1.0 / control_dt,
-        video_size,
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"cannot create video: {temporary_video}")
+    temporary_videos = {
+        camera_name: scenario_dir
+        / f"_attempt_{attempt:04d}_seed{seed}_{camera_name}.mp4"
+        for camera_name in ("opst_cam", "wrist_cam")
+    }
+    writers: dict[str, cv2.VideoWriter] = {}
+    for camera_name, path in temporary_videos.items():
+        writer = cv2.VideoWriter(
+            str(path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            1.0 / control_dt,
+            video_size,
+        )
+        if not writer.isOpened():
+            for opened_writer in writers.values():
+                opened_writer.release()
+            raise RuntimeError(f"cannot create video: {path}")
+        writers[camera_name] = writer
 
     buffer = EpisodeBuffer(env)
     termination_reason: str | None = None
@@ -192,8 +206,11 @@ def _collect_attempt(
     try:
         while not policy.finished and env.data.time < env.config.episode_seconds:
             action = policy.action()
-            frame = env.camera_rgb()
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            frames = env.dynamicvla_camera_rgb()
+            for camera_name, frame in frames.items():
+                writers[camera_name].write(
+                    cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                )
             buffer.record_before_action(policy, action)
             _, _, _, truncated, step_info = env.step(action)
             buffer.record_applied_action()
@@ -212,7 +229,8 @@ def _collect_attempt(
                 )
                 policy.finished = True
     finally:
-        writer.release()
+        for writer in writers.values():
+            writer.release()
 
     info = env.info()
     info["ever_pinched"] = env.last_grasped_body_id is not None
@@ -247,8 +265,18 @@ def _collect_attempt(
         "termination_reason": termination_reason,
         "motion_profile_hash": env.motion_profile_hash,
         "expert": policy.expert_info(),
+        "camera_rig": {
+            "name": "dynamicvla_opposite_and_wrist",
+            "width": env.config.dynamicvla_camera_width,
+            "height": env.config.dynamicvla_camera_height,
+            "fovy": env.config.dynamicvla_camera_fovy,
+            "opst_pos_in_base": env.config.dynamicvla_opst_camera_pos,
+            "opst_quat_in_base": env.config.dynamicvla_opst_camera_quat,
+            "wrist_pos_in_hand": env.config.dynamicvla_wrist_camera_pos,
+            "wrist_quat_in_hand": env.config.dynamicvla_wrist_camera_quat,
+        },
     }
-    return row, buffer, temporary_video, metadata
+    return row, buffer, temporary_videos, metadata
 
 
 def _collect_scenario(
@@ -259,11 +287,15 @@ def _collect_scenario(
     scenario_dir = run_dir / scenario_name
     scenario_dir.mkdir(parents=True, exist_ok=False)
     scenario = get_scenario(scenario_name)
-    env = CableGraspEnv(env_config_for_scenario(
+    env_config = env_config_for_scenario(
         scenario,
         seed=args.seed,
         episode_seconds=args.episode_seconds,
-        camera_observation_enabled=True,
+        camera_observation_enabled=False,
+    )
+    env = CableGraspEnv(replace(
+        env_config,
+        dynamicvla_cameras_enabled=True,
     ))
     policy = FormulaInterceptExpert(env)
     model_path = scenario_dir / "scenario.mjb"
@@ -278,7 +310,7 @@ def _collect_scenario(
         ):
             attempt += 1
             seed = args.seed + attempt - 1
-            row, buffer, temporary_video, metadata = _collect_attempt(
+            row, buffer, temporary_videos, metadata = _collect_attempt(
                 env,
                 policy,
                 seed=seed,
@@ -289,21 +321,26 @@ def _collect_scenario(
             if row["strict_success"]:
                 successes += 1
                 stem = f"episode_{successes:06d}"
-                video_path = scenario_dir / f"{stem}_global.mp4"
+                opst_video_path = scenario_dir / f"{stem}_opst.mp4"
+                wrist_video_path = scenario_dir / f"{stem}_wrist.mp4"
                 data_path = scenario_dir / f"{stem}.npz"
                 metadata_path = scenario_dir / f"{stem}.json"
-                temporary_video.replace(video_path)
+                temporary_videos["opst_cam"].replace(opst_video_path)
+                temporary_videos["wrist_cam"].replace(wrist_video_path)
                 buffer.save(
                     data_path,
                     seed=seed,
                     scenario_name=scenario_name,
                     instruction=args.instruction,
-                    video_file=video_path.name,
+                    opst_video_file=opst_video_path.name,
+                    wrist_video_file=wrist_video_path.name,
                     model_file=model_path.name,
                     result=row["policy_result"],
                 )
                 metadata["artifacts"] = {
-                    "video": video_path.name,
+                    "video": opst_video_path.name,
+                    "opst_video": opst_video_path.name,
+                    "wrist_video": wrist_video_path.name,
                     "trajectory": data_path.name,
                     "model": model_path.name,
                 }
@@ -311,14 +348,19 @@ def _collect_scenario(
                 row.update({
                     "saved_episode": successes,
                     "dataset_saved": True,
-                    "video_path": str(video_path.resolve()),
+                    "video_path": str(opst_video_path.resolve()),
+                    "opst_video_path": str(opst_video_path.resolve()),
+                    "wrist_video_path": str(wrist_video_path.resolve()),
                     "trajectory_path": str(data_path.resolve()),
                     "metadata_path": str(metadata_path.resolve()),
                 })
             else:
-                temporary_video.unlink(missing_ok=True)
+                for temporary_video in temporary_videos.values():
+                    temporary_video.unlink(missing_ok=True)
                 row.update({
                     "video_path": "",
+                    "opst_video_path": "",
+                    "wrist_video_path": "",
                     "trajectory_path": "",
                     "metadata_path": "",
                 })
@@ -470,7 +512,7 @@ def main() -> None:
             "spawn_process_per_scenario" if worker_count > 1 else "serial"
         ),
         "instruction": args.instruction,
-        "camera": "fixed_global",
+        "camera": "dynamicvla_opposite_and_wrist",
         "action_label": "environment_limited_joint_position_command",
         "scenario_manifests": scenario_manifests,
         "episodes_csv": str(episodes_path.resolve()),

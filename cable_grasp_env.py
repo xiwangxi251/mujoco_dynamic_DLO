@@ -164,14 +164,12 @@ class EnvConfig:
     # MuJoCo相机沿自身-Z轴观察，外参定义在世界坐标系中。
     camera_observation_enabled: bool = True
     global_camera_name: str = "global_camera"
-    global_camera_width: int = 320
-    global_camera_height: int = 240
-    global_camera_fovy: float = 45.0
-    global_camera_pos: tuple[float, float, float] = (
-        0.50, -1.42658348, 2.01596494,
-    )
+    global_camera_width: int = 480
+    global_camera_height: int = 360
+    global_camera_fovy: float = 73.7397952917
+    global_camera_pos: tuple[float, float, float] = (1.0, 0.0, 0.6)
     global_camera_quat: tuple[float, float, float, float] = (
-        0.9537169497, 0.3007058028, 0.0, 0.0,
+        0.6123724357, 0.3535533906, 0.3535533906, 0.6123724357,
     )
 
     # DynamicVLA was trained with a fixed opposite camera and a Panda wrist

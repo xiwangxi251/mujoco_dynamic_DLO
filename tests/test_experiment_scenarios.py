@@ -119,6 +119,14 @@ class EnvironmentScenarioTests(unittest.TestCase):
             del env
 
     def test_global_camera_is_fixed_and_returned_in_observation(self) -> None:
+        defaults = EnvConfig()
+        self.assertEqual(defaults.global_camera_width, 480)
+        self.assertEqual(defaults.global_camera_height, 360)
+        self.assertEqual(defaults.global_camera_pos, (1.0, 0.0, 0.6))
+        self.assertEqual(
+            defaults.global_camera_quat,
+            (0.6123724357, 0.3535533906, 0.3535533906, 0.6123724357),
+        )
         config = EnvConfig(
             seed=12,
             episode_seconds=0.1,
