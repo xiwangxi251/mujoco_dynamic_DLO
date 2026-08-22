@@ -24,10 +24,11 @@ XML_PATH = ROOT / "assets" / "mujoco" / "panda_cable_grasp.xml"
 PANDA_XML_PATH = ROOT / "assets" / "mujoco" / "panda.xml"
 MENAGERIE_ENV_VAR = "MUJOCO_MENAGERIE_PATH"
 
+# -------------------------------------------------------------------------
+# 找 MuJoCo Menagerie 里的 Franka Panda 官方资源目录
+# -------------------------------------------------------------------------
 
 def resolve_menagerie_panda_dir() -> Path:
-    """Locate official Panda mesh assets without assuming a workstation path."""
-
     configured = os.environ.get(MENAGERIE_ENV_VAR)
     candidates: list[Path] = []
     if configured:
@@ -67,6 +68,10 @@ def _panda_assets(panda_dir_text: str) -> dict[str, bytes]:
         if path.is_file()
     }
 
+# -------------------------------------------------------------------------
+# rigid 场景的公共参数
+# -------------------------------------------------------------------------
+
 RIGID_MOTION_START_TIME = 0.80
 RIGID_MOTION_START_Y = -0.70
 RIGID_MOTION_TRAVEL = 1.40
@@ -104,36 +109,40 @@ RIGID_MOTION_L2_ARC_LENGTH = float(np.linalg.norm(
 ).sum())
 
 
+# -------------------------------------------------------------------------
+# 环境参数
+# -------------------------------------------------------------------------
 @dataclass
 class EnvConfig:
-    """环境参数"""
-
+    # 基础参数
     seed: int = 20260804
-    episode_seconds: float = 15.0       # 每次随机试验最多运行多少仿真秒
-    disturbance_strength: float = 1.5   # 线缆外力倍率
+    episode_seconds: float = 15.0       
+    disturbance_strength: float = 1.5   
 
     # 场景标记
     scenario_name: str = "legacy_shape_current"
     scenario_id: str | None = None
     scenario_split: str = "legacy"
 
-    # 线缆运动形式
+    # 线缆运动参数
     motion_mode: str = "shape"          # static / rigid / shape / combined
-    # legacy_v1 / factorized_v1/v2 / rigid_level{1,2}_single_pass_v2
-    motion_profile_version: str = "legacy_v1"
+    motion_profile_version: str = "legacy_v1"     # legacy_v1 / factorized_v1/v2 / rigid_level{1,2}_single_pass_v2
     motion_regularity: str = "quasiperiodic"  # regular / quasiperiodic / stochastic
+
+    # 运动强度/速度相关参数
     motion_frequency_scale: float = 1.0
     shape_motion_scale: float = 1.0
     rigid_translation_scale: float = 1.0
     rigid_rotation_scale: float = 1.0
     rigid_motion_nominal_speed: float = 0.25 # L1/L2标称平均速度，单位m/s
-    # L1/L2只在线缆质量中心实际越过这条世界坐标Y线后结束。
     rigid_motion_exit_y: float = 0.70
-    # 整体运动按物体的实际路径进度推进，不追赶绝对时间目标。位置增益只修正
-    # 横向轨迹误差，纵向始终使用标称速度，避免受阻后补路程式加速。
+
+    # rigid 轨迹控制参数
     rigid_path_position_gain: float = 20.0
     rigid_velocity_gain: float = 32.0
     rigid_translation_max_acceleration: float = 8.0
+
+    # rigid 模式保持线缆形状的参数
     rigid_shape_stiffness: float = 1000.0    # rigid中保持初始平面构型，单位1/s²
     rigid_shape_damping: float = 68.0        # rigid相对运动阻尼，单位1/s
     rigid_shape_max_acceleration: float = 45.0
@@ -147,22 +156,21 @@ class EnvConfig:
     table_half_size: tuple[float, float] = (1.20, 1.20)
 
     # 抓取判断参数
-    success_hold_seconds: float = 0.80  # 成功条件必须连续保持的时间
-    grasp_confirm_seconds: float = 0.06 # 双侧内指垫接触保持多久才确认抓取
-    grasp_candidate_gap_seconds: float = 0.02  # 确认前容忍求解器短暂接触/力波动
-    grasp_contact_index_radius: int = 2  # 弯曲线缆双侧接触允许跨越的离散节点数
-    grasp_loss_seconds: float = 0.35    # 双指接触短暂中断的容忍时间
-    max_grasp_aperture: float = 0.034  # 28 mm线缆被真正夹紧时允许的最大开口
-    max_pad_distance: float = 0.055    # 接触线段中心到指垫中心的最大距离
-    min_pad_normal_force: float = 0.20 # 每侧内指垫所需最小法向力，单位N
+    success_hold_seconds: float = 0.80  
+    grasp_confirm_seconds: float = 0.06 
+    grasp_candidate_gap_seconds: float = 0.02  
+    grasp_contact_index_radius: int = 2  
+    grasp_loss_seconds: float = 0.35   
+    max_grasp_aperture: float = 0.034 
+    max_pad_distance: float = 0.055   
+    min_pad_normal_force: float = 0.20 
 
     # 仿真和夹爪参数
-    frame_skip: int = 10                # 一个50 Hz动作对应10个500 Hz物理步
-    gripper_force_scale: float = 5.0    # 提高闭爪位置伺服刚度；执行器最大力范围保持不变
+    frame_skip: int = 10                
+    gripper_force_scale: float = 5.0    
     pad_friction: tuple[float, float, float] = (4.0, 0.10, 0.05)
 
-    # 固定全局相机。相机位于桌面一侧的斜上方，覆盖整条线缆及L1/L2运动范围；
-    # MuJoCo相机沿自身-Z轴观察，外参定义在世界坐标系中。
+    # 固定全局相机参数
     camera_observation_enabled: bool = True
     global_camera_name: str = "global_camera"
     global_camera_width: int = 480
@@ -173,11 +181,7 @@ class EnvConfig:
         0.6123724357, 0.3535533906, 0.3535533906, 0.6123724357,
     )
 
-    # DynamicVLA was trained with a fixed opposite camera and a Panda wrist
-    # camera at 480x360, 25 Hz.  Keep this rig optional so scripted/RL model
-    # files and observations remain unchanged unless a VLA evaluation asks for
-    # it explicitly.  The poses below reproduce DynamicVLA's DOM simulator
-    # configuration in the Panda base/hand frames (OpenGL camera convention).
+    # DynamicVLA 专用相机
     dynamicvla_cameras_enabled: bool = False
     dynamicvla_opst_camera_name: str = "dynamicvla_opst_camera"
     dynamicvla_wrist_camera_name: str = "dynamicvla_wrist_camera"
@@ -193,14 +197,11 @@ class EnvConfig:
         0.0, 0.7071067812, 0.7071067812, 0.0,
     )
 
-    # 环境统一限制机器人能力，脚本、RL与VLA都不能绕过。关节与手指速度
-    # 直接对齐DynamicVLA的Panda仿真配置，不再额外乘80%或提前在65%处制动。
+    # 机器人运动能力限制
     robot_motion_limit_profile: str = "dynamicvla_panda_v4"
     arm_joint_velocity_limits: tuple[float, ...] = (
         2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61,
     )
-    # DynamicVLA只设置执行器关节速度上限，没有额外的动作加速度裁剪。
-    # 保留这组参数供特殊安全回归显式启用，但正式默认配置不使用它。
     arm_acceleration_limit_enabled: bool = False
     arm_joint_acceleration_limits: tuple[float, ...] = (
         15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0,

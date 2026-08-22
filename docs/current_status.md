@@ -10,15 +10,16 @@
 - 根目录旧命令和历史 Python 导入兼容层已退役，统一使用安装后的
   `panda-cable-*` 命令或 `panda_cable_grasp.*` 包导入。
 - PPO 姿态奖励改为“夹爪闭合轴与局部绳子切向垂直”，只在接近可抓取线段时给予有效势能。
+- 夹爪恢复迟滞开关；捕获区内闭爪获得一次性奖励，保持张开或过早闭爪分别受到轻量逐步惩罚。
 - 有效抓取必须在双指夹持后实际抬升 30 mm 并稳定 0.10 s，才进入 secured 状态。
 - 对“捏住但不抬升”加入延迟且封顶的停滞惩罚；未承载夹持结束时加入事件惩罚，避免持续刷夹持奖励。
 - 主动张爪、物理滑脱和接触丢失后张爪分别记录，方便因果诊断。
-- 本轮代码重组后的全量测试基线：71 项通过。
+- 本轮代码重组后的全量测试基线：78 项通过。
 
 ## 尚未完成
 
 - 新奖励版本还没有正式长训练结果，不能用旧 PPO v2 的成功率评价本次修正。
-- 需要从头训练 `outputs/rl/train/ppo_dlo_baseline_v3/`，然后用独立 seed 做严格评估。
+- 需要从头训练 `outputs/rl/train/ppo_dlo_baseline_v4/`，然后用独立 seed 做严格评估。
 - 先比较 aligned-pinch、secured-grasp、loaded-lift 和 strict-success 四级指标，再看总 reward；只看 episode return 无法判断抓取姿态是否正确。
 
 ## 推荐下一次训练
@@ -30,7 +31,7 @@ panda-cable-rl-train \
   --timesteps 2000000 \
   --training-distribution l1 \
   --eval-distribution l1 \
-  --output outputs/rl/train/ppo_dlo_baseline_v3 \
+  --output outputs/rl/train/ppo_dlo_baseline_v4 \
   --device cpu
 ```
 

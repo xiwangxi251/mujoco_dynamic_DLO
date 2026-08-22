@@ -38,7 +38,7 @@ PPO 训练与评估：
 
 ```bash
 panda-cable-rl-train --workers 12 --eval-workers 4 --timesteps 2000000 --device cpu
-panda-cable-rl-eval --model outputs/rl/train/ppo_dlo_baseline_v3/best_model.zip --headless
+panda-cable-rl-eval --model outputs/rl/train/ppo_dlo_baseline_v4/best_model.zip --headless
 ```
 
 `--workers` 是并行 MuJoCo 环境进程数，不是 GPU 数。服务器上应从较小数值开始，

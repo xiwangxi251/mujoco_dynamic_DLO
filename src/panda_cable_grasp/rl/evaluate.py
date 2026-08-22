@@ -125,7 +125,7 @@ EPISODE_FIELDS = (
     "policy_inference_mean_ms",
     "policy_inference_p95_ms",
 )
-RL_INTERFACE_VERSION = "baseline_v3"
+RL_INTERFACE_VERSION = "baseline_v4"
 
 
 def checkpoint_interface_version(checkpoint: Path) -> str | None:
@@ -1215,7 +1215,7 @@ def parse_args() -> argparse.Namespace:
         "--allow-incompatible-interface",
         action="store_true",
         help=(
-            "explicitly load a checkpoint without a baseline_v3 training manifest; "
+            "explicitly load a checkpoint without a baseline_v4 training manifest; "
             "its actions may be semantically incompatible"
         ),
     )
@@ -1257,11 +1257,25 @@ def main() -> None:
         and not arguments.allow_incompatible_interface
     ):
         raise SystemExit(
-            "checkpoint is not marked baseline_v3; use its saved historical videos "
+            "checkpoint is not marked baseline_v4; use its saved historical videos "
             "or pass --allow-incompatible-interface only for deliberate diagnostics"
         )
     set_random_seed(arguments.seed)
-    policy = PPO.load(arguments.model, device=arguments.device)
+    # Only the learned parameters are needed for evaluation.  SB3 also stores
+    # training schedules as cloudpickled Python functions; executing a schedule
+    # saved by another Python minor version can crash CPython before it can
+    # raise a normal deserialization error.  Replacing those training-only
+    # objects keeps Linux/Windows checkpoints portable without changing policy
+    # weights or deterministic predictions.
+    policy = PPO.load(
+        arguments.model,
+        device=arguments.device,
+        custom_objects={
+            "learning_rate": 0.0,
+            "lr_schedule": lambda _: 0.0,
+            "clip_range": 0.2,
+        },
+    )
     if arguments.headless:
         run_headless(arguments, policy)
     else:

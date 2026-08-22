@@ -39,7 +39,7 @@ RL_L1_CURRICULUM_STAGES = (
     ("id_shape_nominal_current", "id_rigid_l1_nominal"),
     ("id_combined_l1_nominal",),
 )
-RL_INTERFACE_VERSION = "baseline_v3"
+RL_INTERFACE_VERSION = "baseline_v4"
 
 
 def checkpoint_interface_version(checkpoint: Path) -> str | None:
@@ -548,7 +548,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path,
-        default=output_path("rl", "train", "ppo_dlo_baseline_v3")
+        default=output_path("rl", "train", "ppo_dlo_baseline_v4")
     )
     parser.add_argument("--checkpoint-steps", type=int, default=100_000)
     parser.add_argument("--n-steps", type=int, default=1024,
@@ -708,7 +708,7 @@ def parse_args() -> argparse.Namespace:
         )
         if version != RL_INTERFACE_VERSION:
             parser.error(
-                "--resume checkpoint predates the baseline_v3 action/reward "
+                "--resume checkpoint predates the baseline_v4 action/reward "
                 "interface and cannot be continued safely"
             )
     return args
@@ -954,13 +954,14 @@ def main() -> None:
         "rl_config": asdict(RLConfig()),
         "reward": (
             "pre-pinch nearest-segment reach progress + planar perpendicular "
-            "alignment potential progress + aligned-pinch bonus + capped unloaded-pinch "
-            "penalties + episode-global lift high-water credit + strict success; "
+            "alignment potential progress + capture-zone close bonus/open penalty + "
+            "aligned-pinch bonus + capped unloaded-pinch penalties + episode-global "
+            "lift high-water credit + strict success; "
             "post-secured active-open and physical-slip penalties remain causal"
         ),
         "action": (
             "base-frame delta xyz (0.010 m vector-norm cap), world-z yaw "
-            "(0.020 rad), and one continuous gripper target; damped resolved-rate "
+            "(0.020 rad), and one hysteretic open/close gripper command; damped resolved-rate "
             "IK with uniform joint-velocity scaling"
         ),
     }
