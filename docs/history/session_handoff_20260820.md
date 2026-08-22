@@ -1,5 +1,8 @@
 # Franka Panda 动态线缆抓取项目交接文档
 
+> 本文是 2026-08-20 前后的历史交接快照。旧路径和旧命令仅用于追溯；
+> 当前入口以 [当前状态](../current_status.md) 和仓库根目录 `README.md` 为准。
+
 - 更新时间：2026-08-19
 - 项目目录：Git 仓库根目录
 - Menagerie 目录：由 `MUJOCO_MENAGERIE_PATH` 指定；仍兼容仓库旁的自动发现

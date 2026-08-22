@@ -6,14 +6,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from cable_grasp_env import (
+from panda_cable_grasp.env.environment import (
     MENAGERIE_ENV_VAR,
     PANDA_XML_PATH,
     ROOT,
     XML_PATH,
     resolve_menagerie_panda_dir,
 )
-from project_paths import OUTPUT_ROOT_ENV_VAR, output_path
+from panda_cable_grasp.paths import OUTPUT_ROOT_ENV_VAR, output_path
 
 
 class PortabilityTests(unittest.TestCase):

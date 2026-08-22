@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from rl.train_rl import StrictSuccessEvalCallback
+from panda_cable_grasp.rl.train import StrictSuccessEvalCallback
 
 
 class _FakeModel:

@@ -6,12 +6,12 @@ import unittest
 import mujoco
 import numpy as np
 
-from dynamic_grasp_policy import DynamicCableGraspPolicy, Phase, PolicyConfig
-from dynamicvla_adapter import (
+from panda_cable_grasp.policies import DynamicCableGraspPolicy, Phase, PolicyConfig
+from panda_cable_grasp.dynamicvla.adapter import (
     DynamicVLATaskSpaceAdapter,
     make_dynamicvla_observation,
 )
-from cable_grasp_env import (
+from panda_cable_grasp.env.environment import (
     CableGraspEnv,
     EnvConfig,
     GraspState,
@@ -21,13 +21,16 @@ from cable_grasp_env import (
     RIGID_MOTION_ROTATION,
     rotation_to_quat,
 )
-from experiment_scenarios import (
+from panda_cable_grasp.scenarios import (
     DEFAULT_SCENARIO,
     get_scenario,
     list_scenarios,
     list_suite_scenarios,
 )
-from motion_diagnostics import MotionTracker, env_config_for_scenario
+from panda_cable_grasp.evaluation.motion_diagnostics import (
+    MotionTracker,
+    env_config_for_scenario,
+)
 
 
 class ScenarioRegistryTests(unittest.TestCase):

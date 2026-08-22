@@ -1,6 +1,6 @@
 # DynamicVLA 线缆数据微调
 
-本目录将 `privileged_expert.collect_dataset` 保存的 schema-v2 成功轨迹转换为
+本工具将 `panda-cable-expert-collect` 保存的 schema-v2 成功轨迹转换为
 DynamicVLA 官方训练代码使用的 LeRobot v2.1 数据集，并调用官方 `run.py` 从
 `dynamic-vla-DOM` 权重开始微调。
 
@@ -38,7 +38,7 @@ python -m pip install mujoco torchcodec
 直接传整个 `privileged_expert_dataset`，否则不同批次使用相同 seed 时会被判定为重复。
 
 ```bash
-python -m dynamicvla_finetune.convert_dataset \
+panda-cable-dataset-convert \
   outputs/datasets/privileged_expert/run_YYYYMMDD_HHMMSS_seed20260804 \
   --output /data1/hxai/datasets/panda_cable_dynamicvla \
   --repo-id local/panda-cable-dynamicvla \
@@ -48,7 +48,7 @@ python -m dynamicvla_finetune.convert_dataset \
 只转换静态场景：
 
 ```bash
-python -m dynamicvla_finetune.convert_dataset \
+panda-cable-dataset-convert \
   outputs/datasets/privileged_expert/run_YYYYMMDD_HHMMSS_seed20260804 \
   --scenarios id_static \
   --output /data1/hxai/datasets/panda_cable_static_dynamicvla \
@@ -64,7 +64,7 @@ run 根目录缺少最终 `manifest.json` 或其中存在未完成场景时也�
 转换完成后，先让 DynamicVLA 自己的加载器检查数据、双帧观测和20步动作块：
 
 ```bash
-python -m dynamicvla_finetune.check_dataset \
+panda-cable-dataset-check \
   --dynamicvla-root /data1/hxai/mujoco/DynamicVLA \
   --dataset /data1/hxai/datasets/panda_cable_static_dynamicvla
 ```
@@ -75,7 +75,7 @@ python -m dynamicvla_finetune.check_dataset \
 GPU 服务器运行：
 
 ```bash
-python -m dynamicvla_finetune.launch_finetune \
+panda-cable-finetune \
   --dynamicvla-root /data1/hxai/mujoco/DynamicVLA \
   --dataset /data1/hxai/datasets/panda_cable_static_dynamicvla \
   --checkpoint /data1/hxai/mujoco/DynamicVLA/ckt/dynamic-vla-DOM \
@@ -88,7 +88,7 @@ python -m dynamicvla_finetune.launch_finetune \
 多 GPU 示例：
 
 ```bash
-python -m dynamicvla_finetune.launch_finetune \
+panda-cable-finetune \
   --dynamicvla-root /data1/hxai/mujoco/DynamicVLA \
   --dataset /data1/hxai/datasets/panda_cable_dynamicvla \
   --experiment cable-four-scenarios \

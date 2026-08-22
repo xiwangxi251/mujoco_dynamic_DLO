@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from dynamicvla_finetune.convert_dataset import (
+from panda_cable_grasp.dynamicvla.finetune.convert_dataset import (
     _select_frame_indices,
     _wxyz_to_euler_xyz,
 )
@@ -40,4 +40,3 @@ class RotationQuaternion:
 
 if __name__ == "__main__":
     unittest.main()
-

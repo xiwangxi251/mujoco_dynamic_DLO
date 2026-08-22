@@ -25,14 +25,14 @@ env.environment（MuJoCo 状态、接触、夹持、扰动、成功判定）
 
 | 目录 | 职责 | 主要入口 |
 |---|---|---|
-| `env/` | MuJoCo 模型、状态推进、接触与成功语义；纯运动学工具 | `CableGraspEnv`, `EnvConfig` |
-| `policies/` | 可解释的规则抓取控制器 | `DynamicGraspPolicy` |
-| `scenarios/` | ID/OOD 场景、物理和运动参数注册表 | `get_scenario`, `list_scenario_names` |
-| `rl/` | 99 维观测、5 维动作、奖励、PPO 训练和严格评估 | `RLCableGraspEnv`, `RLConfig` |
-| `evaluation/` | 多场景基准、运动诊断、失败分类与汇总 | `benchmark`, `motion_diagnostics` |
-| `expert/` | 使用仿真特权状态的专家策略和数据采集 | `collect_dataset` |
-| `dynamicvla/` | DynamicVLA 动作适配、数据转换和微调启动 | `DynamicVLATaskSpaceAdapter` |
-| `cli/` | 面向用户的规则策略与 DynamicVLA 命令 | `run_grasp`, `run_dynamicvla` |
+| `src/panda_cable_grasp/env/` | MuJoCo 模型、状态推进、接触与成功语义；纯运动学工具 | `CableGraspEnv`, `EnvConfig` |
+| `src/panda_cable_grasp/policies/` | 可解释的规则抓取控制器 | `DynamicGraspPolicy` |
+| `src/panda_cable_grasp/scenarios/` | ID/OOD 场景、物理和运动参数注册表 | `get_scenario`, `list_scenario_names` |
+| `src/panda_cable_grasp/rl/` | 99 维观测、5 维动作、奖励、PPO 训练和严格评估 | `RLCableGraspEnv`, `RLConfig` |
+| `src/panda_cable_grasp/evaluation/` | 多场景基准、运动诊断、失败分类与汇总 | `benchmark`, `motion_diagnostics` |
+| `src/panda_cable_grasp/expert/` | 使用仿真特权状态的专家策略和数据采集 | `collect_dataset` |
+| `src/panda_cable_grasp/dynamicvla/` | DynamicVLA 动作适配、数据转换和微调启动 | `DynamicVLATaskSpaceAdapter` |
+| `src/panda_cable_grasp/cli/` | 面向用户的规则策略与 DynamicVLA 命令 | `run_grasp`, `run_dynamicvla` |
 
 ## 物理环境边界
 
@@ -49,7 +49,9 @@ from panda_cable_grasp.env import CableGraspEnv, EnvConfig
 from panda_cable_grasp.rl import RLCableGraspEnv, RLConfig
 ```
 
-根目录同名 Python 文件是旧命令兼容层，只负责把仓库的 `src/` 加入路径并转发到包实现。不要在 `src/panda_cable_grasp/` 内导入这些兼容模块。
+旧的根目录同名模块和 `rl.*`、`privileged_expert.*`、`dynamicvla_finetune.*`
+兼容入口已经退役。命令行使用 `pyproject.toml` 注册的 `panda-cable-*` 命令，
+Python 代码只从 `panda_cable_grasp` 包导入。
 
 ## 配置与路径
 
@@ -68,6 +70,8 @@ from panda_cable_grasp.rl import RLCableGraspEnv, RLConfig
 
 修改奖励时至少运行 integration；修改 XML、接触、动作映射或成功判定时运行全套测试，并补一个短 episode 烟测。
 
-## 兼容层退役条件
+## 根目录约定
 
-目前保留根目录入口是为了让服务器脚本和历史命令继续可用。等所有部署脚本都改为 `panda-cable-*` 或 `python -m panda_cable_grasp...` 后，可以在单独提交中移除兼容文件；不要和奖励或物理修改混在同一次提交里。
+根目录只保存项目级元数据和入口文档。可执行实现全部位于
+`src/panda_cable_grasp/`，维护脚本位于 `tools/`，生成产物位于 `outputs/`。
+各根目录文件的用途见 [根目录说明](root_layout.md)。

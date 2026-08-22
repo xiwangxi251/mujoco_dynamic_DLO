@@ -4,10 +4,10 @@ import unittest
 
 import numpy as np
 
-from cable_grasp_env import CableGraspEnv
-from dynamic_grasp_policy import DynamicCableGraspPolicy, Phase
-from experiment_scenarios import get_scenario
-from motion_diagnostics import env_config_for_scenario
+from panda_cable_grasp.env import CableGraspEnv
+from panda_cable_grasp.evaluation.motion_diagnostics import env_config_for_scenario
+from panda_cable_grasp.policies import DynamicCableGraspPolicy, Phase
+from panda_cable_grasp.scenarios import get_scenario
 
 from panda_cable_grasp.expert.formula_intercept_policy import (
     FormulaInterceptConfig,
