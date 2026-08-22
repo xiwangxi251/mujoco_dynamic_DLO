@@ -55,6 +55,11 @@ panda-cable-finetune --help
 panda-cable-dynamicvla --help
 ```
 
+并行采集时，`--workers` 控制并行场景数，`--envs-per-scenario` 控制每个场景
+内部的独立 MuJoCo 环境数。采集器会实时显示 attempts/h、successes/h 和 ETA，并可用
+`--resume --run-name <名称>` 续跑中断任务。完整说明见
+[特权专家](docs/privileged_expert.md)。
+
 这些命令由 `pyproject.toml` 注册。Python 代码应直接从
 `panda_cable_grasp` 包导入；旧的根目录转发脚本和
 `rl.*`、`privileged_expert.*`、`dynamicvla_finetune.*` 兼容入口已退役。
