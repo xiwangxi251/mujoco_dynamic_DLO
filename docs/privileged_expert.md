@@ -1,7 +1,8 @@
 # Privileged formula expert
 
 This directory contains an experimental teacher policy for data collection.
-It does not replace or modify `dynamic_grasp_policy.py`.
+It does not replace or modify the scripted policy in
+`src/panda_cable_grasp/policies/scripted.py`.
 
 The expert deliberately reads privileged simulator state and the environment's
 motion equations. Rigid L1/L2 motion uses the analytic path directly. Shape and
@@ -16,7 +17,7 @@ evaluation time.
 Run a small four-scenario experiment from the repository root:
 
 ```powershell
-python -m privileged_expert.run_experiment --episodes 3 --workers 4
+panda-cable-expert-run --episodes 3 --workers 4
 ```
 
 Outputs are written under `outputs/benchmarks/privileged_formula_expert/`, which is
@@ -27,7 +28,7 @@ Collect successful training trajectories, automatically replacing failed
 seeds until each scenario reaches its requested count:
 
 ```powershell
-python -m privileged_expert.collect_dataset `
+panda-cable-expert-collect `
   --successes-per-scenario 20 `
   --max-attempts-per-scenario 200 `
   --workers 4

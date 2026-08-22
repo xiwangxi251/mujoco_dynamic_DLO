@@ -21,20 +21,20 @@
 ```bash
 cd /path/to/panda_cable_grasp
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install -e ".[dynamicvla]"
 ```
 
 Windows 的现有 conda 环境：
 
 ```powershell
 conda activate dynamic
-python -m pip install -r requirements.txt
+python -m pip install -e ".[dynamicvla]"
 ```
 
 先做不加载权重、不运行实验的桥接自检：
 
 ```bash
-python run_dynamicvla.py \
+panda-cable-dynamicvla \
   --scenario id_static \
   --instruction "Pick up the blue cable." \
   --check-only
@@ -72,7 +72,7 @@ Linux 若确实需要训练缓存，可先安装 `libmemcached-dev` 后保留该
 权重仍在下载时可只检查 config 和依赖，不会加载模型：
 
 ```bash
-python /path/to/panda_cable_grasp/scripts/check_dynamicvla_install.py \
+python /path/to/panda_cable_grasp/tools/installation/check_dynamicvla_install.py \
   --dynamicvla-root /path/to/DynamicVLA \
   --weights /path/to/DynamicVLA/ckt/dynamic-vla-DOM \
   --allow-incomplete-weights
@@ -82,7 +82,7 @@ Windows PowerShell 对应写法：
 
 ```powershell
 conda activate dynamicvla
-python C:\path\to\panda_cable_grasp\scripts\check_dynamicvla_install.py `
+python C:\path\to\panda_cable_grasp\tools\installation\check_dynamicvla_install.py `
   --dynamicvla-root C:\path\to\DynamicVLA `
   --weights C:\path\to\DynamicVLA\ckt\dynamic-vla-DOM `
   --allow-incomplete-weights
@@ -95,7 +95,7 @@ python C:\path\to\panda_cable_grasp\scripts\check_dynamicvla_install.py `
 ```bash
 conda activate dynamic
 cd /path/to/panda_cable_grasp
-python run_dynamicvla.py \
+panda-cable-dynamicvla \
   --scenario id_static --trials 3 --seed 20260804 \
   --instruction "Pick up the blue cable."
 ```

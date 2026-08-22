@@ -4,9 +4,9 @@ import unittest
 
 import numpy as np
 
-from rl.rl_cable_env import RLCableGraspEnv
-from rl.test_rl import resolve_scenario_names
-from rl.train_rl import RL_L1_SCENARIOS
+from panda_cable_grasp.rl.environment import RLCableGraspEnv
+from panda_cable_grasp.rl.evaluate import resolve_scenario_names
+from panda_cable_grasp.rl.train import RL_L1_SCENARIOS
 
 
 class RLTestScenarioSelectionTests(unittest.TestCase):

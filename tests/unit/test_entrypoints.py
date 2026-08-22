@@ -3,12 +3,8 @@ from __future__ import annotations
 from importlib import import_module
 import unittest
 
-from _bootstrap import bootstrap
-
-
 class EntrypointImportTests(unittest.TestCase):
     def test_all_command_modules_import(self) -> None:
-        bootstrap()
         modules = (
             "panda_cable_grasp.cli.run_grasp",
             "panda_cable_grasp.cli.run_dynamicvla",
@@ -19,6 +15,7 @@ class EntrypointImportTests(unittest.TestCase):
             "panda_cable_grasp.expert.collect_dataset",
             "panda_cable_grasp.expert.run_experiment",
             "panda_cable_grasp.dynamicvla.finetune.convert_dataset",
+            "panda_cable_grasp.dynamicvla.finetune.check_dataset",
             "panda_cable_grasp.dynamicvla.finetune.launch_finetune",
         )
         for module_name in modules:

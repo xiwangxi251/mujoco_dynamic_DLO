@@ -56,14 +56,8 @@ python -m pip install --upgrade pip wheel setuptools
 python -m pip install -e ".[rl,dynamicvla]"
 ```
 
-如果需要 PPO 训练和评估：
-
-```bash
-python -m pip install -r rl/requirements_rl.txt
-```
-
 有特定 CUDA/PyTorch 要求时，应先按服务器 CUDA 驱动安装对应的 PyTorch wheel，再执行
-RL requirements；后者不会替换已经满足版本要求的 PyTorch。
+editable install；已经满足版本要求的 PyTorch 不会被替换。
 
 ## 4. 配置无头渲染和输出目录
 
@@ -107,7 +101,7 @@ python -m tools.installation.check_install --no-render
 然后运行代码回归：
 
 ```bash
-python -m unittest discover -s tests -q
+python -m unittest discover -s tests -t . -q
 ```
 
 ## 6. 运行实验
@@ -115,13 +109,13 @@ python -m unittest discover -s tests -q
 单场景三回合，同时保存视频、state、MJB、CSV 和 manifest：
 
 ```bash
-bash run_demo.sh --scenario id_combined_l1_nominal --headless --trials 3
+panda-cable-grasp --scenario id_combined_l1_nominal --headless --trials 3
 ```
 
 指定输出盘和 20 个回合：
 
 ```bash
-python run_grasp.py \
+panda-cable-grasp \
   --scenario id_shape_nominal_current \
   --headless --trials 20 --seed 20260804 \
   --video-dir "$PANDA_CABLE_OUTPUT_ROOT/scripted"
@@ -140,7 +134,7 @@ scenarios=(
   id_combined_l2_nominal
 )
 for scenario in "${scenarios[@]}"; do
-  python run_grasp.py \
+  panda-cable-grasp \
     --scenario "$scenario" --headless --trials 20 --seed 20260804 \
     --run-name "$run_name"
 done
@@ -149,8 +143,8 @@ done
 RL 训练与测试：
 
 ```bash
-bash rl/run_rl_train.sh --help
-bash rl/run_rl_test.sh --help
+panda-cable-rl-train --help
+panda-cable-rl-eval --help
 ```
 
 ## 7. Slurm 示例
@@ -172,7 +166,7 @@ export PYOPENGL_PLATFORM=egl
 export MUJOCO_EGL_DEVICE_ID=0
 export PANDA_CABLE_OUTPUT_ROOT="${SLURM_TMPDIR:-/data/experiments}/panda_cable"
 
-python run_grasp.py \
+panda-cable-grasp \
   --scenario id_combined_l1_nominal \
   --headless --trials 20 --seed 20260804
 ```
@@ -193,4 +187,4 @@ python run_grasp.py \
 
 DynamicVLA 使用独立的 Python 3.10/PyTorch 环境，MuJoCo 环境不需要安装 Isaac Sim 或 Isaac Lab。
 完整的环境安装、无权重自检、双终端启动命令和输出说明见
-[`DYNAMICVLA_ZERO_SHOT.md`](DYNAMICVLA_ZERO_SHOT.md)。
+[`dynamicvla_zero_shot.md`](dynamicvla_zero_shot.md)。

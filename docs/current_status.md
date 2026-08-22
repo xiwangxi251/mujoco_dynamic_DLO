@@ -1,13 +1,14 @@
 # 当前状态
 
-更新日期：2026-08-21。
+更新日期：2026-08-22。
 
 ## 已完成
 
 - 项目改为 `src/panda_cable_grasp/` 包布局，按环境、策略、场景、RL、评估、专家和 DynamicVLA 分层。
 - MuJoCo XML 移至 `assets/mujoco/`，训练配置移至 `configs/`。
 - 所有生成结果统一迁移到 `outputs/`，原数据未删除，映射记录见 `outputs/migration_manifest.json`。
-- 根目录命令和历史 Python 导入保留兼容层。
+- 根目录旧命令和历史 Python 导入兼容层已退役，统一使用安装后的
+  `panda-cable-*` 命令或 `panda_cable_grasp.*` 包导入。
 - PPO 姿态奖励改为“夹爪闭合轴与局部绳子切向垂直”，只在接近可抓取线段时给予有效势能。
 - 有效抓取必须在双指夹持后实际抬升 30 mm 并稳定 0.10 s，才进入 secured 状态。
 - 对“捏住但不抬升”加入延迟且封顶的停滞惩罚；未承载夹持结束时加入事件惩罚，避免持续刷夹持奖励。
@@ -23,7 +24,7 @@
 ## 推荐下一次训练
 
 ```bash
-python -m rl.train_rl \
+panda-cable-rl-train \
   --workers 12 \
   --eval-workers 4 \
   --timesteps 2000000 \

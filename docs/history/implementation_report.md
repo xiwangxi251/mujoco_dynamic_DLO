@@ -1,7 +1,7 @@
 # MuJoCo 动态线缆与 Franka Panda 抓取演示实施报告
 
 > 本文按时间记录多个历史实现阶段，早期参数和结论不代表当前运行代码。当前目标、实际加载路径和最新参数以 `docs/current_status.md`、`README.md` 及代码为准。
-> 其中的 Windows 绝对路径与 `elasticity.dll` 是历史记录，不是当前运行要求；Linux 服务器安装见 `LINUX_SERVER_SETUP.md`。
+> 其中的 Windows 绝对路径与 `elasticity.dll` 是历史记录，不是当前运行要求；Linux 服务器安装见 [服务器部署](../server_setup.md)。
 
 ## 1. 项目概述
 

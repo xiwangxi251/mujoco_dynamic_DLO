@@ -4,8 +4,11 @@ import unittest
 
 import numpy as np
 
-from rl.rl_cable_env import RLCableGraspEnv
-from rl.train_rl import MotionCurriculumCallback, RL_L1_CURRICULUM_STAGES
+from panda_cable_grasp.rl.environment import RLCableGraspEnv
+from panda_cable_grasp.rl.train import (
+    MotionCurriculumCallback,
+    RL_L1_CURRICULUM_STAGES,
+)
 
 
 class RLBaselineContractTests(unittest.TestCase):
