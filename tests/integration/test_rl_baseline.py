@@ -27,7 +27,7 @@ class RLBaselineContractTests(unittest.TestCase):
         self.assertNotIn("target_body_id", self.env.OBSERVATION_NAMES)
         self.assertIn("nearest_graspable_distance", info)
 
-    def test_five_dimensional_action_uses_base_frame_ik_and_gripper_target(self) -> None:
+    def test_five_dimensional_action_uses_base_frame_ik_and_hysteretic_gripper(self) -> None:
         self.env.reset(seed=18)
         _, _, _, _, info = self.env.step(np.array([
             0.0, 0.0, 1.0, 0.4, -1.0,
@@ -41,15 +41,65 @@ class RLBaselineContractTests(unittest.TestCase):
             info["commanded_world_translation"], [0.0, 0.0, 0.01]
         )
 
-    def test_continuous_gripper_command_has_no_hysteretic_deadband(self) -> None:
+    def test_gripper_command_uses_hysteretic_deadband(self) -> None:
         self.env.reset(seed=24)
         low, high = self.env.model.actuator_ctrlrange[7]
         closed = self.env._convert_action(np.array([0, 0, 0, 0, -1.0]))[7]
-        middle = self.env._convert_action(np.array([0, 0, 0, 0, 0.0]))[7]
+        closed_deadband = self.env._convert_action(
+            np.array([0, 0, 0, 0, 0.0])
+        )[7]
         opened = self.env._convert_action(np.array([0, 0, 0, 0, 1.0]))[7]
+        open_deadband = self.env._convert_action(
+            np.array([0, 0, 0, 0, 0.0])
+        )[7]
         self.assertAlmostEqual(closed, low)
-        self.assertAlmostEqual(middle, 0.5 * (low + high))
+        self.assertAlmostEqual(closed_deadband, low)
         self.assertAlmostEqual(opened, high)
+        self.assertAlmostEqual(open_deadband, high)
+
+    def test_capture_zone_rewards_close_and_penalizes_staying_open(self) -> None:
+        self.env.reset(seed=28)
+        self.env._nearest_graspable_segment = lambda point: (
+            np.zeros(3), 0.01, np.array([1.0, 0.0, 0.0]), 5, 0.5
+        )
+        self.env._alignment_terms = lambda distance, tangent: (1.0, 1.0)
+        grasp_status = {
+            "pinch_confirmed": False,
+            "secured_grasp": False,
+            "grasp_lift_delta": 0.0,
+            "strict_success_hold": 0.0,
+        }
+
+        self.env._gripper_closed = False
+        self.env._gripper_switch_event = False
+        _, open_components = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        self.assertTrue(self.env._capture_ready)
+        self.assertLess(open_components["reward_capture_ready_open"], 0.0)
+
+        self.env._gripper_closed = True
+        self.env._gripper_switch_event = True
+        _, close_components = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        self.assertGreater(close_components["reward_capture_close"], 0.0)
+        self.assertTrue(self.env._capture_close_event)
+
+        _, repeated_components = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        self.assertEqual(repeated_components["reward_capture_close"], 0.0)
+
+        self.env._nearest_graspable_segment = lambda point: (
+            np.zeros(3), 0.10, np.array([1.0, 0.0, 0.0]), 5, 0.5
+        )
+        self.env._gripper_switch_event = False
+        _, premature_components = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        self.assertFalse(self.env._capture_ready)
+        self.assertLess(premature_components["reward_premature_close"], 0.0)
 
     def test_alignment_scores_planar_closing_axis_perpendicular_to_cable(self) -> None:
         identity = np.eye(3)

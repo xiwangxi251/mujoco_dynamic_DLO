@@ -21,7 +21,7 @@ alignment = |c_x t_y - c_y t_x|
 奖励按任务因果链组织：
 
 ```text
-接近 → 垂直对齐 → 双指 pinch → aligned pinch
+张爪接近 → 垂直对齐 → 进入捕获区闭爪 → 双指 pinch → aligned pinch
      → 实际承载抬升 → secured grasp → 严格保持成功
 ```
 
@@ -30,6 +30,10 @@ alignment = |c_x t_y - c_y t_x|
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
 | `aligned_pinch_threshold` | 0.90 | 首次夹持视为姿态正确的门槛 |
+| `gripper_close_threshold` / `gripper_open_threshold` | -0.35 / 0.35 | 带死区的闭爪/张爪迟滞阈值 |
+| `capture_ready_distance` | 0.04 m | 允许闭爪奖励的抓取中心距离门槛 |
+| `capture_ready_alignment` | 0.90 | 允许闭爪奖励的姿态门槛 |
+| `reward_capture_close` | 0.75 | 捕获区内首次闭爪事件奖励 |
 | `secured_lift_delta` | 0.03 m | 夹持段必须实际上升的距离 |
 | `secured_confirm_seconds` | 0.10 s | 承载状态确认时间 |
 | `reward_new_aligned_pinch` | 1.0 | 首次正确姿态夹持事件 |
@@ -38,6 +42,10 @@ alignment = |c_x t_y - c_y t_x|
 | `reward_success` | 25.0 | 严格成功事件 |
 
 抬升奖励使用 high-water mark，只奖励新的最高抬升高度，不能通过上下振荡反复刷分。
+
+夹爪恢复为迟滞开关，死区内保持上一次状态。捕获区内继续张开每步扣 0.002，
+尚未进入捕获区就闭爪每步扣 0.001；只有正确距离和姿态下的首次闭爪获得事件奖励。
+这同时排除了“全程张开接近”和“全程闭爪撞向线缆”两个局部最优。
 
 ## “捏住不抬”的惩罚
 
