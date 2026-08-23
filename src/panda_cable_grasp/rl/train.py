@@ -548,7 +548,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path,
-        default=output_path("rl", "train", "ppo_dlo_baseline_v4")
+        default=output_path("rl", "train", "ppo_dlo_baseline_v5")
     )
     parser.add_argument("--checkpoint-steps", type=int, default=100_000)
     parser.add_argument("--n-steps", type=int, default=1024,
@@ -954,7 +954,8 @@ def main() -> None:
         "rl_config": asdict(RLConfig()),
         "reward": (
             "pre-pinch nearest-segment reach progress + planar perpendicular "
-            "alignment potential progress + capture-zone close bonus/open penalty + "
+            "alignment potential progress + centered, pad-depth-qualified capture "
+            "close bonus + premature-close event/hold penalties + "
             "aligned-pinch bonus + capped unloaded-pinch penalties + episode-global "
             "lift high-water credit + strict success; "
             "post-secured active-open and physical-slip penalties remain causal"

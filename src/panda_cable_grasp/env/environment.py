@@ -387,9 +387,9 @@ class GraspState:
 
     body_id: int
     candidate_time: float
-    bilateral_confirmed: bool  # 双侧夹取确认（60 ms 的连续双侧夹持确）
-    last_bilateral_time: float # 上次双侧确认时间
-    lost_contact_time: float  # 连续失去双侧接触多时间
+    bilateral_confirmed: bool  
+    last_bilateral_time: float 
+    lost_contact_time: float  
 
 
 def id_of(model: mujoco.MjModel, obj: int, name: str) -> int:
@@ -398,16 +398,12 @@ def id_of(model: mujoco.MjModel, obj: int, name: str) -> int:
         raise RuntimeError(f"Missing {name!r} in model")
     return result
 
+# -------------------------------------------------------------------------
+# 环境
+# -------------------------------------------------------------------------
 class CableGraspEnv:
-    """具有独立线缆力场、提供 reset/step 接口的小型环境。
 
-    动作是8维向量:前7维为 Panda 关节位置执行器目标,第8维为夹爪命令。
-    255表示张开,较小数值表示闭合。
-    观测采用字典形式
-    """
-    # 夹爪指垫中心
     GRASP_CENTER_LOCAL = np.array([0.0, 0.0, 0.1029])
-    # 机器臂初始状态
     READY_ARM_QPOS = np.array([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, -0.7853])
 
     def __init__(self, config: EnvConfig | None = None):
@@ -641,8 +637,6 @@ class CableGraspEnv:
         self._dynamicvla_camera_frame_time: float | None = None
         self._dynamicvla_camera_frames: dict[str, np.ndarray] = {}
         self.reset()
-        # 上面的 reset 只用于让刚构造的对象拥有完整、可查询的初始物理状态，
-        # 不是调用方实际运行的 episode。首次显式 reset 应编号为 trial=1。
         self.trial_index = 0
 
     # -------------------------------------------------------------------------
@@ -661,8 +655,6 @@ class CableGraspEnv:
             self.rng = np.random.default_rng(seed)
             self.episode_seed = int(seed)
         else:
-            # 只有调用方明确给出的 seed 才能作为可复现实验元数据；连续训练
-            # 中的普通 reset 继续使用现有 Generator，但不能沿用上一轮的 seed 标签。
             self.episode_seed = None
 
         mujoco.mj_resetData(self.model, self.data)
@@ -696,7 +688,6 @@ class CableGraspEnv:
 
         if uses_curved_initial_shape:
             # 所有新实验场景共享随机弯曲初始分布；相同seed可配对比较。
-            # L1/L2另外固定从同一Y入口开始，并预检完整SE(2)扫掠范围。
             if uses_rigid_motion:
                 dy = RIGID_MOTION_START_Y - float(base_com_xy[1])
             self.initial_cable_translation[:] = [dx, dy]
@@ -885,10 +876,6 @@ class CableGraspEnv:
             requested_action[:7] - previous_position_target
         ) / control_dt
 
-        # Keep the requested multi-joint direction intact while limiting its
-        # change.  Independent component clipping can rotate a resolved-rate
-        # IK command substantially at phase changes (for example, turning a
-        # requested descent into an upward end-effector transient).
         if self.config.arm_acceleration_limit_enabled:
             velocity_delta = (
                 requested_velocity - self._previous_arm_command_velocity
