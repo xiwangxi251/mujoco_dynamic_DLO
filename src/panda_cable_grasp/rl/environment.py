@@ -40,6 +40,11 @@ class RLConfig:
     aligned_pinch_threshold: float = 0.90
     capture_ready_distance: float = 0.040
     capture_ready_alignment: float = 0.90
+    capture_longitudinal_tolerance: float = 0.012
+    capture_lateral_tolerance: float = 0.010
+    capture_pad_tip_offset: float = 0.0085
+    capture_min_insertion_depth: float = 0.0065
+    capture_max_insertion_depth: float = 0.0175
     secured_lift_delta: float = 0.03
     secured_confirm_seconds: float = 0.10
     secured_contact_loss_grace_seconds: float = 0.06
@@ -55,8 +60,9 @@ class RLConfig:
     reward_alignment_progress: float = 2.0
     reward_new_contact: float = 0.15
     reward_capture_close: float = 0.75
-    reward_capture_ready_open_step: float = -0.002
-    reward_premature_close_step: float = -0.001
+    reward_capture_ready_open_step: float = 0.0
+    reward_premature_close_event: float = -0.25
+    reward_premature_close_step: float = -0.003
     reward_new_pinch: float = 0.25
     reward_new_aligned_pinch: float = 1.0
     reward_new_secured_grasp: float = 4.0
@@ -78,7 +84,9 @@ class RLConfig:
             "cable_position_scale", "cable_velocity_scale",
             "translation_delta_scale", "yaw_delta_scale", "ik_damping",
             "alignment_distance_scale",
-            "capture_ready_distance",
+            "capture_ready_distance", "capture_longitudinal_tolerance",
+            "capture_lateral_tolerance", "capture_pad_tip_offset",
+            "capture_min_insertion_depth", "capture_max_insertion_depth",
             "secured_lift_delta", "pinch_minimum_lift",
             "pinch_stall_grace_seconds",
             "secured_confirm_seconds", "secured_contact_loss_grace_seconds",
@@ -92,6 +100,11 @@ class RLConfig:
             raise ValueError("aligned_pinch_threshold must be in [0, 1]")
         if not 0.0 <= self.capture_ready_alignment <= 1.0:
             raise ValueError("capture_ready_alignment must be in [0, 1]")
+        if self.capture_min_insertion_depth >= self.capture_max_insertion_depth:
+            raise ValueError(
+                "capture_min_insertion_depth must be less than "
+                "capture_max_insertion_depth"
+            )
         if not self.gripper_close_threshold < self.gripper_open_threshold:
             raise ValueError("gripper hysteresis thresholds must be increasing")
         if self.pinch_stall_step_penalty > 0.0:
@@ -99,7 +112,8 @@ class RLConfig:
         if self.failed_unloaded_pinch_penalty > 0.0:
             raise ValueError("failed_unloaded_pinch_penalty must be non-positive")
         for name in (
-            "reward_capture_ready_open_step", "reward_premature_close_step",
+            "reward_capture_ready_open_step", "reward_premature_close_event",
+            "reward_premature_close_step",
         ):
             if float(getattr(self, name)) > 0.0:
                 raise ValueError(f"{name} must be non-positive")
@@ -239,6 +253,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._ever_aligned_pinch = False
         self._alignment_score_at_first_pinch: float | None = None
         self._capture_ready = False
+        self._capture_local_offset = np.full(3, np.nan)
+        self._capture_insertion_depth = float("nan")
         self._capture_close_event = False
         self._capture_close_rewarded = False
         self._secured_rewarded = False
@@ -493,6 +509,35 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         distance_scale = self.rl_config.alignment_distance_scale
         proximity = float(np.exp(-np.square(distance / distance_scale)))
         return score, proximity * score
+
+    def _capture_corridor_terms(
+        self, cable_point: np.ndarray,
+    ) -> tuple[np.ndarray, float, bool]:
+        """Measure whether the cable centerline is inside the usable pad region.
+
+        Hand-local ``y`` is the finger closing axis and local ``z`` runs from
+        the finger roots towards the tips.  Distance and yaw alignment alone
+        cannot distinguish a cable at the fingertips from one seated between
+        the pads, so closure readiness also requires lateral centering and a
+        minimum insertion depth past the fingertip edge.
+        """
+        hand_rotation = self.data.xmat[self.base_env.hand_id].reshape(3, 3)
+        local_offset = (
+            np.asarray(cable_point, dtype=float) - self._grasp_center_position()
+        ) @ hand_rotation
+        insertion_depth = float(
+            self.rl_config.capture_pad_tip_offset - local_offset[2]
+        )
+        inside = bool(
+            abs(float(local_offset[0]))
+            <= self.rl_config.capture_longitudinal_tolerance
+            and abs(float(local_offset[1]))
+            <= self.rl_config.capture_lateral_tolerance
+            and self.rl_config.capture_min_insertion_depth
+            <= insertion_depth
+            <= self.rl_config.capture_max_insertion_depth
+        )
+        return local_offset, insertion_depth, inside
 
     def _convert_action(self, action: np.ndarray) -> np.ndarray:
         """Map a 5-D base-frame delta action to a velocity-safe joint target."""
@@ -852,8 +897,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         grasp_status: dict[str, float | bool],
     ) -> tuple[float, dict[str, float]]:
         """用事件和状态增量奖励任务进展，避免靠长期停留反复刷正奖励。"""
-        _, distance, tangent, segment_index, _ = self._nearest_graspable_segment(
-            self._grasp_center_position()
+        nearest_point, distance, tangent, segment_index, _ = (
+            self._nearest_graspable_segment(self._grasp_center_position())
         )
         pinch_confirmed = bool(grasp_status["pinch_confirmed"])
         pregrasp = not pinch_confirmed
@@ -876,10 +921,16 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._nearest_graspable_segment_index = segment_index
         self._alignment_score = alignment_score
         self._alignment_potential = alignment_potential
+        (
+            self._capture_local_offset,
+            self._capture_insertion_depth,
+            inside_capture_corridor,
+        ) = self._capture_corridor_terms(nearest_point)
         self._capture_ready = bool(
             pregrasp
             and distance <= self.rl_config.capture_ready_distance
             and alignment_score >= self.rl_config.capture_ready_alignment
+            and inside_capture_corridor
         )
         self._capture_close_event = bool(
             self._capture_ready
@@ -889,6 +940,12 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         self._capture_close_rewarded = bool(
             self._capture_close_rewarded or self._capture_close_event
+        )
+        premature_close = bool(
+            pregrasp and self._gripper_closed and not self._capture_ready
+        )
+        premature_close_event = bool(
+            premature_close and self._gripper_switch_event
         )
 
         pairs = self.base_env._finger_contact_pairs()
@@ -1002,9 +1059,13 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 self.rl_config.reward_capture_ready_open_step
                 * float(self._capture_ready and not self._gripper_closed)
             ),
+            "reward_premature_close_event": (
+                self.rl_config.reward_premature_close_event
+                * float(premature_close_event)
+            ),
             "reward_premature_close": (
                 self.rl_config.reward_premature_close_step
-                * float(pregrasp and not self._capture_ready and self._gripper_closed)
+                * float(premature_close)
             ),
             "reward_new_pinch": self.rl_config.reward_new_pinch * float(new_pinch),
             "reward_new_aligned_pinch": (
@@ -1087,6 +1148,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._ever_aligned_pinch = False
         self._alignment_score_at_first_pinch = None
         self._capture_ready = False
+        self._capture_local_offset = np.full(3, np.nan)
+        self._capture_insertion_depth = float("nan")
         self._capture_close_event = False
         self._capture_close_rewarded = False
         self._secured_rewarded = False
@@ -1124,13 +1187,18 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._post_pinch_world_z_action_count = 0
         self._last_commanded_world_translation = np.zeros(3)
         (
-            _, self._previous_distance, tangent,
+            nearest_point, self._previous_distance, tangent,
             self._nearest_graspable_segment_index, _,
         ) = self._nearest_graspable_segment(self._grasp_center_position())
         self._nearest_graspable_distance = self._previous_distance
         self._alignment_score, self._alignment_potential = self._alignment_terms(
             self._previous_distance, tangent
         )
+        (
+            self._capture_local_offset,
+            self._capture_insertion_depth,
+            _,
+        ) = self._capture_corridor_terms(nearest_point)
         self._previous_alignment_potential = self._alignment_potential
         return self._observation(), self._augment_info(info)
 
@@ -1238,6 +1306,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         result["gripper_closed"] = self._gripper_closed
         result["capture_ready"] = self._capture_ready
+        result["capture_local_x"] = float(self._capture_local_offset[0])
+        result["capture_local_y"] = float(self._capture_local_offset[1])
+        result["capture_local_z"] = float(self._capture_local_offset[2])
+        result["capture_insertion_depth"] = self._capture_insertion_depth
         result["capture_close_event"] = self._capture_close_event
         result["pinch_session_elapsed"] = self._pinch_session_elapsed
         result["pinch_session_lift_high_water"] = (

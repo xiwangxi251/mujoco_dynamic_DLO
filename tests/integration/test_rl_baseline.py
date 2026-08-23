@@ -57,10 +57,22 @@ class RLBaselineContractTests(unittest.TestCase):
         self.assertAlmostEqual(opened, high)
         self.assertAlmostEqual(open_deadband, high)
 
-    def test_capture_zone_rewards_close_and_penalizes_staying_open(self) -> None:
+    def test_capture_corridor_rewards_close_without_forcing_it_early(self) -> None:
         self.env.reset(seed=28)
+        hand_position = self.env._grasp_center_position()
+        hand_rotation = self.env.data.xmat[
+            self.env.base_env.hand_id
+        ].reshape(3, 3)
+
+        def world_from_hand(local: np.ndarray) -> np.ndarray:
+            return hand_position + hand_rotation @ local
+
         self.env._nearest_graspable_segment = lambda point: (
-            np.zeros(3), 0.01, np.array([1.0, 0.0, 0.0]), 5, 0.5
+            world_from_hand(np.zeros(3)),
+            0.0,
+            np.array([1.0, 0.0, 0.0]),
+            5,
+            0.5,
         )
         self.env._alignment_terms = lambda distance, tangent: (1.0, 1.0)
         grasp_status = {
@@ -76,7 +88,7 @@ class RLBaselineContractTests(unittest.TestCase):
             np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
         )
         self.assertTrue(self.env._capture_ready)
-        self.assertLess(open_components["reward_capture_ready_open"], 0.0)
+        self.assertEqual(open_components["reward_capture_ready_open"], 0.0)
 
         self.env._gripper_closed = True
         self.env._gripper_switch_event = True
@@ -91,15 +103,42 @@ class RLBaselineContractTests(unittest.TestCase):
         )
         self.assertEqual(repeated_components["reward_capture_close"], 0.0)
 
+        # This point is still close and aligned, but lies near the fingertip
+        # instead of being seated deeply enough between the pads.
+        shallow_point = world_from_hand(np.array([0.0, 0.0, 0.0075]))
         self.env._nearest_graspable_segment = lambda point: (
-            np.zeros(3), 0.10, np.array([1.0, 0.0, 0.0]), 5, 0.5
+            shallow_point, 0.0075, np.array([1.0, 0.0, 0.0]), 5, 0.5
         )
-        self.env._gripper_switch_event = False
+        self.env._gripper_switch_event = True
         _, premature_components = self.env._reward(
             np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
         )
         self.assertFalse(self.env._capture_ready)
+        self.assertLess(
+            premature_components["reward_premature_close_event"], 0.0
+        )
         self.assertLess(premature_components["reward_premature_close"], 0.0)
+
+    def test_capture_corridor_rejects_shallow_and_off_center_cable(self) -> None:
+        self.env.reset(seed=29)
+        hand_position = self.env._grasp_center_position()
+        hand_rotation = self.env.data.xmat[
+            self.env.base_env.hand_id
+        ].reshape(3, 3)
+
+        def terms(local: np.ndarray) -> tuple[np.ndarray, float, bool]:
+            return self.env._capture_corridor_terms(
+                hand_position + hand_rotation @ local
+            )
+
+        _, centered_depth, centered = terms(np.zeros(3))
+        _, shallow_depth, shallow = terms(np.array([0.0, 0.0, 0.0075]))
+        _, _, off_center = terms(np.array([0.0, 0.015, 0.0]))
+
+        self.assertTrue(centered)
+        self.assertFalse(shallow)
+        self.assertFalse(off_center)
+        self.assertGreater(centered_depth, shallow_depth)
 
     def test_alignment_scores_planar_closing_axis_perpendicular_to_cable(self) -> None:
         identity = np.eye(3)
