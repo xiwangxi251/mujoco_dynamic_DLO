@@ -47,15 +47,17 @@ def main() -> None:
     env = CableGraspEnv(EnvConfig(
         seed=1,
         episode_seconds=0.1,
-        camera_observation_enabled=not args.no_render,
+        dynamicvla_cameras_enabled=not args.no_render,
     ))
     try:
         observation, _ = env.reset(seed=1)
         observation, _, _, _, _ = env.step(env.ready_ctrl)
         print(f"model_bodies={env.model.nbody} model_geoms={env.model.ngeom}")
-        if "camera_rgb" in observation:
-            frame = observation["camera_rgb"]
-            print(f"camera_rgb={frame.shape} dtype={frame.dtype}")
+        if not args.no_render:
+            frames = env.dynamicvla_camera_rgb()
+            for name in ("opst_cam", "wrist_cam"):
+                frame = frames[name]
+                print(f"{name}={frame.shape} dtype={frame.dtype}")
         print("installation_check=OK")
     finally:
         env.close()

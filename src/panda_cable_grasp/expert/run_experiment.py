@@ -41,7 +41,6 @@ def run_episode(
         scenario,
         seed=seed,
         episode_seconds=episode_seconds,
-        camera_observation_enabled=False,
     ))
     try:
         _, initial_info = env.reset(seed=seed)

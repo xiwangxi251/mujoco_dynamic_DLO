@@ -548,7 +548,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path,
-        default=output_path("rl", "train", "ppo_dlo_baseline_v5")
+        default=output_path("rl", "train", "ppo_dlo_baseline_v6")
     )
     parser.add_argument("--checkpoint-steps", type=int, default=100_000)
     parser.add_argument("--n-steps", type=int, default=1024,

@@ -22,7 +22,6 @@ class FormulaInterceptExpertTests(unittest.TestCase):
             get_scenario(name),
             seed=seed,
             episode_seconds=0.1,
-            camera_observation_enabled=False,
         ))
 
     def test_config_rejects_invalid_search_parameters(self) -> None:

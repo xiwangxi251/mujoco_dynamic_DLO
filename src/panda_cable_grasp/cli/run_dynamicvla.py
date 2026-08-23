@@ -50,7 +50,6 @@ def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
         scenario_id=scenario.scenario_id,
         scenario_split=scenario.split.value,
         frame_skip=20,  # 25 Hz, matching DOM collection/evaluation.
-        camera_observation_enabled=False,
         dynamicvla_cameras_enabled=True,
         **scenario.to_env_overrides(),
     )
@@ -224,7 +223,7 @@ def run_server(args: argparse.Namespace) -> None:
                 flush=True,
             )
 
-            opst_video_path = scenario_dir / f"trial_{trial_index:03d}.mp4"
+            opst_video_path = scenario_dir / f"trial_{trial_index:03d}_opst.mp4"
             wrist_video_path = scenario_dir / f"trial_{trial_index:03d}_wrist.mp4"
             video_size = (
                 env.config.dynamicvla_camera_width,
@@ -369,7 +368,7 @@ def run_server(args: argparse.Namespace) -> None:
                 "model_action_received": model_action_messages > 0,
                 "position_clip_frames": int(np.count_nonzero(position_clipped)),
                 "quaternion_repair_frames": int(np.count_nonzero(quaternion_repaired)),
-                "video_path": str(opst_video_path.resolve()),
+                "opst_video_path": str(opst_video_path.resolve()),
                 "wrist_video_path": str(wrist_video_path.resolve()),
                 "states_path": str(states_path.resolve()),
                 "model_path": str(model_path.resolve()),
@@ -381,7 +380,7 @@ def run_server(args: argparse.Namespace) -> None:
                 f"model_actions={model_action_messages}",
                 flush=True,
             )
-            print(f"  video={opst_video_path.resolve()}", flush=True)
+            print(f"  opst_video={opst_video_path.resolve()}", flush=True)
             print(f"  wrist_video={wrist_video_path.resolve()}", flush=True)
             print(f"  states={states_path.resolve()}", flush=True)
 
@@ -416,7 +415,7 @@ def run_server(args: argparse.Namespace) -> None:
         _write_csv(episodes_path, rows)
         git_status = _git_text("status", "--porcelain=v1")
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "created_at": datetime.now().astimezone().isoformat(),
             "command": [sys.executable, *sys.argv],
             "method": "dynamicvla_zero_shot",
@@ -449,7 +448,7 @@ def run_server(args: argparse.Namespace) -> None:
             "artifacts": {
                 "model": {"path": str(model_path.resolve()), "sha256": _sha256(model_path)},
                 "episodes_csv": str(episodes_path.resolve()),
-                "videos": [row["video_path"] for row in rows],
+                "opst_videos": [row["opst_video_path"] for row in rows],
                 "wrist_videos": [row["wrist_video_path"] for row in rows],
                 "states": [row["states_path"] for row in rows],
             },

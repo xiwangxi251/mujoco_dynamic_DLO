@@ -22,3 +22,17 @@
 | `evaluation/` | 统一实验评测。批量跑测试、统计成功率、失败原因、不同运动场景下的结果。 |
 | `dynamicvla/` | DynamicVLA 相关代码。包括把 DynamicVLA 输出动作接到你当前环境，以及数据转换和微调相关功能。 |
 | `cli/` | 命令行入口层。负责解析你在终端输入的参数，再调用上面的环境、策略、RL、DynamicVLA 等模块。 |
+
+# 相机架构
+
+环境只有一套标准视觉传感器，由 `EnvConfig.dynamicvla_cameras_enabled` 在
+MuJoCo 模型编译前启用：
+
+- `dynamicvla_opst_camera` 固定在 Panda base/world，用作全局 opposite 视角；
+- `dynamicvla_wrist_camera` 挂在 `panda_hand`，随腕部运动。
+
+需要图像的代码统一调用 `CableGraspEnv.dynamicvla_camera_rgb()`，一次取得
+`opst_cam` 和 `wrist_cam`。普通环境观测和 RL 策略观测不隐式渲染图像；
+scripted、RL、专家数据与 DynamicVLA 的标准录像均保存 `*_opst.mp4` 和
+`*_wrist.mp4`。交互式 MuJoCo viewer 可以保留自由相机，但它不属于传感器、
+模型输入或标准录像 schema。

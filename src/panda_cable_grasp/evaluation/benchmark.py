@@ -85,7 +85,6 @@ def _legacy_config(seed: int, disturbance: float, seconds: float) -> EnvConfig:
         seed=seed,
         disturbance_strength=disturbance,
         episode_seconds=seconds,
-        camera_observation_enabled=False,
     )
 
 
@@ -102,7 +101,6 @@ def _scenario_config(
         scenario,
         seed=seed,
         episode_seconds=seconds,
-        camera_observation_enabled=False,
     )
 
 
