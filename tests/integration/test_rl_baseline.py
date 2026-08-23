@@ -88,7 +88,7 @@ class RLBaselineContractTests(unittest.TestCase):
             np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
         )
         self.assertTrue(self.env._capture_ready)
-        self.assertEqual(open_components["reward_capture_ready_open"], 0.0)
+        self.assertLess(open_components["reward_capture_ready_open"], 0.0)
 
         self.env._gripper_closed = True
         self.env._gripper_switch_event = True
@@ -118,6 +118,26 @@ class RLBaselineContractTests(unittest.TestCase):
             premature_components["reward_premature_close_event"], 0.0
         )
         self.assertLess(premature_components["reward_premature_close"], 0.0)
+
+        accumulated_event_penalty = premature_components[
+            "reward_premature_close_event"
+        ]
+        for _ in range(100):
+            _, capped_components = self.env._reward(
+                np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+            )
+            accumulated_event_penalty += capped_components[
+                "reward_premature_close_event"
+            ]
+        self.assertAlmostEqual(
+            accumulated_event_penalty,
+            -self.env.rl_config.premature_close_episode_penalty_cap,
+        )
+        self.assertAlmostEqual(
+            self.env._premature_close_penalty_total,
+            self.env.rl_config.premature_close_episode_penalty_cap,
+        )
+        self.assertEqual(capped_components["reward_premature_close_event"], 0.0)
 
     def test_capture_corridor_rejects_shallow_and_off_center_cable(self) -> None:
         self.env.reset(seed=29)

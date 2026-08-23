@@ -43,6 +43,7 @@ class TrainingMetricsCallback(BaseCallback):
         self._rollout_gripper_closed: list[float] = []
         self._rollout_capture_ready: list[float] = []
         self._rollout_capture_close_events: list[float] = []
+        self._rollout_premature_close_events: list[float] = []
 
     def _on_training_start(self) -> None:
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +114,9 @@ class TrainingMetricsCallback(BaseCallback):
             )
             self._rollout_capture_close_events.append(
                 float(bool(info.get("capture_close_event", False)))
+            )
+            self._rollout_premature_close_events.append(
+                float(bool(info.get("premature_close_event", False)))
             )
         for done, info in zip(dones, infos):
             if not done:
@@ -257,6 +261,11 @@ class TrainingMetricsCallback(BaseCallback):
                 "control/capture_close_event_fraction",
                 float(np.mean(self._rollout_capture_close_events)),
             )
+        if self._rollout_premature_close_events:
+            self.logger.record(
+                "control/premature_close_event_fraction",
+                float(np.mean(self._rollout_premature_close_events)),
+            )
         log_std = getattr(self.model.policy, "log_std", None)
         if log_std is not None:
             policy_std = np.exp(log_std.detach().cpu().numpy())
@@ -270,6 +279,7 @@ class TrainingMetricsCallback(BaseCallback):
         self._rollout_gripper_closed.clear()
         self._rollout_capture_ready.clear()
         self._rollout_capture_close_events.clear()
+        self._rollout_premature_close_events.clear()
 
     def _on_training_end(self) -> None:
         if self._file is not None:

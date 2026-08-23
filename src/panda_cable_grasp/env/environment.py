@@ -170,9 +170,7 @@ class EnvConfig:
     gripper_force_scale: float = 5.0    
     pad_friction: tuple[float, float, float] = (4.0, 0.10, 0.05)
 
-    # DynamicVLA opposite/wrist camera rig.  These are the only sensor cameras
-    # in the environment; diagnostic viewers may still use an interactive free
-    # camera without becoming part of the observation or recording schema.
+    # 相机配置
     dynamicvla_cameras_enabled: bool = False
     dynamicvla_opst_camera_name: str = "dynamicvla_opst_camera"
     dynamicvla_wrist_camera_name: str = "dynamicvla_wrist_camera"

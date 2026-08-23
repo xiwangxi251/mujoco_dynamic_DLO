@@ -60,9 +60,10 @@ class RLConfig:
     reward_alignment_progress: float = 2.0
     reward_new_contact: float = 0.15
     reward_capture_close: float = 0.75
-    reward_capture_ready_open_step: float = 0.0
-    reward_premature_close_event: float = -0.25
-    reward_premature_close_step: float = -0.003
+    reward_capture_ready_open_step: float = -0.001
+    reward_premature_close_event: float = -0.04
+    reward_premature_close_step: float = -0.001
+    premature_close_episode_penalty_cap: float = 0.50
     reward_new_pinch: float = 0.25
     reward_new_aligned_pinch: float = 1.0
     reward_new_secured_grasp: float = 4.0
@@ -120,6 +121,7 @@ class RLConfig:
         for name in (
             "pinch_stall_penalty_cap",
             "unloaded_pinch_episode_penalty_cap",
+            "premature_close_episode_penalty_cap",
         ):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be non-negative")
@@ -258,6 +260,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._capture_insertion_depth = float("nan")
         self._capture_close_event = False
         self._capture_close_rewarded = False
+        self._premature_close_event = False
+        self._premature_close_penalty_total = 0.0
         self._secured_rewarded = False
         self._lift_credit_high_water = 0.0
         self._cable_lift_credit_high_water = 0.0
@@ -945,9 +949,22 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         premature_close = bool(
             pregrasp and self._gripper_closed and not self._capture_ready
         )
-        premature_close_event = bool(
+        self._premature_close_event = bool(
             premature_close and self._gripper_switch_event
         )
+        premature_close_event_reward = 0.0
+        if self._premature_close_event:
+            remaining_penalty = max(
+                0.0,
+                self.rl_config.premature_close_episode_penalty_cap
+                - self._premature_close_penalty_total,
+            )
+            applied_penalty = min(
+                -self.rl_config.reward_premature_close_event,
+                remaining_penalty,
+            )
+            self._premature_close_penalty_total += applied_penalty
+            premature_close_event_reward = -applied_penalty
 
         pairs = self.base_env._finger_contact_pairs()
         contacting_fingers = len({finger for _, finger in pairs})
@@ -1060,10 +1077,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 self.rl_config.reward_capture_ready_open_step
                 * float(self._capture_ready and not self._gripper_closed)
             ),
-            "reward_premature_close_event": (
-                self.rl_config.reward_premature_close_event
-                * float(premature_close_event)
-            ),
+            "reward_premature_close_event": premature_close_event_reward,
             "reward_premature_close": (
                 self.rl_config.reward_premature_close_step
                 * float(premature_close)
@@ -1153,6 +1167,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._capture_insertion_depth = float("nan")
         self._capture_close_event = False
         self._capture_close_rewarded = False
+        self._premature_close_event = False
+        self._premature_close_penalty_total = 0.0
         self._secured_rewarded = False
         self._lift_credit_high_water = 0.0
         self._cable_lift_credit_high_water = float(np.clip(
@@ -1245,6 +1261,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         result["ik_velocity_scale"] = self._last_ik_velocity_scale
         result["gripper_switch_event"] = self._gripper_switch_event
         result["gripper_switch_count"] = self._gripper_switch_count
+        result["premature_close_event"] = self._premature_close_event
+        result["premature_close_penalty_total"] = (
+            self._premature_close_penalty_total
+        )
         result["commanded_world_translation"] = (
             self._last_commanded_world_translation.copy()
         )
