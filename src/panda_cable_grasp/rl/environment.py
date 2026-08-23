@@ -158,6 +158,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         seed: int = 20260804,
         disturbance_strength: float = 1.5,
         episode_seconds: float = 15.0,
+        dynamicvla_cameras_enabled: bool = False,
         env_config: EnvConfig | None = None,
         scenario_names: Sequence[str] | None = None,
         rl_config: RLConfig | None = None,
@@ -205,7 +206,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 scenario_name=first_scenario.name,
                 scenario_id=first_scenario.scenario_id,
                 scenario_split=first_scenario.split.value,
-                camera_observation_enabled=False,
+                dynamicvla_cameras_enabled=dynamicvla_cameras_enabled,
                 **first_overrides,
             )
         self.base_env = CableGraspEnv(
@@ -215,7 +216,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 seed=seed,
                 disturbance_strength=disturbance_strength,
                 episode_seconds=episode_seconds,
-                camera_observation_enabled=False,
+                dynamicvla_cameras_enabled=dynamicvla_cameras_enabled,
             )
         )
         # The wrapper converts task-space actions to joint targets, while the

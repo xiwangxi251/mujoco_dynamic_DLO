@@ -26,11 +26,10 @@ def parse_args() -> argparse.Namespace:
                         help="对应的model.mjb；默认读取状态文件旁的模型")
     parser.add_argument("--output", type=Path, default=None,
                         help="输出MP4；默认在状态文件旁生成*_rerender.mp4")
-    parser.add_argument("--azimuth", type=float, default=135.0)
-    parser.add_argument("--elevation", type=float, default=-25.0)
-    parser.add_argument("--distance", type=float, default=1.65)
-    parser.add_argument("--lookat", type=float, nargs=3, default=[0.55, 0.0, 0.30],
-                        metavar=("X", "Y", "Z"))
+    parser.add_argument(
+        "--camera", choices=("opst", "wrist"), default="opst",
+        help="使用模型中环境定义的 DynamicVLA 命名相机",
+    )
     parser.add_argument("--fps", type=float, default=None,
                         help="输出帧率；默认沿用记录帧率")
     parser.add_argument("--width", type=int, default=None,
@@ -56,7 +55,8 @@ def main(args: argparse.Namespace) -> None:
     if not model_path.is_file():
         raise FileNotFoundError(f"找不到对应的MuJoCo模型: {model_path}")
     output_path = args.output or args.states.with_name(
-        args.states.stem.removesuffix("_states") + "_rerender.mp4"
+        args.states.stem.removesuffix("_states")
+        + f"_{args.camera}_rerender.mp4"
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -67,6 +67,16 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("fps、width和height必须大于0")
 
     model = mujoco.MjModel.from_binary_path(str(model_path))
+    camera_name = (
+        "dynamicvla_opst_camera"
+        if args.camera == "opst"
+        else "dynamicvla_wrist_camera"
+    )
+    if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name) < 0:
+        raise ValueError(
+            f"模型不包含环境标准相机 {camera_name!r}; "
+            "旧录像请使用保存时附带的旧工具版本"
+        )
     expected_state_size = mujoco.mj_stateSize(model, state_spec)
     if states.ndim != 2 or states.shape[1] != expected_state_size:
         raise ValueError(
@@ -76,13 +86,6 @@ def main(args: argparse.Namespace) -> None:
     model.vis.global_.offheight = max(int(model.vis.global_.offheight), height)
     data = mujoco.MjData(model)
     renderer = mujoco.Renderer(model, height=height, width=width)
-
-    camera = mujoco.MjvCamera()
-    mujoco.mjv_defaultCamera(camera)
-    camera.lookat[:] = args.lookat
-    camera.distance = args.distance
-    camera.azimuth = args.azimuth
-    camera.elevation = args.elevation
 
     writer = cv2.VideoWriter(
         str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
@@ -94,7 +97,7 @@ def main(args: argparse.Namespace) -> None:
         for state in states:
             mujoco.mj_setState(model, data, state, state_spec)
             mujoco.mj_forward(model, data)
-            renderer.update_scene(data, camera=camera)
+            renderer.update_scene(data, camera=camera_name)
             rgb = renderer.render()
             writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
     finally:
@@ -103,9 +106,7 @@ def main(args: argparse.Namespace) -> None:
 
     print(
         f"rendered={output_path.resolve()} frames={len(states)} "
-        f"fps={fps:g} size={width}x{height} camera="
-        f"(azimuth={args.azimuth:g}, elevation={args.elevation:g}, "
-        f"distance={args.distance:g}, lookat={args.lookat})",
+        f"fps={fps:g} size={width}x{height} camera={camera_name}",
         flush=True,
     )
 

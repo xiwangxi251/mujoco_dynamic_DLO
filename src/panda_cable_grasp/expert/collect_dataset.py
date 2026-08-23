@@ -514,7 +514,6 @@ def _collect_scenario_worker(
         scenario,
         seed=args.seed,
         episode_seconds=args.episode_seconds,
-        camera_observation_enabled=False,
     )
     env = CableGraspEnv(replace(
         env_config,

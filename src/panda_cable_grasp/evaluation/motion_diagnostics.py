@@ -57,7 +57,6 @@ def env_config_for_scenario(
     *,
     seed: int,
     episode_seconds: float,
-    camera_observation_enabled: bool = True,
 ) -> EnvConfig:
     """把方法无关的场景协议转换成底层环境配置。"""
 
@@ -67,7 +66,6 @@ def env_config_for_scenario(
         scenario_name=scenario.name,
         scenario_id=scenario.scenario_id,
         scenario_split=scenario.split.value,
-        camera_observation_enabled=camera_observation_enabled,
         **scenario.to_env_overrides(),
     )
 
@@ -202,7 +200,6 @@ def diagnose_scenario(
         scenario,
         seed=seed,
         episode_seconds=seconds,
-        camera_observation_enabled=False,
     ))
     try:
         observation, initial_info = env.reset(seed=seed)

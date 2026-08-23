@@ -105,7 +105,6 @@ class EnvironmentScenarioTests(unittest.TestCase):
             scenario,
             seed=seed,
             episode_seconds=0.1,
-            camera_observation_enabled=False,
         ))
 
     def test_constructor_initialization_is_not_counted_as_a_trial(self) -> None:
@@ -121,37 +120,52 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_global_camera_is_fixed_and_returned_in_observation(self) -> None:
+    def test_dynamicvla_opst_camera_is_the_only_fixed_sensor_camera(self) -> None:
         defaults = EnvConfig()
-        self.assertEqual(defaults.global_camera_width, 480)
-        self.assertEqual(defaults.global_camera_height, 360)
-        self.assertEqual(defaults.global_camera_pos, (1.0, 0.0, 0.6))
+        self.assertEqual(defaults.dynamicvla_camera_width, 480)
+        self.assertEqual(defaults.dynamicvla_camera_height, 360)
+        self.assertEqual(defaults.dynamicvla_opst_camera_pos, (1.0, 0.0, 0.6))
         self.assertEqual(
-            defaults.global_camera_quat,
+            defaults.dynamicvla_opst_camera_quat,
             (0.6123724357, 0.3535533906, 0.3535533906, 0.6123724357),
         )
         config = EnvConfig(
             seed=12,
             episode_seconds=0.1,
-            global_camera_width=160,
-            global_camera_height=120,
+            dynamicvla_cameras_enabled=True,
+            dynamicvla_camera_width=160,
+            dynamicvla_camera_height=120,
         )
         env = CableGraspEnv(config)
         try:
             observation, _ = env.reset(seed=12)
-            self.assertEqual(int(env.model.cam_bodyid[env.global_camera_id]), 0)
-            camera_position = env.data.cam_xpos[env.global_camera_id].copy()
-            image = observation["camera_rgb"]
-            self.assertEqual(image.shape, (120, 160, 3))
-            self.assertEqual(image.dtype, np.uint8)
-            self.assertGreater(float(image.std()), 1.0)
-            image[:] = 0
-            self.assertGreater(float(env.camera_rgb().std()), 1.0)
+            self.assertNotIn("camera_rgb", observation)
+            self.assertEqual(
+                mujoco.mj_name2id(
+                    env.model, mujoco.mjtObj.mjOBJ_CAMERA, "global_camera"
+                ),
+                -1,
+            )
+            self.assertEqual(
+                int(env.model.cam_bodyid[env.dynamicvla_opst_camera_id]), 0
+            )
+            camera_position = env.data.cam_xpos[
+                env.dynamicvla_opst_camera_id
+            ].copy()
+            frames = env.dynamicvla_camera_rgb()
+            self.assertEqual(frames["opst_cam"].shape, (120, 160, 3))
+            self.assertEqual(frames["wrist_cam"].shape, (120, 160, 3))
+            self.assertEqual(frames["opst_cam"].dtype, np.uint8)
+            self.assertGreater(float(frames["opst_cam"].std()), 1.0)
+            frames["opst_cam"][:] = 0
+            self.assertGreater(
+                float(env.dynamicvla_camera_rgb()["opst_cam"].std()), 1.0
+            )
             next_observation, _, _, _, _ = env.step(env.ready_ctrl)
-            self.assertEqual(next_observation["camera_rgb"].shape, (120, 160, 3))
+            self.assertNotIn("camera_rgb", next_observation)
             self.assertGreater(next_observation["time"], observation["time"])
             self.assertTrue(np.array_equal(
-                env.data.cam_xpos[env.global_camera_id], camera_position
+                env.data.cam_xpos[env.dynamicvla_opst_camera_id], camera_position
             ))
         finally:
             env.close()
@@ -160,7 +174,6 @@ class EnvironmentScenarioTests(unittest.TestCase):
         env = CableGraspEnv(EnvConfig(
             seed=13,
             episode_seconds=0.1,
-            camera_observation_enabled=False,
             dynamicvla_cameras_enabled=True,
         ))
         try:
@@ -877,7 +890,6 @@ class EnvironmentScenarioTests(unittest.TestCase):
             legacy = CableGraspEnv(EnvConfig(
                 seed=46,
                 episode_seconds=0.1,
-                camera_observation_enabled=False,
             ))
             try:
                 observation, info = legacy.reset(seed=46)
@@ -1056,7 +1068,6 @@ class EnvironmentScenarioTests(unittest.TestCase):
         env = CableGraspEnv(EnvConfig(
             seed=71,
             episode_seconds=0.1,
-            camera_observation_enabled=False,
         ))
         try:
             env.reset(seed=71)

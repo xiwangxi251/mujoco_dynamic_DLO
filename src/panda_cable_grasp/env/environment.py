@@ -170,18 +170,9 @@ class EnvConfig:
     gripper_force_scale: float = 5.0    
     pad_friction: tuple[float, float, float] = (4.0, 0.10, 0.05)
 
-    # 固定全局相机参数
-    camera_observation_enabled: bool = True
-    global_camera_name: str = "global_camera"
-    global_camera_width: int = 480
-    global_camera_height: int = 360
-    global_camera_fovy: float = 73.7397952917
-    global_camera_pos: tuple[float, float, float] = (1.0, 0.0, 0.6)
-    global_camera_quat: tuple[float, float, float, float] = (
-        0.6123724357, 0.3535533906, 0.3535533906, 0.6123724357,
-    )
-
-    # DynamicVLA 专用相机
+    # DynamicVLA opposite/wrist camera rig.  These are the only sensor cameras
+    # in the environment; diagnostic viewers may still use an interactive free
+    # camera without becoming part of the observation or recording schema.
     dynamicvla_cameras_enabled: bool = False
     dynamicvla_opst_camera_name: str = "dynamicvla_opst_camera"
     dynamicvla_wrist_camera_name: str = "dynamicvla_wrist_camera"
@@ -283,28 +274,8 @@ class EnvConfig:
             )
         if self.frame_skip < 1:
             raise ValueError("frame_skip must be positive")
-        if not isinstance(self.camera_observation_enabled, bool):
-            raise ValueError("camera_observation_enabled must be boolean")
         if not isinstance(self.dynamicvla_cameras_enabled, bool):
             raise ValueError("dynamicvla_cameras_enabled must be boolean")
-        if not self.global_camera_name.strip():
-            raise ValueError("global_camera_name must be non-empty")
-        for name in ("global_camera_width", "global_camera_height"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        if not 0.0 < self.global_camera_fovy < 180.0:
-            raise ValueError("global_camera_fovy must be in (0, 180) degrees")
-        camera_pos = np.asarray(self.global_camera_pos, dtype=float)
-        camera_quat = np.asarray(self.global_camera_quat, dtype=float)
-        if camera_pos.shape != (3,) or not np.all(np.isfinite(camera_pos)):
-            raise ValueError("global_camera_pos must contain 3 finite values")
-        if (
-            camera_quat.shape != (4,)
-            or not np.all(np.isfinite(camera_quat))
-            or not math.isclose(float(np.linalg.norm(camera_quat)), 1.0, abs_tol=1e-6)
-        ):
-            raise ValueError("global_camera_quat must be a normalized quaternion")
         if self.dynamicvla_cameras_enabled:
             for name in (
                 "dynamicvla_opst_camera_name", "dynamicvla_wrist_camera_name",
@@ -410,12 +381,6 @@ class CableGraspEnv:
         self.config = config or EnvConfig()
         self.rng = np.random.default_rng(self.config.seed)
         self.model = self._load_model(self.config)
-        self.model.vis.global_.offwidth = max(
-            int(self.model.vis.global_.offwidth), self.config.global_camera_width
-        )
-        self.model.vis.global_.offheight = max(
-            int(self.model.vis.global_.offheight), self.config.global_camera_height
-        )
         if self.config.dynamicvla_cameras_enabled:
             self.model.vis.global_.offwidth = max(
                 int(self.model.vis.global_.offwidth),
@@ -442,9 +407,6 @@ class CableGraspEnv:
         self.arm_qpos_adr = self.model.jnt_qposadr[self.arm_joint_ids].copy()
         self.arm_dof_adr = self.model.jnt_dofadr[self.arm_joint_ids].copy()
         self.hand_id = id_of(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand")
-        self.global_camera_id = id_of(
-            self.model, mujoco.mjtObj.mjOBJ_CAMERA, self.config.global_camera_name
-        )
         self.dynamicvla_opst_camera_id: int | None = None
         self.dynamicvla_wrist_camera_id: int | None = None
         if self.config.dynamicvla_cameras_enabled:
@@ -630,9 +592,6 @@ class CableGraspEnv:
         self._max_abs_actual_arm_velocity = np.zeros(7)
         self._max_actual_hand_linear_speed = 0.0
         self._max_actual_hand_angular_speed = 0.0
-        self._camera_renderer: mujoco.Renderer | None = None
-        self._camera_frame_time: float | None = None
-        self._camera_frame: np.ndarray | None = None
         self._dynamicvla_camera_renderer: mujoco.Renderer | None = None
         self._dynamicvla_camera_frame_time: float | None = None
         self._dynamicvla_camera_frames: dict[str, np.ndarray] = {}
@@ -777,8 +736,6 @@ class CableGraspEnv:
         self._max_abs_actual_arm_velocity[:] = 0.0
         self._max_actual_hand_linear_speed = 0.0
         self._max_actual_hand_angular_speed = 0.0
-        self._camera_frame_time = None
-        self._camera_frame = None
         self._dynamicvla_camera_frame_time = None
         self._dynamicvla_camera_frames.clear()
         self.trial_index += 1
@@ -1076,31 +1033,13 @@ class CableGraspEnv:
     # 2. 对外观测与诊断接口
     # -------------------------------------------------------------------------
 
-    def camera_rgb(self) -> np.ndarray:
-        """返回固定全局RGB相机图像，形状为(H, W, 3)、类型为uint8。"""
-        if not self.config.camera_observation_enabled:
-            raise RuntimeError("camera observation is disabled for this environment")
-        current_time = float(self.data.time)
-        if self._camera_frame is None or self._camera_frame_time != current_time:
-            if self._camera_renderer is None:
-                self._camera_renderer = mujoco.Renderer(
-                    self.model,
-                    height=self.config.global_camera_height,
-                    width=self.config.global_camera_width,
-                )
-            self._camera_renderer.update_scene(
-                self.data, camera=self.config.global_camera_name
-            )
-            self._camera_frame = self._camera_renderer.render().copy()
-            self._camera_frame_time = current_time
-        return self._camera_frame.copy()
-
     def dynamicvla_camera_rgb(self) -> dict[str, np.ndarray]:
-        """Return the opposite/wrist RGB pair expected by DynamicVLA.
+        """Return the environment's standard opposite/wrist RGB pair.
 
-        Both arrays are uint8 ``(360, 480, 3)`` by default. The cameras only
-        exist when ``dynamicvla_cameras_enabled`` was selected before model
-        compilation and therefore cannot be enabled in the middle of a run.
+        The rig matches DynamicVLA and is shared by scripted, RL, expert and
+        DynamicVLA recordings. Both arrays are uint8 ``(360, 480, 3)`` by
+        default. The cameras only exist when ``dynamicvla_cameras_enabled`` was
+        selected before model compilation and cannot be enabled mid-run.
         """
 
         if not self.config.dynamicvla_cameras_enabled:
@@ -1133,7 +1072,7 @@ class CableGraspEnv:
         }
 
     def observation(self) -> dict:
-        observation = {
+        return {
             "time": float(self.data.time),
             "arm_qpos": self.data.qpos[self.arm_qpos_adr].copy(),
             "hand_position": self.hand_position.copy(),
@@ -1143,22 +1082,13 @@ class CableGraspEnv:
             "cable_positions": self.data.xpos[self.cable_ids].copy(),
             "grasped_body_id": None if self.grasp_state is None else self.grasp_state.body_id,
         }
-        if self.config.camera_observation_enabled:
-            observation["camera_rgb"] = self.camera_rgb()
-        return observation
 
     def close(self) -> None:
         """释放惰性创建的离屏相机渲染器。"""
-        renderer = getattr(self, "_camera_renderer", None)
-        if renderer is not None:
-            renderer.close()
-            self._camera_renderer = None
         dynamicvla_renderer = getattr(self, "_dynamicvla_camera_renderer", None)
         if dynamicvla_renderer is not None:
             dynamicvla_renderer.close()
             self._dynamicvla_camera_renderer = None
-        self._camera_frame = None
-        self._camera_frame_time = None
         self._dynamicvla_camera_frames = {}
         self._dynamicvla_camera_frame_time = None
 
@@ -2345,17 +2275,6 @@ class CableGraspEnv:
             if geom.name == "table_edge":
                 spec.delete(geom)
         spec.stat.extent = max(float(spec.stat.extent), 1.80)
-
-        # 相机挂在world body上，因此机械臂运动不会改变外参。编译前注入MjSpec，
-        # 确保保存出的.mjb、观测和视频使用同一个固定视觉传感器。
-        global_camera = spec.worldbody.add_camera()
-        global_camera.name = config.global_camera_name
-        global_camera.pos[:] = config.global_camera_pos
-        global_camera.quat[:] = config.global_camera_quat
-        global_camera.fovy = config.global_camera_fovy
-        global_camera.resolution[:] = (
-            config.global_camera_width, config.global_camera_height,
-        )
 
         if config.dynamicvla_cameras_enabled:
             # The yellow cable_marker is a scripted-policy debug aid, not part

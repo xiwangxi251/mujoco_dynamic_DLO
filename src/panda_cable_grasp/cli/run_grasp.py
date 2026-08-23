@@ -57,7 +57,7 @@ def run_headless(args: argparse.Namespace) -> None:
     import mujoco
     import numpy as np
 
-    from benchmark import (
+    from ..evaluation.benchmark import (
         _base_row,
         _distribution_version,
         _git_text,
@@ -92,53 +92,26 @@ def run_headless(args: argparse.Namespace) -> None:
         )
     video_dir.mkdir(parents=True)
 
-    # MuJoCo默认离屏 framebuffer 只有640x480；按请求尺寸自动扩展后再创建渲染器。
-    # 这只修改当前进程中的模型，不改变物理参数，也不要求用户手工编辑XML。
-    env.model.vis.global_.offwidth = max(
-        int(env.model.vis.global_.offwidth), args.video_width
-    )
-    env.model.vis.global_.offheight = max(
-        int(env.model.vis.global_.offheight), args.video_height
-    )
-    renderer = mujoco.Renderer(
-        env.model, height=args.video_height, width=args.video_width
-    )
-    wrist_renderer = mujoco.Renderer(
-        env.model,
-        height=env.config.dynamicvla_camera_height,
-        width=env.config.dynamicvla_camera_width,
-    )
     model_path = video_dir / f"{env.config.scenario_name}.mjb"
     mujoco.mj_saveModel(env.model, str(model_path), None)
     state_spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
     state_size = mujoco.mj_stateSize(env.model, state_spec)
-    camera = mujoco.MjvCamera()
-    mujoco.mjv_defaultCamera(camera)
-    camera.lookat[:] = [0.55, 0.0, 0.30]
-    camera.distance = 2.10
-    camera.azimuth = 135
-    camera.elevation = -25
-
     def write_frame(
-        writer: cv2.VideoWriter,
-        global_writer: cv2.VideoWriter,
+        opst_writer: cv2.VideoWriter,
         wrist_writer: cv2.VideoWriter,
         recorded_states: list[np.ndarray],
     ) -> None:
-        """同步保存物理状态、诊断总览画面和固定全局相机画面。"""
+        """同步保存物理状态和环境的 DynamicVLA 双相机画面。"""
         state = np.empty(state_size, dtype=np.float64)
         mujoco.mj_getState(env.model, env.data, state, state_spec)
         recorded_states.append(state)
-        renderer.update_scene(env.data, camera=camera)
-        rgb = renderer.render()
-        writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        global_rgb = env.camera_rgb()
-        global_writer.write(cv2.cvtColor(global_rgb, cv2.COLOR_RGB2BGR))
-        wrist_renderer.update_scene(
-            env.data, camera=env.config.dynamicvla_wrist_camera_name
+        frames = env.dynamicvla_camera_rgb()
+        opst_writer.write(
+            cv2.cvtColor(frames["opst_cam"], cv2.COLOR_RGB2BGR)
         )
-        wrist_rgb = wrist_renderer.render()
-        wrist_writer.write(cv2.cvtColor(wrist_rgb, cv2.COLOR_RGB2BGR))
+        wrist_writer.write(
+            cv2.cvtColor(frames["wrist_cam"], cv2.COLOR_RGB2BGR)
+        )
 
     print(f"model={XML_PATH}", flush=True)
     print(f"headless_run={run_dir.resolve()}", flush=True)
@@ -148,39 +121,24 @@ def run_headless(args: argparse.Namespace) -> None:
         _, initial_info = env.reset(seed=episode_seed)
         policy.reset()
         print_trial_start(env)
-        video_path = video_dir / f"trial_{env.trial_index:03d}.mp4"
-        global_video_path = (
-            video_dir / f"trial_{env.trial_index:03d}_global.mp4"
+        opst_video_path = (
+            video_dir / f"trial_{env.trial_index:03d}_opst.mp4"
         )
         wrist_video_path = (
             video_dir / f"trial_{env.trial_index:03d}_wrist.mp4"
         )
-        writer = cv2.VideoWriter(
-            str(video_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            args.video_fps,
-            (args.video_width, args.video_height),
-        )
-        if not writer.isOpened():
-            renderer.close()
-            wrist_renderer.close()
-            env.close()
-            raise RuntimeError(f"无法创建视频文件: {video_path}")
-        global_writer = cv2.VideoWriter(
-            str(global_video_path),
+        opst_writer = cv2.VideoWriter(
+            str(opst_video_path),
             cv2.VideoWriter_fourcc(*"mp4v"),
             args.video_fps,
             (
-                env.config.global_camera_width,
-                env.config.global_camera_height,
+                env.config.dynamicvla_camera_width,
+                env.config.dynamicvla_camera_height,
             ),
         )
-        if not global_writer.isOpened():
-            writer.release()
-            renderer.close()
-            wrist_renderer.close()
+        if not opst_writer.isOpened():
             env.close()
-            raise RuntimeError(f"无法创建固定全局相机视频文件: {global_video_path}")
+            raise RuntimeError(f"cannot create opposite-camera video: {opst_video_path}")
         wrist_writer = cv2.VideoWriter(
             str(wrist_video_path),
             cv2.VideoWriter_fourcc(*"mp4v"),
@@ -191,10 +149,7 @@ def run_headless(args: argparse.Namespace) -> None:
             ),
         )
         if not wrist_writer.isOpened():
-            writer.release()
-            global_writer.release()
-            renderer.close()
-            wrist_renderer.close()
+            opst_writer.release()
             env.close()
             raise RuntimeError(
                 f"cannot create wrist-camera video: {wrist_video_path}"
@@ -206,7 +161,7 @@ def run_headless(args: argparse.Namespace) -> None:
         steps = 0
         termination_reason: str | None = None
         # 保存重置后的初始画面；之后按仿真时间而不是计算耗时采样。
-        write_frame(writer, global_writer, wrist_writer, recorded_states)
+        write_frame(opst_writer, wrist_writer, recorded_states)
         next_frame_time += 1.0 / args.video_fps
         while not policy.finished and env.data.time < env.config.episode_seconds:
             # 标准交互循环：策略产生动作 -> 环境执行动作并推进物理。
@@ -220,7 +175,7 @@ def run_headless(args: argparse.Namespace) -> None:
                 )),
             )
             if env.data.time + 1e-9 >= next_frame_time:
-                write_frame(writer, global_writer, wrist_writer, recorded_states)
+                write_frame(opst_writer, wrist_writer, recorded_states)
                 next_frame_time += 1.0 / args.video_fps
             if policy.phase is not previous_phase:
                 tracking_error = ((env.hand_position - policy.last_desired) ** 2).sum() ** 0.5
@@ -242,8 +197,7 @@ def run_headless(args: argparse.Namespace) -> None:
                     else "failed_timeout"
                 )
                 policy.finished = True
-        writer.release()
-        global_writer.release()
+        opst_writer.release()
         wrist_writer.release()
         task_result = "success" if env.ever_success else policy.result
         states_path = video_dir / f"trial_{env.trial_index:03d}_states.npz"
@@ -253,15 +207,19 @@ def run_headless(args: argparse.Namespace) -> None:
             state_spec=np.int64(int(state_spec)),
             frame_times=np.asarray([state[0] for state in recorded_states]),
             fps=np.float64(args.video_fps),
-            width=np.int64(args.video_width),
-            height=np.int64(args.video_height),
-            global_camera_name=np.asarray(env.config.global_camera_name),
-            global_camera_width=np.int64(env.config.global_camera_width),
-            global_camera_height=np.int64(env.config.global_camera_height),
-            global_camera_fovy=np.float64(env.config.global_camera_fovy),
-            global_camera_pos=np.asarray(env.config.global_camera_pos),
-            global_camera_quat=np.asarray(env.config.global_camera_quat),
-            global_video_file=np.asarray(global_video_path.name),
+            width=np.int64(env.config.dynamicvla_camera_width),
+            height=np.int64(env.config.dynamicvla_camera_height),
+            opst_camera_name=np.asarray(env.config.dynamicvla_opst_camera_name),
+            opst_camera_width=np.int64(env.config.dynamicvla_camera_width),
+            opst_camera_height=np.int64(env.config.dynamicvla_camera_height),
+            opst_camera_fovy=np.float64(env.config.dynamicvla_camera_fovy),
+            opst_camera_pos_in_base=np.asarray(
+                env.config.dynamicvla_opst_camera_pos
+            ),
+            opst_camera_quat_in_base=np.asarray(
+                env.config.dynamicvla_opst_camera_quat
+            ),
+            opst_video_file=np.asarray(opst_video_path.name),
             wrist_camera_name=np.asarray(
                 env.config.dynamicvla_wrist_camera_name
             ),
@@ -308,8 +266,7 @@ def run_headless(args: argparse.Namespace) -> None:
             "policy_result": policy.result,
             "terminated": env.ever_success,
             "truncated": termination_reason is not None,
-            "video_path": str(video_path.resolve()),
-            "global_video_path": str(global_video_path.resolve()),
+            "opst_video_path": str(opst_video_path.resolve()),
             "wrist_video_path": str(wrist_video_path.resolve()),
             "states_path": str(states_path.resolve()),
             "model_path": str(model_path.resolve()),
@@ -317,13 +274,10 @@ def run_headless(args: argparse.Namespace) -> None:
         rows.append(row)
         successes += int(env.ever_success)
         print(policy.summary(), flush=True)
-        print(f"  video={video_path.resolve()}", flush=True)
-        print(f"  global_video={global_video_path.resolve()}", flush=True)
+        print(f"  opst_video={opst_video_path.resolve()}", flush=True)
         print(f"  wrist_video={wrist_video_path.resolve()}", flush=True)
         print(f"  states={states_path.resolve()}", flush=True)
 
-    renderer.close()
-    wrist_renderer.close()
     env.close()
     summary = _summary(rows)
     episodes_path = video_dir / "episodes.csv"
@@ -331,7 +285,7 @@ def run_headless(args: argparse.Namespace) -> None:
     _write_csv(episodes_path, rows)
     git_status = _git_text("status", "--porcelain=v1")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": datetime.now().astimezone().isoformat(),
         "command": [sys.executable, *sys.argv],
         "output": {
@@ -346,15 +300,15 @@ def run_headless(args: argparse.Namespace) -> None:
         "episode_seconds": args.episode_seconds,
         "video": {
             "fps": args.video_fps,
-            "width": args.video_width,
-            "height": args.video_height,
-            "global_camera": {
-                "name": env.config.global_camera_name,
-                "width": env.config.global_camera_width,
-                "height": env.config.global_camera_height,
-                "fovy": env.config.global_camera_fovy,
-                "pos_in_world": env.config.global_camera_pos,
-                "quat_in_world": env.config.global_camera_quat,
+            "width": env.config.dynamicvla_camera_width,
+            "height": env.config.dynamicvla_camera_height,
+            "opst_camera": {
+                "name": env.config.dynamicvla_opst_camera_name,
+                "width": env.config.dynamicvla_camera_width,
+                "height": env.config.dynamicvla_camera_height,
+                "fovy": env.config.dynamicvla_camera_fovy,
+                "pos_in_base": env.config.dynamicvla_opst_camera_pos,
+                "quat_in_base": env.config.dynamicvla_opst_camera_quat,
             },
             "wrist_camera": {
                 "name": env.config.dynamicvla_wrist_camera_name,
@@ -371,8 +325,7 @@ def run_headless(args: argparse.Namespace) -> None:
                 "sha256": _sha256(model_path),
             },
             "episodes_csv": str(episodes_path.resolve()),
-            "videos": [row["video_path"] for row in rows],
-            "global_videos": [row["global_video_path"] for row in rows],
+            "opst_videos": [row["opst_video_path"] for row in rows],
             "wrist_videos": [row["wrist_video_path"] for row in rows],
             "states": [row["states_path"] for row in rows],
         },
@@ -628,18 +581,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--video-fps", type=float, default=25.0,
                         help="headless视频帧率")
-    parser.add_argument("--video-width", type=int, default=960,
-                        help="headless视频宽度")
-    parser.add_argument("--video-height", type=int, default=540,
-                        help="headless视频高度")
     args = parser.parse_args()
     args.speed = min(8.0, max(0.25, args.speed))
     if args.headless and args.trials <= 0:
         parser.error("--headless requires --trials greater than zero")
     if args.video_fps <= 0.0:
         parser.error("--video-fps must be greater than zero")
-    if args.video_width <= 0 or args.video_height <= 0:
-        parser.error("--video-width and --video-height must be greater than zero")
     if args.run_name is not None:
         run_name_path = Path(args.run_name)
         if (

@@ -505,8 +505,31 @@ def _manifest(
         "recording": {
             "enabled": not args.no_video,
             "fps": args.video_fps if not args.no_video else None,
-            "width": args.video_width if not args.no_video else None,
-            "height": args.video_height if not args.no_video else None,
+            "width": (
+                env.base_env.config.dynamicvla_camera_width
+                if not args.no_video else None
+            ),
+            "height": (
+                env.base_env.config.dynamicvla_camera_height
+                if not args.no_video else None
+            ),
+            "camera_rig": "dynamicvla_opposite_and_wrist",
+            "opst_camera": {
+                "name": env.base_env.config.dynamicvla_opst_camera_name,
+                "pos_in_base": env.base_env.config.dynamicvla_opst_camera_pos,
+                "quat_wxyz_in_base": (
+                    env.base_env.config.dynamicvla_opst_camera_quat
+                ),
+                "fovy": env.base_env.config.dynamicvla_camera_fovy,
+            },
+            "wrist_camera": {
+                "name": env.base_env.config.dynamicvla_wrist_camera_name,
+                "pos_in_hand": env.base_env.config.dynamicvla_wrist_camera_pos,
+                "quat_wxyz_in_hand": (
+                    env.base_env.config.dynamicvla_wrist_camera_quat
+                ),
+                "fovy": env.base_env.config.dynamicvla_camera_fovy,
+            },
         },
         "policy_outcome_types": list(FAILURE_TYPES),
         "task_outcome_types": list(TASK_OUTCOME_TYPES),
@@ -723,6 +746,7 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         disturbance_strength=args.disturbance,
         episode_seconds=args.episode_seconds,
         scenario_names=args.scenario_names,
+        dynamicvla_cameras_enabled=True,
     )
 
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
@@ -737,8 +761,6 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
     manifest = _manifest(args, model, env, output_dir)
     _write_json(manifest_path, manifest)
 
-    renderer = None
-    camera = None
     state_spec = None
     state_size = None
     mjb_path: Path | None = None
@@ -753,26 +775,10 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
             import cv2
             import mujoco
 
-            env.model.vis.global_.offwidth = max(
-                int(env.model.vis.global_.offwidth), args.video_width
-            )
-            env.model.vis.global_.offheight = max(
-                int(env.model.vis.global_.offheight), args.video_height
-            )
-            renderer = mujoco.Renderer(
-                env.model, height=args.video_height, width=args.video_width
-            )
             mjb_path = output_dir / "model.mjb"
             mujoco.mj_saveModel(env.model, str(mjb_path), None)
             state_spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
             state_size = mujoco.mj_stateSize(env.model, state_spec)
-            camera = mujoco.MjvCamera()
-            mujoco.mjv_defaultCamera(camera)
-            camera.lookat[:] = [0.55, 0.0, 0.30]
-            camera.distance = 1.65
-            camera.azimuth = 135
-            camera.elevation = -25
-
         with csv_path.open("w", encoding="utf-8", newline="") as csv_stream:
             csv_writer = csv.DictWriter(csv_stream, fieldnames=EPISODE_FIELDS)
             csv_writer.writeheader()
@@ -790,7 +796,8 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                 terminated = False
                 truncated = False
 
-                video_path = output_dir / f"episode_{episode:03d}.mp4"
+                opst_video_path = output_dir / f"episode_{episode:03d}_opst.mp4"
+                wrist_video_path = output_dir / f"episode_{episode:03d}_wrist.mp4"
                 states_path = output_dir / f"episode_{episode:03d}_states.npz"
                 recorded_states: list[np.ndarray] = []
                 frame_times: list[float] = []
@@ -798,34 +805,47 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                 recorded_rewards: list[float] = []
                 action_times: list[float] = []
                 next_frame_time = 0.0
-                video_writer = None
+                opst_writer = None
+                wrist_writer = None
 
                 if not args.no_video:
-                    video_writer = cv2.VideoWriter(
-                        str(video_path),
-                        cv2.VideoWriter_fourcc(*"mp4v"),
-                        args.video_fps,
-                        (args.video_width, args.video_height),
+                    video_size = (
+                        env.base_env.config.dynamicvla_camera_width,
+                        env.base_env.config.dynamicvla_camera_height,
                     )
-                    if not video_writer.isOpened():
-                        video_writer.release()
-                        raise RuntimeError(f"无法创建视频文件: {video_path}")
+                    opst_writer = cv2.VideoWriter(
+                        str(opst_video_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                        args.video_fps, video_size,
+                    )
+                    wrist_writer = cv2.VideoWriter(
+                        str(wrist_video_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                        args.video_fps, video_size,
+                    )
+                    if not opst_writer.isOpened() or not wrist_writer.isOpened():
+                        opst_writer.release()
+                        wrist_writer.release()
+                        raise RuntimeError(
+                            "无法创建 DynamicVLA opposite/wrist 视频文件"
+                        )
 
                 def write_frame() -> None:
                     if args.no_video:
                         return
                     assert state_size is not None
                     assert state_spec is not None
-                    assert renderer is not None
-                    assert camera is not None
-                    assert video_writer is not None
+                    assert opst_writer is not None
+                    assert wrist_writer is not None
                     state = np.empty(state_size, dtype=np.float64)
                     mujoco.mj_getState(env.model, env.data, state, state_spec)
                     recorded_states.append(state)
                     frame_times.append(float(env.data.time))
-                    renderer.update_scene(env.data, camera=camera)
-                    rgb = renderer.render()
-                    video_writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                    frames = env.base_env.dynamicvla_camera_rgb()
+                    opst_writer.write(cv2.cvtColor(
+                        frames["opst_cam"], cv2.COLOR_RGB2BGR
+                    ))
+                    wrist_writer.write(cv2.cvtColor(
+                        frames["wrist_cam"], cv2.COLOR_RGB2BGR
+                    ))
 
                 if not args.no_video:
                     write_frame()
@@ -866,8 +886,10 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                     ):
                         write_frame()
                 finally:
-                    if video_writer is not None:
-                        video_writer.release()
+                    if opst_writer is not None:
+                        opst_writer.release()
+                    if wrist_writer is not None:
+                        wrist_writer.release()
 
                 success = bool(info.get("success", terminated))
                 failure_type = classify_failure(success, diagnostics)
@@ -935,8 +957,31 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                         state_spec=np.int64(int(state_spec)),
                         frame_times=np.asarray(frame_times, dtype=np.float64),
                         fps=np.float64(args.video_fps),
-                        width=np.int64(args.video_width),
-                        height=np.int64(args.video_height),
+                        width=np.int64(env.base_env.config.dynamicvla_camera_width),
+                        height=np.int64(env.base_env.config.dynamicvla_camera_height),
+                        opst_video_file=np.asarray(opst_video_path.name),
+                        wrist_video_file=np.asarray(wrist_video_path.name),
+                        opst_camera_name=np.asarray(
+                            env.base_env.config.dynamicvla_opst_camera_name
+                        ),
+                        wrist_camera_name=np.asarray(
+                            env.base_env.config.dynamicvla_wrist_camera_name
+                        ),
+                        camera_fovy=np.float64(
+                            env.base_env.config.dynamicvla_camera_fovy
+                        ),
+                        opst_camera_pos_in_base=np.asarray(
+                            env.base_env.config.dynamicvla_opst_camera_pos
+                        ),
+                        opst_camera_quat_in_base=np.asarray(
+                            env.base_env.config.dynamicvla_opst_camera_quat
+                        ),
+                        wrist_camera_pos_in_hand=np.asarray(
+                            env.base_env.config.dynamicvla_wrist_camera_pos
+                        ),
+                        wrist_camera_quat_in_hand=np.asarray(
+                            env.base_env.config.dynamicvla_wrist_camera_quat
+                        ),
                         model_file=np.asarray(mjb_path.name),
                         source_xml=np.asarray(str(XML_PATH.resolve())),
                         policy_file=np.asarray(str(args.model.resolve())),
@@ -958,7 +1003,8 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                     flush=True,
                 )
                 if not args.no_video:
-                    print(f"  video={video_path.resolve()}", flush=True)
+                    print(f"  opst_video={opst_video_path.resolve()}", flush=True)
+                    print(f"  wrist_video={wrist_video_path.resolve()}", flush=True)
                     print(f"  states={states_path.resolve()}", flush=True)
 
         successes = outcomes["success"]
@@ -1109,8 +1155,6 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         _write_json(manifest_path, manifest)
         raise
     finally:
-        if renderer is not None:
-            renderer.close()
         env.close()
 
 
@@ -1122,6 +1166,7 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         disturbance_strength=args.disturbance,
         episode_seconds=args.episode_seconds,
         scenario_names=args.scenario_names,
+        dynamicvla_cameras_enabled=True,
     )
     observation, info = env.reset(seed=args.seed)
     episode = 1
@@ -1224,19 +1269,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-video",
         action="store_true",
-        help="headless批量评估时跳过renderer、MP4和state录制，仅写CSV和manifest",
+        help="headless批量评估时跳过双相机MP4和state录制，仅写CSV和manifest",
     )
     parser.add_argument("--video-fps", type=float, default=25.0)
-    parser.add_argument("--video-width", type=int, default=960)
-    parser.add_argument("--video-height", type=int, default=540)
     args = parser.parse_args()
     args.speed = float(np.clip(args.speed, 0.25, 8.0))
     if args.episodes < 1:
         parser.error("--episodes must be at least 1")
     if args.video_fps <= 0.0:
         parser.error("--video-fps must be greater than zero")
-    if args.video_width <= 0 or args.video_height <= 0:
-        parser.error("--video-width and --video-height must be greater than zero")
     if args.scenario is not None:
         # A named scenario is the complete selection; do not leave the default
         # distribution in the manifest where it could be mistaken for sampling.
