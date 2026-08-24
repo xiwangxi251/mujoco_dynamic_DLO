@@ -31,6 +31,7 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 panda-cable-grasp = "panda_cable_grasp.cli.run_grasp:main"
 panda-cable-benchmark = "panda_cable_grasp.evaluation.benchmark:main"
+panda-cable-replay = "panda_cable_grasp.evaluation.replay:main"
 panda-cable-motion-diagnostics = "panda_cable_grasp.evaluation.motion_diagnostics:main"
 panda-cable-rl-train = "panda_cable_grasp.rl.train:main"
 panda-cable-rl-eval = "panda_cable_grasp.rl.evaluate:main"

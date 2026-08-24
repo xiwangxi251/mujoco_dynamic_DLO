@@ -741,7 +741,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             "strict_success_qualification": strict_qualification,
             "strict_success_hold": self._strict_success_hold,
             "rl_hold_success": rl_hold_success,
-            # 最终 strict_success 还会在 step() 中与底层 500 Hz 连续判定取交集。
+            # 最终 strict_success 还会在 step() 中与底层 500 Hz 当前判定取交集；
+            # 它只作为训练漏斗诊断，不再定义任务终止。
             "strict_success": rl_hold_success,
         }
         return self._last_grasp_status
@@ -1224,16 +1225,17 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         mujoco_action = self._convert_action(normalized_action)
         _, _, base_success, truncated, info = self.base_env.step(mujoco_action)
         grasp_status = self._update_grasp_status(info)
-        # RL 的原始双侧接触/secured进度在50 Hz动作边界检查，底层的高度、
-        # 整线离桌比例和中心距离连续性在500 Hz物理子步检查。当前两个0.80 s
-        # 窗口必须同时达标；使用非粘性的success_now，历史成功不能兜底。
-        success = bool(
+        # RL 的原始双侧接触/secured进度在50 Hz动作边界检查，作为训练漏斗
+        # 和过程奖励诊断。跨方法共享的底层任务成功是唯一终止条件与终点奖励
+        # 来源；PPO不能用额外条件改变任务定义。
+        strict_success = bool(
             grasp_status["rl_hold_success"]
             and info.get("success_now", False)
         )
-        grasp_status["strict_success"] = success
+        grasp_status["strict_success"] = strict_success
+        task_success = bool(base_success)
         reward, reward_components = self._reward(
-            normalized_action, success, info, grasp_status
+            normalized_action, task_success, info, grasp_status
         )
 
         self._episode_return += reward
@@ -1243,7 +1245,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         info["episode_return"] = self._episode_return
         info["episode_steps"] = self._episode_steps
         info["mujoco_action"] = mujoco_action.copy()
-        return self._observation(), reward, bool(success), bool(truncated), info
+        return self._observation(), reward, task_success, bool(truncated), info
 
     def _augment_info(self, info: dict, *, base_success: bool | None = None) -> dict:
         result = dict(info)
@@ -1354,7 +1356,12 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             if self._post_pinch_world_z_action_count
             else 0.0
         )
-        result["success"] = bool(self._last_grasp_status["strict_success"])
+        strict_success = bool(self._last_grasp_status["strict_success"])
+        task_success = bool(result["base_success"])
+        result["strict_success"] = strict_success
+        result["policy_internal_success"] = strict_success
+        result["task_success"] = task_success
+        result["success"] = task_success
         return result
 
     def set_disturbance_strength(self, strength: float) -> None:

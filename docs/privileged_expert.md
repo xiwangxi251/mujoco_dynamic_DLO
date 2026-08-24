@@ -1,18 +1,56 @@
 # Privileged formula expert
 
 This directory contains an experimental teacher policy for data collection.
-It does not replace or modify the scripted policy in
-`src/panda_cable_grasp/policies/scripted.py`.
+It does not change the scripted policy's default behavior.
 
 The expert deliberately reads privileged simulator state and the environment's
-motion equations. Rigid L1/L2 motion uses the analytic path directly. Shape and
-combined motion copy the current `MjData`, apply the environment's original
-force field in that copy, and roll MuJoCo forward. The cached shadow trajectory
+motion equations. Rigid L1/L2 motion uses the analytic path directly. Combined
+motion copies the current `MjData`, applies the environment's original force
+field in that copy, and rolls MuJoCo forward. The cached shadow trajectory
 therefore includes cable constraints, damping, and contact dynamics without
 advancing or modifying the live episode. Candidate cable segments and
-interception times are searched repeatedly until descent starts. A learned
-student must never receive this privileged rollout or the motion parameters at
+interception times are searched repeatedly until descent starts.
+
+For shape-only motion, the default teacher uses the scripted constant-velocity
+tracker. Paired ablations found that full shadow prediction reduced successful
+collection on this cell, so the expert uses privileged knowledge of the motion
+mode to select the stronger controller. The no-video experiment runner exposes
+`--no-shape-use-scripted-fallback` for continued ablations. A learned student
+must never receive the privileged rollout or the motion parameters at
 evaluation time.
+
+Rigid and combined episodes use a privileged controller portfolio. The teacher
+first runs the formula controller in an isolated same-seed environment. If that
+preview does not succeed, it previews the scripted controller and executes the
+stronger outcome in the live collection environment. Preview rollouts are not
+saved as demonstrations. Disable this ablation with
+`--no-dynamic-portfolio-enabled` in the no-video experiment runner.
+
+## Paired 4 x 10 results
+
+All rows below use 15-second episodes and exact scenario/seed pairing. The
+calibration seeds were used while developing the expert. The second block is a
+held-out, contiguous seed range that was evaluated only after the configuration
+was fixed.
+
+| Seed range | Policy | Static | Shape | Rigid | Combined | Overall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 20260804--20260813 | scripted | 10/10 | 7/10 | 1/10 | 2/10 | 20/40 (50.0%) |
+| 20260804--20260813 | portfolio expert | 10/10 | 7/10 | 3/10 | 5/10 | 25/40 (62.5%) |
+| 20260814--20260823 | scripted | 7/10 | 2/10 | 2/10 | 4/10 | 15/40 (37.5%) |
+| 20260814--20260823 | portfolio expert | 7/10 | 2/10 | 4/10 | 4/10 | 17/40 (42.5%) |
+
+On the held-out pairs there were two expert-only successes and no
+scripted-only successes. With only two discordant pairs, the exact two-sided
+McNemar p-value is 0.5; this is evidence of no observed regression on this
+small suite, not a claim of statistical significance. The saved expert result
+directories are `outputs/benchmarks/expert_portfolio_calibration_4x10/` and
+`outputs/benchmarks/expert_portfolio_holdout_4x10/`.
+
+The portfolio deliberately spends extra simulation compute to make a
+privileged data-collection decision. It is not a deployable policy and its
+preview state, selected-controller label, and outcome must not be exposed to a
+student at evaluation time.
 
 Run a small four-scenario experiment from the repository root:
 

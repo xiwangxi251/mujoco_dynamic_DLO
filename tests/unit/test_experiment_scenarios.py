@@ -124,7 +124,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         defaults = EnvConfig()
         self.assertEqual(defaults.dynamicvla_camera_width, 480)
         self.assertEqual(defaults.dynamicvla_camera_height, 360)
-        self.assertEqual(defaults.dynamicvla_opst_camera_pos, (1.0, 0.0, 0.6))
+        self.assertEqual(defaults.dynamicvla_opst_camera_pos, (1.3, 0.0, 0.6))
         self.assertEqual(
             defaults.dynamicvla_opst_camera_quat,
             (0.6123724357, 0.3535533906, 0.3535533906, 0.6123724357),

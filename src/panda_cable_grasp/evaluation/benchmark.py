@@ -1,11 +1,11 @@
-"""在冻结场景矩阵和相同 seed 上配对评估脚本基线与 PPO。"""
+"""在冻结场景和相同 seed 上统一评估 scripted、expert 与 PPO。"""
 
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
@@ -47,10 +47,13 @@ from .failure_taxonomy import (
     scene_fingerprint,
 )
 from .motion_diagnostics import env_config_for_scenario
+from .defaults import DEFAULT_EVALUATION_SEED, DEFAULT_VIDEO_FPS
+from .recording import EpisodeRecorder, create_unique_run_dir
 from ..paths import output_path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[3]
+_PPO_MODEL_CACHE: dict[tuple[str, str], Any] = {}
 
 
 def _distribution_version(name: str) -> str | None:
@@ -102,6 +105,14 @@ def _scenario_config(
         seed=seed,
         episode_seconds=seconds,
     )
+
+
+def _recordable_config(config: EnvConfig, enabled: bool) -> EnvConfig:
+    """Compile the standard camera rig whenever common artifacts are requested."""
+
+    if config.dynamicvla_cameras_enabled == enabled:
+        return config
+    return replace(config, dynamicvla_cameras_enabled=enabled)
 
 
 def _base_row(
@@ -222,7 +233,9 @@ def _base_row(
         "base_scene_fingerprint": base_scene_fingerprint(initial_info),
         "scene_fingerprint": scene_fingerprint(initial_info),
         "task_success": task_success,
-        "policy_internal_success": bool(info.get("success", False)),
+        "policy_internal_success": bool(
+            info.get("policy_internal_success", info.get("success", False))
+        ),
         "ever_pinched": bool(
             info.get("ever_pinched", info.get("grasped_body_id") is not None)
         ),
@@ -432,6 +445,154 @@ def _run_ppo(
     return rows
 
 
+def _cached_ppo_model(model_path: Path, device: str) -> Any:
+    """Load a PPO checkpoint once per worker process."""
+
+    key = (str(model_path.resolve()), device)
+    model = _PPO_MODEL_CACHE.get(key)
+    if model is None:
+        from stable_baselines3 import PPO
+
+        model = PPO.load(model_path, device=device)
+        _PPO_MODEL_CACHE[key] = model
+    return model
+
+
+def _episode_directory(
+    output_dir: Path,
+    method: str,
+    scenario_name: str,
+    seed: int,
+) -> Path:
+    return output_dir / "episodes" / method / scenario_name / f"seed_{seed}"
+
+
+def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
+    """Execute one isolated episode; safe as a ProcessPool worker target."""
+
+    method = str(job["method"])
+    episode = int(job["episode"])
+    seed = int(job["seed"])
+    scenario = job["scenario"]
+    recording = bool(job["recording"])
+    config = _scenario_config(
+        scenario,
+        seed=seed,
+        disturbance=float(job["disturbance"]),
+        seconds=float(job["episode_seconds"]),
+    )
+    config = _recordable_config(config, recording)
+
+    if method == "ppo":
+        from ..rl.environment import RLCableGraspEnv
+
+        env: Any = RLCableGraspEnv(env_config=config)
+        base_env = env.base_env
+        policy = _cached_ppo_model(Path(job["ppo_model"]), str(job["device"]))
+    else:
+        env = CableGraspEnv(config)
+        base_env = env
+        if method == "scripted":
+            policy = DynamicCableGraspPolicy(env)
+        elif method == "expert":
+            from ..expert.formula_intercept_policy import FormulaInterceptExpert
+
+            policy = FormulaInterceptExpert(env)
+        else:  # Defensive: argparse normally prevents this path.
+            raise ValueError(f"unsupported evaluation method: {method}")
+
+    recorder: EpisodeRecorder | None = None
+    try:
+        observation, initial_info = env.reset(seed=seed)
+        if method != "ppo":
+            policy.reset()
+        if recording:
+            recorder = EpisodeRecorder(
+                env,
+                _episode_directory(
+                    Path(job["output_dir"]), method,
+                    str(initial_info.get("scenario_name", config.scenario_name)), seed,
+                ),
+                video_fps=float(job["video_fps"]),
+            )
+            recorder.capture_initial()
+
+        episode_return = 0.0
+        steps = 0
+        min_target_distance = float(initial_info.get("target_distance", np.inf))
+        terminated = False
+        truncated = False
+        info = dict(initial_info)
+        while True:
+            if method == "ppo":
+                action, _ = policy.predict(observation, deterministic=True)
+            else:
+                if policy.finished:
+                    break
+                action = policy.action()
+            observation, reward, terminated, truncated, info = env.step(action)
+            episode_return += float(reward)
+            steps += 1
+            target_distance = info.get("target_distance")
+            if target_distance is None:
+                target_distance = np.linalg.norm(
+                    base_env.target_position() - base_env.hand_position
+                )
+            min_target_distance = min(min_target_distance, float(target_distance))
+            if recorder is not None:
+                recorder.record_step(action, reward, terminated, truncated, info)
+            if terminated or truncated:
+                break
+
+        if method != "ppo":
+            info = base_env.info()
+            info["ever_pinched"] = base_env.last_grasped_body_id is not None
+            info["base_success"] = base_env.ever_success
+            info["success"] = policy.result == "success"
+            terminated = bool(base_env.ever_success)
+            if truncated and policy.result is None:
+                reason = info.get("termination_reason")
+                policy.result = (
+                    "failed_motion_boundary"
+                    if reason == "rigid_motion_boundary_crossed"
+                    else "failed_timeout"
+                )
+            policy_result = policy.result
+        else:
+            policy_result = "success" if terminated else "truncated"
+
+        row = _base_row(
+            method, episode, seed, scenario, initial_info, info,
+            base_env.grasp_break_history,
+        )
+        row.update({
+            "steps": steps,
+            "sim_time": float(base_env.data.time),
+            "episode_return": episode_return,
+            "min_target_distance": min_target_distance,
+            "policy_result": policy_result,
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "compiled_model": str(job["compiled_model"]),
+        })
+        if recorder is not None:
+            artifacts = recorder.finish(row)
+            row.update(artifacts.relative_to(Path(job["output_dir"])))
+        else:
+            row.update({
+                "episode_dir": None,
+                "trajectory": None,
+                "metadata": None,
+                "global_video": None,
+                "wrist_video": None,
+            })
+        return row
+    finally:
+        if recorder is not None:
+            recorder.close()
+        env.close()
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     fields: list[str] = []
     for row in rows:
@@ -534,6 +695,8 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def _select_scenarios(args: argparse.Namespace) -> list[ScenarioConfig | None]:
     if args.scenario is not None:
         return [get_scenario(args.scenario)]
+    if args.scenarios is not None:
+        return [get_scenario(name) for name in args.scenarios]
     if args.suite is not None:
         return list(list_suite_scenarios(args.suite))
     return [None]
@@ -544,95 +707,161 @@ def parse_args() -> argparse.Namespace:
         description="Paired scenario-matrix benchmark for cable grasping"
     )
     parser.add_argument(
-        "--methods", nargs="+", choices=("scripted", "ppo"), default=("scripted",)
+        "--methods", nargs="+", choices=("scripted", "expert", "ppo"),
+        default=("scripted",)
     )
     parser.add_argument("--ppo-model", type=Path)
     parser.add_argument(
         "--episodes", type=int, default=20,
         help="paired repeats per scenario",
     )
-    parser.add_argument("--seed", type=int, default=20280804)
+    parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--disturbance", type=float, default=1.5)
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--scenario", choices=list_scenario_names())
+    selection.add_argument(
+        "--scenarios", nargs="+", choices=list_scenario_names(),
+        help="explicit list of scenarios to evaluate",
+    )
     selection.add_argument("--suite", choices=SCENARIO_SUITE_NAMES)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument(
-        "--workers", type=int, default=1,
-        help="parallel isolated environments (scripted method only)",
+        "--scenario-workers", type=int, default=1,
+        help="maximum number of scenario cells active at once",
     )
+    parser.add_argument(
+        "--envs-per-scenario", type=int, default=1,
+        help="maximum concurrent episode environments per active scenario",
+    )
+    parser.add_argument(
+        "--workers", type=int,
+        help="optional global worker cap (defaults to their product)",
+    )
+    parser.add_argument(
+        "--recording", action=argparse.BooleanOptionalAction, default=True,
+        help="write FULLPHYSICS trajectories and global/wrist videos",
+    )
+    parser.add_argument("--video-fps", type=float, default=DEFAULT_VIDEO_FPS)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output", type=Path, default=output_path("benchmarks"))
     args = parser.parse_args()
     args.methods = list(dict.fromkeys(args.methods))
-    if args.episodes < 1 or args.episode_seconds <= 0.0 or args.workers < 1:
-        parser.error("--episodes, --episode-seconds, and --workers must be positive")
+    positive = (
+        args.episodes >= 1
+        and args.episode_seconds > 0.0
+        and args.scenario_workers >= 1
+        and args.envs_per_scenario >= 1
+        and (args.workers is None or args.workers >= 1)
+        and args.video_fps > 0.0
+    )
+    if not positive:
+        parser.error("episode, duration, FPS, and worker counts must be positive")
     if args.disturbance < 0.0 or not math.isfinite(args.disturbance):
         parser.error("--disturbance must be finite and non-negative")
     if "ppo" in args.methods and args.ppo_model is None:
         parser.error("--ppo-model is required when evaluating PPO")
-    if args.workers > 1 and args.methods != ["scripted"]:
-        parser.error("--workers > 1 currently supports --methods scripted only")
     if args.ppo_model is not None and not args.ppo_model.is_file():
         parser.error(f"PPO model not found: {args.ppo_model}")
     return args
 
 
-def main() -> None:
-    args = parse_args()
+def run_benchmark(args: argparse.Namespace) -> Path:
+    """Run a benchmark from a validated argparse-compatible namespace."""
+
     scenarios = _select_scenarios(args)
     seeds = [args.seed + index for index in range(args.episodes)]
-    run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
-    output_dir = args.output / run_name
-    suffix = 1
-    while output_dir.exists():
-        output_dir = args.output / f"{run_name}_{suffix:02d}"
-        suffix += 1
-    output_dir.mkdir(parents=True)
+    requested_run_name = getattr(args, "run_name", None)
+    if requested_run_name is None:
+        output_dir = create_unique_run_dir(args.output)
+    else:
+        output_dir = Path(args.output) / requested_run_name
+        output_dir.mkdir(parents=True, exist_ok=False)
+
+    # Save the exact compiled model used by recorded FULLPHYSICS states before
+    # launching workers. Camera bodies are part of the model when recording.
+    models_dir = output_dir / "models"
+    models_dir.mkdir()
+    compiled_models: dict[str, Any] = {}
+    model_paths: dict[str, str] = {}
+    for scenario in scenarios:
+        config = _recordable_config(_scenario_config(
+            scenario, seed=args.seed, disturbance=args.disturbance,
+            seconds=args.episode_seconds,
+        ), args.recording)
+        model_env = CableGraspEnv(config)
+        scenario_name = config.scenario_name
+        model_path = models_dir / f"{scenario_name}.mjb"
+        mujoco.mj_saveModel(model_env.model, str(model_path), None)
+        model_env.close()
+        model_paths[scenario_name] = str(model_path.relative_to(output_dir))
+        compiled_models[scenario_name] = {
+            "path": str(model_path.resolve()),
+            "sha256": _sha256(model_path),
+        }
 
     rows: list[dict[str, Any]] = []
-    if args.workers > 1:
-        jobs = [
-            (episode, seed, scenario)
-            for scenario in scenarios
-            for episode, seed in enumerate(seeds, start=1)
+    total_jobs = len(scenarios) * len(seeds) * len(args.methods)
+    completed = 0
+    for batch_start in range(0, len(scenarios), args.scenario_workers):
+        scenario_batch = scenarios[
+            batch_start:batch_start + args.scenario_workers
         ]
-        with ThreadPoolExecutor(max_workers=args.workers) as executor:
-            pending = {
-                executor.submit(
-                    _run_scripted_episode,
-                    episode,
-                    seed,
-                    scenario,
-                    args.disturbance,
-                    args.episode_seconds,
-                ): (scenario, episode)
-                for episode, seed, scenario in jobs
-            }
-            completed = 0
-            for future in as_completed(pending):
-                rows.append(future.result())
+        per_scenario: list[list[dict[str, Any]]] = []
+        for scenario in scenario_batch:
+            config = _scenario_config(
+                scenario, seed=args.seed, disturbance=args.disturbance,
+                seconds=args.episode_seconds,
+            )
+            model_path = model_paths[config.scenario_name]
+            per_scenario.append([
+                {
+                    "method": method,
+                    "episode": episode,
+                    "seed": seed,
+                    "scenario": scenario,
+                    "disturbance": args.disturbance,
+                    "episode_seconds": args.episode_seconds,
+                    "ppo_model": args.ppo_model,
+                    "device": args.device,
+                    "recording": args.recording,
+                    "video_fps": args.video_fps,
+                    "output_dir": output_dir,
+                    "compiled_model": model_path,
+                }
+                for episode, seed in enumerate(seeds, start=1)
+                for method in args.methods
+            ])
+        # Round-robin ordering prevents one scenario from monopolizing all
+        # process slots and realizes the per-scenario concurrency limit.
+        jobs = [
+            scenario_jobs[index]
+            for index in range(max(map(len, per_scenario)))
+            for scenario_jobs in per_scenario
+            if index < len(scenario_jobs)
+        ]
+        worker_limit = len(scenario_batch) * args.envs_per_scenario
+        if args.workers is not None:
+            worker_limit = min(worker_limit, args.workers)
+        worker_limit = min(worker_limit, len(jobs))
+        if worker_limit == 1:
+            for job in jobs:
+                rows.append(_run_policy_episode(job))
                 completed += 1
-                if completed % args.workers == 0 or completed == len(jobs):
+                print(f"completed_episodes={completed}/{total_jobs}", flush=True)
+        else:
+            with ProcessPoolExecutor(max_workers=worker_limit) as executor:
+                pending = {
+                    executor.submit(_run_policy_episode, job): job for job in jobs
+                }
+                for future in as_completed(pending):
+                    rows.append(future.result())
+                    completed += 1
                     print(
-                        f"completed_episodes={completed}/{len(jobs)}",
-                        flush=True,
+                        f"completed_episodes={completed}/{total_jobs}", flush=True,
                     )
-        rows.sort(key=lambda row: (
-            str(row["scenario_name"]), int(row["episode"]), str(row["method"])
-        ))
-    else:
-        for scenario in scenarios:
-            for method in args.methods:
-                if method == "scripted":
-                    rows.extend(_run_scripted(
-                        seeds, scenario, args.disturbance, args.episode_seconds,
-                    ))
-                else:
-                    rows.extend(_run_ppo(
-                        seeds, scenario, args.disturbance, args.episode_seconds,
-                        args.ppo_model, args.device,
-                    ))
+    rows.sort(key=lambda row: (
+        str(row["scenario_name"]), int(row["episode"]), str(row["method"])
+    ))
 
     fingerprints: dict[str, set[str]] = {}
     methods: dict[str, list[str]] = {}
@@ -659,27 +888,9 @@ def main() -> None:
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    models_dir = output_dir / "models"
-    models_dir.mkdir()
-    compiled_models: dict[str, Any] = {}
-    for scenario in scenarios:
-        config = _scenario_config(
-            scenario, seed=args.seed, disturbance=args.disturbance,
-            seconds=args.episode_seconds,
-        )
-        model_env = CableGraspEnv(config)
-        scenario_name = config.scenario_name
-        model_path = models_dir / f"{scenario_name}.mjb"
-        mujoco.mj_saveModel(model_env.model, str(model_path), None)
-        compiled_models[scenario_name] = {
-            "path": str(model_path.resolve()),
-            "sha256": _sha256(model_path),
-        }
-        del model_env
-
     git_status = _git_text("status", "--porcelain=v1")
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "command": [sys.executable, *sys.argv],
         "arguments": {
@@ -697,6 +908,20 @@ def main() -> None:
         ],
         "seeds_per_scenario": seeds,
         "episode_seconds": args.episode_seconds,
+        "recording": {
+            "enabled": args.recording,
+            "schema_version": 1,
+            "state_format": "mujoco_mjSTATE_FULLPHYSICS",
+            "state_sampling": "initial_and_after_every_control_step",
+            "video_fps": args.video_fps,
+            "cameras": ["opst_cam", "wrist_cam"],
+        },
+        "parallelism": {
+            "scenario_workers": args.scenario_workers,
+            "envs_per_scenario": args.envs_per_scenario,
+            "global_worker_cap": args.workers,
+            "backend": "process",
+        },
         "ppo_model": None if args.ppo_model is None else str(args.ppo_model.resolve()),
         "ppo_model_sha256": _sha256(args.ppo_model),
         "source_xml": str(XML_PATH.resolve()),
@@ -709,12 +934,13 @@ def main() -> None:
             name: {"path": str(path.resolve()), "sha256": _sha256(path)}
             for name, path in {
                 "benchmark": Path(__file__),
-            "base_environment": ROOT / "src" / "panda_cable_grasp" / "env" / "environment.py",
-            "scenario_registry": ROOT / "src" / "panda_cable_grasp" / "scenarios" / "registry.py",
-                "motion_diagnostics": ROOT / "motion_diagnostics.py",
-            "scripted_policy": ROOT / "src" / "panda_cable_grasp" / "policies" / "scripted.py",
-                "failure_taxonomy": ROOT / "failure_taxonomy.py",
-            "rl_environment": ROOT / "src" / "panda_cable_grasp" / "rl" / "environment.py",
+                "recording": ROOT / "src" / "panda_cable_grasp" / "evaluation" / "recording.py",
+                "base_environment": ROOT / "src" / "panda_cable_grasp" / "env" / "environment.py",
+                "scenario_registry": ROOT / "src" / "panda_cable_grasp" / "scenarios" / "registry.py",
+                "motion_diagnostics": ROOT / "src" / "panda_cable_grasp" / "evaluation" / "motion_diagnostics.py",
+                "scripted_policy": ROOT / "src" / "panda_cable_grasp" / "policies" / "scripted.py",
+                "failure_taxonomy": ROOT / "src" / "panda_cable_grasp" / "evaluation" / "failure_taxonomy.py",
+                "rl_environment": ROOT / "src" / "panda_cable_grasp" / "rl" / "environment.py",
             }.items()
         },
         "configs": {"scripted_policy": asdict(PolicyConfig())},
@@ -737,16 +963,26 @@ def main() -> None:
     if "ppo" in args.methods:
         from ..rl.environment import RLConfig
         manifest["configs"]["rl"] = asdict(RLConfig())
+    if "expert" in args.methods:
+        from ..expert.formula_intercept_policy import FormulaInterceptConfig
+        manifest["configs"]["expert"] = asdict(FormulaInterceptConfig())
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     print(f"benchmark_output={output_dir.resolve()}", flush=True)
+    return output_dir
+
+
+def main() -> None:
+    run_benchmark(parse_args())
 
 
 # Public experiment helpers shared by benchmark and expert collectors.  The
 # underscored names remain internal aliases for compatibility with old runs.
 git_text = _git_text
+distribution_version = _distribution_version
+sha256_file = _sha256
 base_row = _base_row
 write_csv = _write_csv
 summarize = _summary

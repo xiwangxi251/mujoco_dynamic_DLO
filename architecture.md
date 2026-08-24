@@ -23,6 +23,17 @@
 | `dynamicvla/` | DynamicVLA 相关代码。包括把 DynamicVLA 输出动作接到你当前环境，以及数据转换和微调相关功能。 |
 | `cli/` | 命令行入口层。负责解析你在终端输入的参数，再调用上面的环境、策略、RL、DynamicVLA 等模块。 |
 
+# 仿真评测架构
+
+正式的动作成功率评测统一由 `evaluation/benchmark.py` 调度。scripted、expert 和 PPO
+只实现策略适配，场景选择、seed、公共成功条件、episode 汇总、双视角录像和完整状态记录均走同一条路径。
+`cli/run_grasp.py` 的 headless 模式是该入口的兼容包装；GUI、运动诊断、RL 训练诊断和专家数据采集不再作为平行的成功率评测实现。
+
+`evaluation/recording.py` 定义统一 episode schema，`evaluation/replay.py` 负责用保存的
+`.mjb` 和 `mjSTATE_FULLPHYSICS` 校验或回放。两级进程调度由 benchmark 管理：
+`scenario_workers` 限制同时活跃的场景数，`envs_per_scenario` 限制单场景并行回合数。
+详细命令和输出目录见 [`docs/evaluation.md`](docs/evaluation.md)。
+
 # 相机架构
 
 环境只有一套标准视觉传感器，由 `EnvConfig.dynamicvla_cameras_enabled` 在
@@ -33,6 +44,6 @@ MuJoCo 模型编译前启用：
 
 需要图像的代码统一调用 `CableGraspEnv.dynamicvla_camera_rgb()`，一次取得
 `opst_cam` 和 `wrist_cam`。普通环境观测和 RL 策略观测不隐式渲染图像；
-scripted、RL、专家数据与 DynamicVLA 的标准录像均保存 `*_opst.mp4` 和
-`*_wrist.mp4`。交互式 MuJoCo viewer 可以保留自由相机，但它不属于传感器、
+正式评测的标准录像均保存为每个 episode 的 `global.mp4` 和 `wrist.mp4`；专家数据采集器
+可按数据集 schema 使用自己的文件名。交互式 MuJoCo viewer 可以保留自由相机，但它不属于传感器、
 模型输入或标准录像 schema。

@@ -418,6 +418,11 @@ class DynamicCableGraspPolicy:
         self.recover_goal = hand + np.array([0.0, 0.0, 0.18])
         self._transition(Phase.RECOVER)
 
+    def _close_capture_distance(self) -> float:
+        """Distance at which descent transitions to gripper closure."""
+
+        return self.config.close_capture_distance
+
     def action(self) -> np.ndarray:
         """推进反应式状态机，并返回一个控制周期的动作。"""
         # 无论处于哪个阶段，策略只读取环境状态并返回动作，不直接修改线缆物理。
@@ -478,7 +483,7 @@ class DynamicCableGraspPolicy:
             nearest, nearest_distance, _, _ = self._nearest_cable_point(hand)
             # 截获期间持续追踪进入该阶段时锁定的材料线段，避免在相邻弯折间
             # 跳变；但闭爪触发仍以任意真实线缆中心线进入夹持区域为准。
-            if nearest_distance < self.config.close_capture_distance:
+            if nearest_distance < self._close_capture_distance():
                 desired = self._lock_segment_near(nearest)
                 self.filtered_target = desired.copy()
                 self._transition(Phase.CLOSE)
