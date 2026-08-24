@@ -498,21 +498,35 @@ class DynamicCableGraspPolicy:
             # 闭爪时继续追踪已经进入夹持中心的局部线段；真实接触存在时延长确认窗口，
             # 避免固定0.8秒超时在夹爪仍夹着线缆时主动张开。
             desired = target.copy()
-            if self.env.finger_contacts():
+            close_contacts = self.env.finger_contacts()
+            if close_contacts:
                 self.last_close_contact_time = float(self.env.data.time)
             if self.env.grasp_confirmed:
                 self._lock_segment_near(hand)
                 self.lift_start = hand.copy()
                 self.lift_goal = hand + np.array([0.0, 0.0, self.config.lift_distance])
                 self._transition(Phase.LIFT)
-            elif (
-                self.phase_time > self.config.close_hard_timeout
-                or (
-                    self.phase_time > self.config.close_timeout
-                    and self.env.data.time - self.last_close_contact_time
-                    > self.config.close_contact_grace
+            else:
+                # Never actively open while the simulator still reports pad
+                # contact or an in-progress grasp candidate.  Previously the
+                # unconditional hard timeout overrode this evidence at 3 s,
+                # producing the visible "grasp, open, lift away" failure.
+                contact_evidence = bool(
+                    close_contacts or self.env.grasp_state is not None
                 )
-            ):
+                close_timed_out = (
+                    (
+                        self.phase_time > self.config.close_hard_timeout
+                        and not contact_evidence
+                    )
+                    or (
+                        self.phase_time > self.config.close_timeout
+                        and self.env.data.time - self.last_close_contact_time
+                        > self.config.close_contact_grace
+                        and not contact_evidence
+                    )
+                )
+            if not self.env.grasp_confirmed and close_timed_out:
                 if self.retry_count < self.config.max_retries:
                     self.retry_count += 1
                     self._begin_vertical_recovery(hand)

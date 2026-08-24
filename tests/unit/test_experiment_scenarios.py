@@ -455,6 +455,44 @@ class EnvironmentScenarioTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-negative integer"):
             EnvConfig(grasp_contact_index_radius=-1)
 
+    def test_oblique_bilateral_grasp_accepts_39_mm_aperture(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1013)
+            env.config.max_pad_distance = 10.0
+            env._pad_contact_samples = lambda: [
+                (env.target_body_id, env.left_finger_id, 1.0),
+                (env.target_body_id, env.right_finger_id, 1.0),
+            ]
+            env.data.qpos[env.finger_qpos_adr] = 0.0195
+            self.assertEqual(
+                env._physical_grasp_candidate(), env.target_body_id
+            )
+
+            env.data.qpos[env.finger_qpos_adr] = 0.0205
+            self.assertIsNone(env._physical_grasp_candidate())
+        finally:
+            del env
+
+    def test_close_hard_timeout_does_not_open_during_pad_contact(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1014)
+            policy = DynamicCableGraspPolicy(env)
+            policy.phase = Phase.CLOSE
+            policy.phase_start = (
+                float(env.data.time) - policy.config.close_hard_timeout - 0.1
+            )
+            policy.last_close_contact_time = float(env.data.time)
+            env.finger_contacts = lambda cable_body=None: [env.target_body_id]
+
+            action = policy.action()
+
+            self.assertIs(policy.phase, Phase.CLOSE)
+            self.assertEqual(action[7], policy.HOLD_GRIPPER_CTRL)
+        finally:
+            del env
+
     def test_scripted_policy_uses_measured_motion_delay_compensation(self) -> None:
         config = PolicyConfig()
         self.assertEqual(config.prediction_horizon, 0.30)

@@ -546,11 +546,13 @@ def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
 
         if method != "ppo":
             info = base_env.info()
+            if base_env.ever_success and policy.result == "running":
+                policy.result = "success"
             info["ever_pinched"] = base_env.last_grasped_body_id is not None
             info["base_success"] = base_env.ever_success
             info["success"] = policy.result == "success"
             terminated = bool(base_env.ever_success)
-            if truncated and policy.result is None:
+            if truncated and policy.result == "running":
                 reason = info.get("termination_reason")
                 policy.result = (
                     "failed_motion_boundary"

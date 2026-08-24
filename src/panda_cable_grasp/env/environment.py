@@ -161,7 +161,11 @@ class EnvConfig:
     grasp_candidate_gap_seconds: float = 0.02  
     grasp_contact_index_radius: int = 2  
     grasp_loss_seconds: float = 0.35   
-    max_grasp_aperture: float = 0.034 
+    # A 20 mm cable can hold the Panda fingers near 39 mm when it enters the
+    # pads obliquely.  Bilateral pad force and center-distance checks below
+    # still reject an empty/open gripper, so 40 mm is the appropriate upper
+    # bound for a physically trapped cable rather than the old 34 mm cutoff.
+    max_grasp_aperture: float = 0.040
     max_pad_distance: float = 0.055   
     min_pad_normal_force: float = 0.20 
 
