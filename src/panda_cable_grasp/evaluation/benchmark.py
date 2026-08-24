@@ -493,14 +493,7 @@ def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
         env = CableGraspEnv(config)
         base_env = env
         if method == "scripted":
-            horizon = float(job["scripted_prediction_horizon"])
-            policy = DynamicCableGraspPolicy(
-                env,
-                PolicyConfig(
-                    prediction_horizon=horizon,
-                    approach_prediction_horizon=horizon,
-                ),
-            )
+            policy = DynamicCableGraspPolicy(env)
         elif method == "expert":
             from ..expert.formula_intercept_policy import FormulaInterceptExpert
 
@@ -724,15 +717,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--disturbance", type=float, default=1.5)
-    parser.add_argument(
-        "--scripted-prediction-horizon",
-        type=float,
-        default=PolicyConfig().prediction_horizon,
-        help=(
-            "linear target-prediction horizon in seconds for the scripted "
-            "APPROACH and INTERCEPT phases"
-        ),
-    )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--scenario", choices=list_scenario_names())
     selection.add_argument(
@@ -774,11 +758,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("episode, duration, FPS, and worker counts must be positive")
     if args.disturbance < 0.0 or not math.isfinite(args.disturbance):
         parser.error("--disturbance must be finite and non-negative")
-    if (
-        args.scripted_prediction_horizon < 0.0
-        or not math.isfinite(args.scripted_prediction_horizon)
-    ):
-        parser.error("--scripted-prediction-horizon must be finite and non-negative")
     if "ppo" in args.methods and args.ppo_model is None:
         parser.error("--ppo-model is required when evaluating PPO")
     if args.ppo_model is not None and not args.ppo_model.is_file():
@@ -791,9 +770,6 @@ def run_benchmark(args: argparse.Namespace) -> Path:
 
     scenarios = _select_scenarios(args)
     seeds = [args.seed + index for index in range(args.episodes)]
-    scripted_prediction_horizon = float(getattr(
-        args, "scripted_prediction_horizon", PolicyConfig().prediction_horizon,
-    ))
     requested_run_name = getattr(args, "run_name", None)
     if requested_run_name is None:
         output_dir = create_unique_run_dir(args.output)
@@ -844,7 +820,6 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                     "seed": seed,
                     "scenario": scenario,
                     "disturbance": args.disturbance,
-                    "scripted_prediction_horizon": scripted_prediction_horizon,
                     "episode_seconds": args.episode_seconds,
                     "ppo_model": args.ppo_model,
                     "device": args.device,
@@ -968,12 +943,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                 "rl_environment": ROOT / "src" / "panda_cable_grasp" / "rl" / "environment.py",
             }.items()
         },
-        "configs": {
-            "scripted_policy": asdict(PolicyConfig(
-                prediction_horizon=scripted_prediction_horizon,
-                approach_prediction_horizon=scripted_prediction_horizon,
-            )),
-        },
+        "configs": {"scripted_policy": asdict(PolicyConfig())},
         "task_outcome_types": list(TASK_OUTCOME_TYPES),
         "paired_scene_fingerprints_verified": paired_verification,
         "git_commit": _git_text("rev-parse", "HEAD"),
