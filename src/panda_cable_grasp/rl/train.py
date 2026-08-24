@@ -256,7 +256,7 @@ class EntropyCoefficientScheduleCallback(BaseCallback):
 
 
 class StrictSuccessEvalCallback(BaseCallback):
-    """在固定新种子上按严格成功率选最佳模型，而不是按训练回报选。"""
+    """在固定新种子上按公共任务成功率选最佳模型并记录严格漏斗。"""
 
     def __init__(
         self,
@@ -280,8 +280,8 @@ class StrictSuccessEvalCallback(BaseCallback):
         self.eval_workers = int(env.num_envs)
         if self.eval_workers < 1:
             raise ValueError("strict evaluation requires at least one worker")
-        # Do not spend 50 confirmation episodes on a policy with no strict
-        # success and no secured grasp merely because its shaped return moved.
+        # Do not spend confirmation episodes on a policy with no task success
+        # and no secured grasp merely because its shaped return moved.
         self.best_success_rate = 0.0
         self.best_grasp_rate = 0.0
         self.best_aligned_pinch_rate = 0.0
@@ -317,12 +317,19 @@ class StrictSuccessEvalCallback(BaseCallback):
                         self.best_grasp_rate = grasp_rate
                         self.best_aligned_pinch_rate = aligned_pinch_rate
                         self.best_mean_return = mean_return
+            if previous_rows and "strict_success_rate" not in previous_rows[0]:
+                raise RuntimeError(
+                    f"Existing evaluation metrics predate the shared task-success "
+                    f"contract: {self.csv_path}. Start training in a new output "
+                    "directory."
+                )
         else:
             with self.csv_path.open("w", encoding="utf-8", newline="") as target:
                 csv.writer(target).writerow([
                     "timesteps", "curriculum_phase", "next_curriculum_phase",
                     "curriculum_stage",
-                    "motion_difficulty", "success_rate", "pinch_rate",
+                    "motion_difficulty", "success_rate", "strict_success_rate",
+                    "pinch_rate",
                     "aligned_pinch_rate", "lift_attempt_rate", "loaded_lift_rate",
                     "grasp_rate", "physical_slip_rate", "mean_return",
                     "mean_length", "episodes",
@@ -348,6 +355,7 @@ class StrictSuccessEvalCallback(BaseCallback):
 
     def _evaluate(self, episodes: int, *, seed_offset: int = 0) -> dict[str, float]:
         successes = 0
+        strict_successes = 0
         pinches = 0
         aligned_pinches = 0
         lift_attempts = 0
@@ -384,6 +392,7 @@ class StrictSuccessEvalCallback(BaseCallback):
                 for worker in finished:
                     info = infos[int(worker)]
                     successes += int(bool(info["success"]))
+                    strict_successes += int(bool(info.get("strict_success", False)))
                     pinches += int(bool(info["ever_pinched"]))
                     aligned_pinches += int(bool(
                         info.get("ever_aligned_pinch", False)
@@ -405,6 +414,7 @@ class StrictSuccessEvalCallback(BaseCallback):
             )
         return {
             "success_rate": successes / episodes,
+            "strict_success_rate": strict_successes / episodes,
             "pinch_rate": pinches / episodes,
             "aligned_pinch_rate": aligned_pinches / episodes,
             "lift_attempt_rate": lift_attempts / episodes,
@@ -424,6 +434,7 @@ class StrictSuccessEvalCallback(BaseCallback):
             self.curriculum.configure_evaluation_env(self.env)
         metrics = self._evaluate(self.episodes)
         success_rate = metrics["success_rate"]
+        strict_success_rate = metrics["strict_success_rate"]
         pinch_rate = metrics["pinch_rate"]
         aligned_pinch_rate = metrics["aligned_pinch_rate"]
         lift_attempt_rate = metrics["lift_attempt_rate"]
@@ -450,11 +461,13 @@ class StrictSuccessEvalCallback(BaseCallback):
             csv.writer(target).writerow([
                 self.num_timesteps, curriculum_phase, next_curriculum_phase,
                 curriculum_stage,
-                motion_difficulty, success_rate, pinch_rate, aligned_pinch_rate,
+                motion_difficulty, success_rate, strict_success_rate,
+                pinch_rate, aligned_pinch_rate,
                 lift_attempt_rate, loaded_lift_rate, grasp_rate, slip_rate,
                 mean_return, mean_length, self.episodes,
             ])
-        self.logger.record("eval/strict_success_rate", success_rate)
+        self.logger.record("eval/task_success_rate", success_rate)
+        self.logger.record("eval/strict_success_rate", strict_success_rate)
         self.logger.record("eval/pinch_rate", pinch_rate)
         self.logger.record("eval/aligned_pinch_rate", aligned_pinch_rate)
         self.logger.record("eval/lift_attempt_rate", lift_attempt_rate)
@@ -512,7 +525,8 @@ class StrictSuccessEvalCallback(BaseCallback):
                     )
         print(
             f"strict_eval timesteps={self.num_timesteps} "
-            f"success={success_rate:.1%} pinch={pinch_rate:.1%} "
+            f"task_success={success_rate:.1%} strict_success={strict_success_rate:.1%} "
+            f"pinch={pinch_rate:.1%} "
             f"aligned={aligned_pinch_rate:.1%} loaded={loaded_lift_rate:.1%} "
             f"grasp={grasp_rate:.1%} slip={slip_rate:.1%} "
             f"mean_return={mean_return:.3f}",
@@ -740,7 +754,7 @@ def main() -> None:
         vector_env,
         filename=str(args.output / "monitor.csv"),
         info_keywords=(
-            "success", "ever_pinched", "ever_aligned_pinch", "lift_attempt",
+            "success", "strict_success", "ever_pinched", "ever_aligned_pinch", "lift_attempt",
             "loaded_lift", "ever_grasped", "lifted_fraction",
         ),
     )
@@ -943,10 +957,14 @@ def main() -> None:
             "0.10 s continuous physical retention"
         ),
         "rl_success_definition": (
-            "secured grasp + body z > 0.14 m + lifted fraction >= 0.18 + "
-            "distance <= 0.055 m at 50 Hz for 0.80 s, intersected with the "
-            "base environment's current confirmed-grasp and 500 Hz continuous "
-            "0.80 s geometric task-success window"
+            "shared base-environment task success: confirmed grasp + body z > "
+            "0.14 m + lifted fraction >= 0.18 + distance within the public pad "
+            "threshold for a 500 Hz continuous 0.80 s window"
+        ),
+        "rl_strict_success_diagnostic": (
+            "secured grasp + raw bilateral contact + distance <= 0.055 m at "
+            "50 Hz for 0.80 s, intersected with the base environment's current "
+            "qualification; diagnostic and shaping only"
         ),
         "observation_names": list(RLCableGraspEnv.OBSERVATION_NAMES),
         "observation_dimension": len(RLCableGraspEnv.OBSERVATION_NAMES),
@@ -957,7 +975,7 @@ def main() -> None:
             "alignment potential progress + centered, pad-depth-qualified capture "
             "close bonus + premature-close event/hold penalties + "
             "aligned-pinch bonus + capped unloaded-pinch penalties + episode-global "
-            "lift high-water credit + strict success; "
+            "lift/strict-hold high-water credit + shared task success; "
             "post-secured active-open and physical-slip penalties remain causal"
         ),
         "action": (

@@ -26,6 +26,7 @@ class TrainingMetricsCallback(BaseCallback):
         self.window = window
         self.print_every_episodes = print_every_episodes
         self.success_window: deque[float] = deque(maxlen=window)
+        self.strict_success_window: deque[float] = deque(maxlen=window)
         self.pinch_window: deque[float] = deque(maxlen=window)
         self.aligned_pinch_window: deque[float] = deque(maxlen=window)
         self.loaded_lift_window: deque[float] = deque(maxlen=window)
@@ -55,6 +56,9 @@ class TrainingMetricsCallback(BaseCallback):
             # 继续训练时恢复最近一个窗口，避免实时成功率从空窗口重新开始。
             for row in previous_rows[-self.window:]:
                 self.success_window.append(float(row["success"]))
+                self.strict_success_window.append(float(
+                    row.get("strict_success", row["success"])
+                ))
                 self.pinch_window.append(float(row.get("ever_pinched", 0.0)))
                 self.aligned_pinch_window.append(float(
                     row.get("ever_aligned_pinch", 0.0)
@@ -65,12 +69,13 @@ class TrainingMetricsCallback(BaseCallback):
                 self.return_window.append(float(row["episode_return"]))
                 self.lift_window.append(float(row["lifted_fraction"]))
         fieldnames = [
-            "episode", "timesteps", "success", "ever_pinched",
+            "episode", "timesteps", "success", "strict_success", "ever_pinched",
             "ever_aligned_pinch", "lift_attempt", "loaded_lift", "ever_grasped",
             "episode_return", "episode_length", "lifted_fraction",
         ]
         required_v3_fields = {
-            "ever_pinched", "ever_aligned_pinch", "lift_attempt", "loaded_lift",
+            "strict_success", "ever_pinched", "ever_aligned_pinch", "lift_attempt",
+            "loaded_lift",
         }
         if (
             file_exists
@@ -123,6 +128,9 @@ class TrainingMetricsCallback(BaseCallback):
                 continue
             episode_info = info.get("episode", {})
             success = float(bool(episode_info.get("success", info.get("success", False))))
+            strict_success = float(bool(episode_info.get(
+                "strict_success", info.get("strict_success", False)
+            )))
             pinched = float(bool(
                 episode_info.get("ever_pinched", info.get("ever_pinched", False))
             ))
@@ -146,6 +154,7 @@ class TrainingMetricsCallback(BaseCallback):
 
             self.episode_count += 1
             self.success_window.append(success)
+            self.strict_success_window.append(strict_success)
             self.pinch_window.append(pinched)
             self.aligned_pinch_window.append(aligned_pinched)
             self.lift_attempt_window.append(lift_attempt)
@@ -158,6 +167,7 @@ class TrainingMetricsCallback(BaseCallback):
                 "episode": self.episode_count,
                 "timesteps": self.num_timesteps,
                 "success": int(success),
+                "strict_success": int(strict_success),
                 "ever_pinched": int(pinched),
                 "ever_aligned_pinch": int(aligned_pinched),
                 "lift_attempt": int(lift_attempt),
@@ -170,6 +180,7 @@ class TrainingMetricsCallback(BaseCallback):
             self._file.flush()
 
             success_rate = float(np.mean(self.success_window))
+            strict_success_rate = float(np.mean(self.strict_success_window))
             pinch_rate = float(np.mean(self.pinch_window))
             grasp_rate = float(np.mean(self.grasp_window))
             aligned_pinch_rate = float(np.mean(self.aligned_pinch_window))
@@ -180,6 +191,7 @@ class TrainingMetricsCallback(BaseCallback):
             # logger记录会同时进入PPO终端表格和TensorBoard。
             self.logger.record("task/episodes", self.episode_count)
             self.logger.record("task/success_rate_100", success_rate)
+            self.logger.record("task/strict_success_rate_100", strict_success_rate)
             self.logger.record("task/pinch_rate_100", pinch_rate)
             self.logger.record("task/aligned_pinch_rate_100", aligned_pinch_rate)
             self.logger.record("task/lift_attempt_rate_100", lift_attempt_rate)
@@ -203,6 +215,7 @@ class TrainingMetricsCallback(BaseCallback):
                     f"training episodes={self.episode_count} "
                     f"timesteps={self.num_timesteps} "
                     f"success_rate_{self.window}={success_rate:.1%} "
+                    f"strict_success_rate_{self.window}={strict_success_rate:.1%} "
                     f"pinch_rate_{self.window}={pinch_rate:.1%} "
                     f"aligned_pinch_rate_{self.window}={aligned_pinch_rate:.1%} "
                     f"loaded_lift_rate_{self.window}={loaded_lift_rate:.1%} "

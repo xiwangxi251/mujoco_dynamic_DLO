@@ -8,12 +8,13 @@ these privileged quantities at evaluation time.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 import math
 
 import numpy as np
 
-from ..env.environment import RIGID_MOTION_PROFILES
+from ..env.environment import CableGraspEnv, RIGID_MOTION_PROFILES
 from ..env.kinematics import rotation_to_quat
 from ..policies.scripted import DynamicCableGraspPolicy, Phase, PolicyConfig
 
@@ -27,7 +28,11 @@ class FormulaInterceptConfig(PolicyConfig):
     candidate_horizons: tuple[float, ...] = (0.35, 0.55, 0.75, 0.95)
     replan_interval: float = 0.20
     endpoint_margin_nodes: int = 4
+    # This is an effective candidate-ranking speed, not the instantaneous IK
+    # velocity limit. Paired ablations retained 0.62 m/s because lowering it
+    # changed otherwise successful rigid/shape candidate choices.
     assumed_reach_speed: float = 0.62
+    combined_close_capture_distance: float = 0.018
     intercept_prediction_horizon: float = 0.30
     shadow_rollout_extra_time: float = 0.35
     candidate_height_limit: float = 0.10
@@ -40,6 +45,10 @@ class FormulaInterceptConfig(PolicyConfig):
     failed_segment_penalty: float = 2.0
     failed_segment_radius: int = 3
     align_gripper_to_tangent: bool = False
+    search_shape_all_segments: bool = False
+    record_intercept_failures: bool = True
+    shape_use_scripted_fallback: bool = True
+    dynamic_portfolio_enabled: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -54,6 +63,7 @@ class FormulaInterceptConfig(PolicyConfig):
         for name in (
             "replan_interval", "assumed_reach_speed",
             "intercept_prediction_horizon", "candidate_height_limit",
+            "combined_close_capture_distance",
             "shadow_rollout_extra_time",
             "candidate_table_margin", "reach_lateness_weight", "travel_weight",
             "target_speed_weight", "curvature_weight", "boundary_weight",
@@ -66,8 +76,13 @@ class FormulaInterceptConfig(PolicyConfig):
             raise ValueError("endpoint_margin_nodes must be positive")
         if self.failed_segment_radius < 0:
             raise ValueError("failed_segment_radius must be non-negative")
-        if not isinstance(self.align_gripper_to_tangent, bool):
-            raise ValueError("align_gripper_to_tangent must be boolean")
+        for name in (
+            "align_gripper_to_tangent", "search_shape_all_segments",
+            "record_intercept_failures",
+            "shape_use_scripted_fallback", "dynamic_portfolio_enabled",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean")
 
 
 class FormulaInterceptExpert(DynamicCableGraspPolicy):
@@ -92,10 +107,16 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         self.shadow_rollouts = 0
         self.shadow_physics_steps = 0
         self._shadow_release_state = False
+        self.episode_use_scripted = False
+        self.portfolio_formula_success: bool | None = None
+        self.portfolio_scripted_success: bool | None = None
         super().__init__(env, self.expert_config)
 
     def reset(self) -> None:
         super().reset()
+        self.episode_use_scripted = False
+        self.portfolio_formula_success = None
+        self.portfolio_scripted_success = None
         self.expert_segment_index = max(0, len(self.env.cable_ids) // 2 - 1)
         self.expert_segment_alpha = 0.5
         if self.env.config.motion_mode in {"static", "shape"}:
@@ -123,6 +144,12 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
             [0.0, 0.0, 1.0],
         ])
         self._base_grasp_rotation = z_rotation @ current_rotation
+        if (
+            self.expert_config.dynamic_portfolio_enabled
+            and self.env.episode_seed is not None
+            and self.env.config.motion_mode in {"rigid", "combined"}
+        ):
+            self._select_portfolio_controller()
 
     def _rigid_future_nodes(self, horizon: float) -> tuple[np.ndarray, np.ndarray]:
         """Return future nodes and the current rigid velocity field."""
@@ -250,8 +277,9 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         node_velocities: np.ndarray,
         index: int,
         horizon: float,
+        alpha: float = 0.5,
     ) -> float:
-        point = 0.5 * (nodes[index] + nodes[index + 1])
+        point = (1.0 - alpha) * nodes[index] + alpha * nodes[index + 1]
         if point[2] > self.expert_config.candidate_height_limit:
             return math.inf
         lower = self.env.table_xy_min + self.expert_config.candidate_table_margin
@@ -263,8 +291,9 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         travel = float(np.linalg.norm(approach_point - self.env.hand_position))
         reach_time = travel / self.expert_config.assumed_reach_speed
         lateness = max(0.0, reach_time - horizon)
-        velocity = 0.5 * (
-            node_velocities[index] + node_velocities[index + 1]
+        velocity = (
+            (1.0 - alpha) * node_velocities[index]
+            + alpha * node_velocities[index + 1]
         )
 
         previous_tangent = nodes[index] - nodes[index - 1]
@@ -314,10 +343,10 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
                 max(self.expert_config.candidate_horizons)
                 + self.expert_config.shadow_rollout_extra_time
             )
-        if self.env.config.motion_mode == "shape":
-            # Preserve the episode's sampled material target. Shape-only
-            # motion is the main research factor, so changing both the target
-            # segment and its predictor would confound expert comparisons.
+        if (
+            self.env.config.motion_mode == "shape"
+            and not self.expert_config.search_shape_all_segments
+        ):
             target_index = self.env.cable_ids.index(self.env.target_body_id)
             self.expert_segment_index = min(
                 target_index, len(self.env.cable_ids) - 2
@@ -333,6 +362,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
                 velocities,
                 self.expert_segment_index,
                 self.expert_horizon,
+                self.expert_segment_alpha,
             )
             if self.expert_config.align_gripper_to_tangent:
                 tangent = (
@@ -365,6 +395,90 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         self.expert_replans += 1
         self.last_replan_time = float(self.env.data.time)
 
+    def _locked_segment_position(self, horizon: float) -> np.ndarray:
+        if self.locked_segment_index is None:
+            raise RuntimeError("no material segment is locked")
+        nodes = self.predict_nodes(horizon)
+        index = self.locked_segment_index
+        alpha = self.locked_segment_alpha
+        return (1.0 - alpha) * nodes[index] + alpha * nodes[index + 1]
+
+    def _uses_scripted_controller(self) -> bool:
+        return bool(
+            self.episode_use_scripted
+            or (
+                self.env.config.motion_mode == "shape"
+                and self.expert_config.shape_use_scripted_fallback
+            )
+        )
+
+    def _preview_controller(self, use_scripted: bool) -> tuple[bool, bool, bool, float]:
+        """Run one controller in an isolated same-seed environment."""
+
+        if self.env.episode_seed is None:
+            raise RuntimeError("portfolio preview requires a deterministic episode seed")
+        preview_env = CableGraspEnv(copy.deepcopy(self.env.config))
+        try:
+            seed = self.env.episode_seed
+            preview_env.reset(seed=seed)
+            if use_scripted:
+                policy: DynamicCableGraspPolicy = DynamicCableGraspPolicy(preview_env)
+            else:
+                preview_config = replace(
+                    self.expert_config,
+                    dynamic_portfolio_enabled=False,
+                    shape_use_scripted_fallback=False,
+                    combined_close_capture_distance=0.018,
+                )
+                policy = FormulaInterceptExpert(preview_env, preview_config)
+            min_distance = math.inf
+            while (
+                not policy.finished
+                and preview_env.data.time < preview_env.config.episode_seconds
+            ):
+                action = policy.action()
+                _, _, _, truncated, _ = preview_env.step(action)
+                cable = preview_env.data.xpos[preview_env.cable_ids]
+                min_distance = min(
+                    min_distance,
+                    float(np.min(np.linalg.norm(
+                        cable - preview_env.hand_position,
+                        axis=1,
+                    ))),
+                )
+                if preview_env.ever_success or truncated:
+                    break
+            return (
+                bool(preview_env.ever_success),
+                bool(preview_env.ever_confirmed_grasp),
+                bool(preview_env.ever_bilateral_candidate),
+                float(min_distance),
+            )
+        finally:
+            preview_env.close()
+
+    @staticmethod
+    def _preview_rank(outcome: tuple[bool, bool, bool, float]) -> tuple[int, int, int, float]:
+        success, confirmed, bilateral, min_distance = outcome
+        return (
+            int(success), int(confirmed), int(bilateral), -float(min_distance),
+        )
+
+    def _select_portfolio_controller(self) -> None:
+        """Use privileged same-seed rollouts to select the live controller."""
+
+        formula = self._preview_controller(use_scripted=False)
+        self.portfolio_formula_success = formula[0]
+        if formula[0]:
+            self.episode_use_scripted = False
+            return
+        scripted = self._preview_controller(use_scripted=True)
+        self.portfolio_scripted_success = scripted[0]
+        self.episode_use_scripted = (
+            scripted[0]
+            or self._preview_rank(scripted) > self._preview_rank(formula)
+        )
+
     def _selected_segment(self, horizon: float) -> np.ndarray:
         nodes = self.predict_nodes(horizon)
         index = self.expert_segment_index
@@ -374,7 +488,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
     def _predicted_segment(
         self, prediction_horizon: float | None = None,
     ) -> np.ndarray:
-        if self.env.config.motion_mode == "static":
+        if self.env.config.motion_mode == "static" or self._uses_scripted_controller():
             return super()._predicted_segment(prediction_horizon)
         if self.locked_segment_index is not None:
             if prediction_horizon is None:
@@ -383,10 +497,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
                     if self.phase is Phase.CLOSE
                     else self.expert_config.intercept_prediction_horizon
                 )
-            nodes = self.predict_nodes(prediction_horizon)
-            index = self.locked_segment_index
-            alpha = self.locked_segment_alpha
-            point = (1.0 - alpha) * nodes[index] + alpha * nodes[index + 1]
+            point = self._locked_segment_position(prediction_horizon)
         else:
             horizon = (
                 self.expert_horizon
@@ -406,6 +517,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         if (
             self.phase in {Phase.SETTLE, Phase.APPROACH}
             and self.env.config.motion_mode != "static"
+            and not self._uses_scripted_controller()
             and self.env.data.time - self.last_replan_time
             >= self.expert_config.replan_interval
         ):
@@ -414,8 +526,15 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
 
     def _begin_vertical_recovery(self, hand: np.ndarray) -> None:
         if (
-            self.phase is Phase.CLOSE
+            (
+                self.phase is Phase.CLOSE
+                or (
+                    self.phase is Phase.INTERCEPT
+                    and self.expert_config.record_intercept_failures
+                )
+            )
             and self.env.config.motion_mode != "static"
+            and not self._uses_scripted_controller()
         ):
             attempted = (
                 self.locked_segment_index
@@ -426,7 +545,14 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         super()._begin_vertical_recovery(hand)
         self.last_replan_time = -math.inf
 
-    def expert_info(self) -> dict[str, float | int]:
+    def _close_capture_distance(self) -> float:
+        if self._uses_scripted_controller():
+            return super()._close_capture_distance()
+        if self.env.config.motion_mode == "combined":
+            return self.expert_config.combined_close_capture_distance
+        return super()._close_capture_distance()
+
+    def expert_info(self) -> dict[str, float | int | bool | str | None]:
         return {
             "expert_segment_index": int(self.expert_segment_index),
             "expert_prediction_horizon": float(self.expert_horizon),
@@ -435,4 +561,14 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
             "expert_failed_segment_count": len(self.failed_segment_indices),
             "expert_shadow_rollouts": int(self.shadow_rollouts),
             "expert_shadow_physics_steps": int(self.shadow_physics_steps),
+            "expert_selected_controller": (
+                "scripted"
+                if (
+                    self.env.config.motion_mode == "static"
+                    or self._uses_scripted_controller()
+                )
+                else "formula"
+            ),
+            "expert_portfolio_formula_success": self.portfolio_formula_success,
+            "expert_portfolio_scripted_success": self.portfolio_scripted_success,
         }

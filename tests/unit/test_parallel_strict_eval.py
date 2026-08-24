@@ -35,6 +35,7 @@ class _FakeEvalVecEnv:
         for seed in seeds:
             infos.append({
                 "success": seed % 2 == 0,
+                "strict_success": seed % 4 == 0,
                 "ever_pinched": seed % 3 == 0,
                 "ever_aligned_pinch": seed % 4 == 0,
                 "lift_attempt": seed % 5 == 0,
@@ -66,6 +67,7 @@ def test_parallel_strict_eval_preserves_episode_count_and_seed_order(tmp_path):
 
     assert env.seed_calls == [10, 12, 14]
     assert metrics["success_rate"] == 3 / 5
+    assert metrics["strict_success_rate"] == 1 / 5
     assert metrics["pinch_rate"] == 1 / 5
     assert metrics["aligned_pinch_rate"] == 1 / 5
     assert metrics["lift_attempt_rate"] == 1 / 5

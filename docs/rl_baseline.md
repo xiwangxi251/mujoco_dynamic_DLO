@@ -63,7 +63,8 @@ alignment = |c_x t_y - c_y t_x|
 - `pinch_confirmed`：双指夹持成立，不代表绳子已经承载。
 - `aligned_pinch`：首次 pinch 时姿态分数达到阈值。
 - `secured_grasp`：夹持段已实际上升并稳定确认。
-- `strict_success`：同时满足底层物理成功判定与连续保持时间。
+- `strict_success`：PPO内部的稳定承载保持诊断，只用于训练漏斗和过程塑形。
+- `success` / `task_success`：底层环境统一判定的任务成功，是所有策略共享的终止与最终成功奖励条件。
 
 训练验收应看上述转化漏斗，而不是只看平均 reward。
 

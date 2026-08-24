@@ -96,7 +96,7 @@ python C:\path\to\panda_cable_grasp\tools\installation\check_dynamicvla_install.
 conda activate dynamic
 cd /path/to/panda_cable_grasp
 panda-cable-dynamicvla \
-  --scenario id_static --trials 3 --seed 20260804 \
+  --scenario id_static --trials 3 --seed 20280804 \
   --instruction "Pick up the blue cable."
 ```
 
@@ -119,6 +119,11 @@ Hugging Face，或事先把相应文件放入服务器的 `HF_HOME` 缓存。权
 
 两进程在同一台机器时使用默认 `127.0.0.1:3186/3188`。跨机器运行时，仿真端用
 `--host 0.0.0.0`，推理端增加 `--host <仿真机IP>`，同时只开放这两个实验端口。
+
+仿真端输出与统一 benchmark 使用相同的 `episodes.csv`、`summary.json`、`manifest.json`
+和 episode 目录；每个 episode 包含 `trajectory.npz`、`global.mp4`、`wrist.mp4` 与
+`episode.json`。DynamicVLA 特有的 task-space 动作、关节动作和裁剪/修复标记保存在
+`trajectory.npz` 的 `extra_*` 字段。详见[统一仿真评测](evaluation.md)。
 
 ## 解释结果时的边界
 

@@ -19,12 +19,14 @@ import time
 import numpy as np
 
 from ..evaluation.benchmark import (
-    _base_row,
-    _git_text,
-    _sha256,
-    _summary,
-    _write_csv,
+    base_row,
+    git_text,
+    sha256_file,
+    summarize,
+    write_csv,
 )
+from ..evaluation.defaults import DEFAULT_EVALUATION_SEED, DEFAULT_VIDEO_FPS
+from ..evaluation.recording import EpisodeRecorder
 from ..env.environment import (
     CableGraspEnv,
     EnvConfig,
@@ -154,7 +156,6 @@ def check_bridge(args: argparse.Namespace) -> None:
 
 
 def run_server(args: argparse.Namespace) -> None:
-    import cv2
     import mujoco
     import zmq
 
@@ -198,15 +199,14 @@ def run_server(args: argparse.Namespace) -> None:
         while run_dir.exists():
             run_dir = args.video_dir / f"{run_name}_{suffix:02d}"
             suffix += 1
-    scenario_dir = run_dir / f"dynamicvla_{scenario.name}"
-    if scenario_dir.exists():
-        raise FileExistsError(f"Refusing to overwrite {scenario_dir.resolve()}")
-    scenario_dir.mkdir(parents=True)
-
-    model_path = scenario_dir / f"{scenario.name}.mjb"
+    if run_dir.exists():
+        raise FileExistsError(f"Refusing to overwrite {run_dir.resolve()}")
+    run_dir.mkdir(parents=True)
+    scenario_dir = run_dir
+    models_dir = run_dir / "models"
+    models_dir.mkdir()
+    model_path = models_dir / f"{scenario.name}.mjb"
     mujoco.mj_saveModel(env.model, str(model_path), None)
-    state_spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
-    state_size = mujoco.mj_stateSize(env.model, state_spec)
     control_dt = float(env.model.opt.timestep * env.config.frame_skip)
     successes = 0
     rows: list[dict] = []
@@ -223,30 +223,13 @@ def run_server(args: argparse.Namespace) -> None:
                 flush=True,
             )
 
-            opst_video_path = scenario_dir / f"trial_{trial_index:03d}_opst.mp4"
-            wrist_video_path = scenario_dir / f"trial_{trial_index:03d}_wrist.mp4"
-            video_size = (
-                env.config.dynamicvla_camera_width,
-                env.config.dynamicvla_camera_height,
+            recorder = EpisodeRecorder(
+                env,
+                run_dir / "episodes" / "dynamicvla_zero_shot"
+                / scenario.name / f"seed_{episode_seed}",
+                video_fps=args.video_fps,
             )
-            writers = [
-                cv2.VideoWriter(
-                    str(path), cv2.VideoWriter_fourcc(*"mp4v"), 1.0 / control_dt,
-                    video_size,
-                )
-                for path in (opst_video_path, wrist_video_path)
-            ]
-            if not all(writer.isOpened() for writer in writers):
-                for writer in writers:
-                    writer.release()
-                raise RuntimeError("Unable to create DynamicVLA input videos")
-
-            states: list[np.ndarray] = []
-            frame_times: list[float] = []
-            raw_model_actions: list[np.ndarray] = []
-            pose_commands: list[np.ndarray] = []
-            joint_actions: list[np.ndarray] = []
-            received_action_masks: list[bool] = []
+            recorder.capture_initial()
             position_clipped: list[bool] = []
             quaternion_repaired: list[bool] = []
             ee_path: list[np.ndarray] = []
@@ -277,28 +260,24 @@ def run_server(args: argparse.Namespace) -> None:
                         dt_scale=max(1.0, previous_wall_step / control_dt),
                     )
                     obs_socket.send_pyobj(observation)
-                    images = {
-                        "opst_cam": observation["observation.images.opst_cam"][0],
-                        "wrist_cam": observation["observation.images.wrist_cam"][0],
-                    }
-                    writers[0].write(cv2.cvtColor(images["opst_cam"], cv2.COLOR_RGB2BGR))
-                    writers[1].write(cv2.cvtColor(images["wrist_cam"], cv2.COLOR_RGB2BGR))
-
-                    state = np.empty(state_size, dtype=np.float64)
-                    mujoco.mj_getState(env.model, env.data, state, state_spec)
                     diagnostics = adapter.diagnostics()
-                    states.append(state)
-                    frame_times.append(float(env.data.time))
-                    raw_model_actions.append(diagnostics["raw_action"])
-                    pose_commands.append(diagnostics["pose_command"])
-                    received_action_masks.append(received_now)
                     position_clipped.append(diagnostics["position_clipped"])
                     quaternion_repaired.append(diagnostics["quaternion_repaired"])
                     ee_path.append(env.hand_position.copy())
 
                     action = adapter.action()
-                    joint_actions.append(action.copy())
-                    _, _, success, truncated, step_info = env.step(action)
+                    _, reward, success, truncated, step_info = env.step(action)
+                    recorder.record_step(
+                        diagnostics["raw_action"], reward, success, truncated,
+                        step_info,
+                        extras={
+                            "pose_commands": diagnostics["pose_command"],
+                            "joint_actions": action,
+                            "received_action_mask": received_now,
+                            "position_clipped": diagnostics["position_clipped"],
+                            "quaternion_repaired": diagnostics["quaternion_repaired"],
+                        },
+                    )
                     min_target_distance = min(
                         min_target_distance,
                         float(np.linalg.norm(env.target_position() - env.hand_position)),
@@ -311,9 +290,9 @@ def run_server(args: argparse.Namespace) -> None:
                     if remaining > 0.0:
                         time.sleep(remaining)
                     previous_wall_step = time.perf_counter() - tick
-            finally:
-                for writer in writers:
-                    writer.release()
+            except BaseException:
+                recorder.close()
+                raise
 
             if success:
                 result = "success"
@@ -324,35 +303,10 @@ def run_server(args: argparse.Namespace) -> None:
             else:
                 result = "failed_timeout"
 
-            states_path = scenario_dir / f"trial_{trial_index:03d}_states.npz"
-            np.savez_compressed(
-                states_path,
-                states=np.stack(states),
-                state_spec=np.int64(int(state_spec)),
-                frame_times=np.asarray(frame_times),
-                fps=np.float64(1.0 / control_dt),
-                raw_model_actions=np.stack(raw_model_actions),
-                pose_commands=np.stack(pose_commands),
-                joint_actions=np.stack(joint_actions),
-                received_action_mask=np.asarray(received_action_masks),
-                position_clipped=np.asarray(position_clipped),
-                quaternion_repaired=np.asarray(quaternion_repaired),
-                instruction=np.asarray(args.instruction),
-                dynamicvla_name=np.asarray(vla_name),
-                dynamicvla_epoch=np.int64(vla_epoch),
-                model_file=np.asarray(model_path.name),
-                opst_video_file=np.asarray(opst_video_path.name),
-                wrist_video_file=np.asarray(wrist_video_path.name),
-                seed=np.int64(episode_seed),
-                scenario_name=np.asarray(scenario.name),
-                result=np.asarray(result),
-                termination_reason=np.asarray(termination_reason or ""),
-            )
-
             info = env.info()
             info["ever_pinched"] = env.last_grasped_body_id is not None
             info["base_success"] = env.ever_success
-            row = _base_row(
+            row = base_row(
                 "dynamicvla_zero_shot", trial_index, episode_seed, scenario,
                 initial_info, info, env.grasp_break_history,
             )
@@ -368,11 +322,13 @@ def run_server(args: argparse.Namespace) -> None:
                 "model_action_received": model_action_messages > 0,
                 "position_clip_frames": int(np.count_nonzero(position_clipped)),
                 "quaternion_repair_frames": int(np.count_nonzero(quaternion_repaired)),
-                "opst_video_path": str(opst_video_path.resolve()),
-                "wrist_video_path": str(wrist_video_path.resolve()),
-                "states_path": str(states_path.resolve()),
-                "model_path": str(model_path.resolve()),
+                "instruction": args.instruction,
+                "dynamicvla_name": vla_name,
+                "dynamicvla_epoch": vla_epoch,
+                "compiled_model": str(model_path.relative_to(run_dir)),
             })
+            artifacts = recorder.finish(row)
+            row.update(artifacts.relative_to(run_dir))
             rows.append(row)
             successes += int(success)
             print(
@@ -380,9 +336,7 @@ def run_server(args: argparse.Namespace) -> None:
                 f"model_actions={model_action_messages}",
                 flush=True,
             )
-            print(f"  opst_video={opst_video_path.resolve()}", flush=True)
-            print(f"  wrist_video={wrist_video_path.resolve()}", flush=True)
-            print(f"  states={states_path.resolve()}", flush=True)
+            print(f"  episode_dir={artifacts.episode_dir.resolve()}", flush=True)
 
             episode_result = {
                 "env_name": scenario.name,
@@ -412,10 +366,15 @@ def run_server(args: argparse.Namespace) -> None:
 
         episodes_path = scenario_dir / "episodes.csv"
         manifest_path = scenario_dir / "manifest.json"
-        _write_csv(episodes_path, rows)
-        git_status = _git_text("status", "--porcelain=v1")
+        summary_path = scenario_dir / "summary.json"
+        write_csv(episodes_path, rows)
+        summary = summarize(rows)
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        git_status = git_text("status", "--porcelain=v1")
         manifest = {
-            "schema_version": 2,
+            "schema_version": 4,
             "created_at": datetime.now().astimezone().isoformat(),
             "command": [sys.executable, *sys.argv],
             "method": "dynamicvla_zero_shot",
@@ -434,6 +393,14 @@ def run_server(args: argparse.Namespace) -> None:
             },
             "scenario": scenario.asdict(),
             "seeds": [args.seed + index for index in range(args.trials)],
+            "recording": {
+                "enabled": True,
+                "schema_version": 1,
+                "state_format": "mujoco_mjSTATE_FULLPHYSICS",
+                "state_sampling": "initial_and_after_every_control_step",
+                "video_fps": args.video_fps,
+                "cameras": ["opst_cam", "wrist_cam"],
+            },
             "camera": {
                 "width": env.config.dynamicvla_camera_width,
                 "height": env.config.dynamicvla_camera_height,
@@ -446,14 +413,15 @@ def run_server(args: argparse.Namespace) -> None:
                 "wrist_quat_wxyz_in_hand": env.config.dynamicvla_wrist_camera_quat,
             },
             "artifacts": {
-                "model": {"path": str(model_path.resolve()), "sha256": _sha256(model_path)},
+                "model": {"path": str(model_path.resolve()), "sha256": sha256_file(model_path)},
                 "episodes_csv": str(episodes_path.resolve()),
-                "opst_videos": [row["opst_video_path"] for row in rows],
-                "wrist_videos": [row["wrist_video_path"] for row in rows],
-                "states": [row["states_path"] for row in rows],
+                "summary": str(summary_path.resolve()),
+                "global_videos": [row["global_video"] for row in rows],
+                "wrist_videos": [row["wrist_video"] for row in rows],
+                "trajectories": [row["trajectory"] for row in rows],
             },
             "source_files": {
-                name: {"path": str(path.resolve()), "sha256": _sha256(path)}
+                name: {"path": str(path.resolve()), "sha256": sha256_file(path)}
                 for name, path in {
                     "runner": Path(__file__),
                     "adapter": Path(__file__).resolve().parents[1]
@@ -468,16 +436,15 @@ def run_server(args: argparse.Namespace) -> None:
                 "environment": asdict(env.config),
                 "adapter": asdict(DynamicVLAAdapterConfig()),
             },
-            "source_xml": {"path": str(XML_PATH.resolve()), "sha256": _sha256(XML_PATH)},
-            "panda_xml": {"path": str(PANDA_XML_PATH.resolve()), "sha256": _sha256(PANDA_XML_PATH)},
+            "source_xml": {"path": str(XML_PATH.resolve()), "sha256": sha256_file(XML_PATH)},
+            "panda_xml": {"path": str(PANDA_XML_PATH.resolve()), "sha256": sha256_file(PANDA_XML_PATH)},
             "menagerie_panda_assets": str(resolve_menagerie_panda_dir()),
-            "git_commit": _git_text("rev-parse", "HEAD"),
+            "git_commit": git_text("rev-parse", "HEAD"),
             "git_dirty": bool(git_status),
             "python": platform.python_version(),
             "mujoco": mujoco.__version__,
             "numpy": np.__version__,
-            "opencv": cv2.__version__,
-            "summary": _summary(rows),
+            "summary": summary,
         }
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
@@ -503,8 +470,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--scenario", choices=list_scenario_names(), required=True)
     parser.add_argument("--trials", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=20260804)
+    parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
+    parser.add_argument("--video-fps", type=float, default=DEFAULT_VIDEO_FPS)
     parser.add_argument(
         "--headless", action="store_true",
         help="accepted for CLI compatibility; this server is always offscreen",
@@ -532,6 +500,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--trials must be positive")
     if args.episode_seconds <= 0.0:
         parser.error("--episode-seconds must be positive")
+    if args.video_fps <= 0.0:
+        parser.error("--video-fps must be positive")
     if not args.instruction.strip():
         parser.error("--instruction must be non-empty")
     return args

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -35,7 +36,9 @@ class FormulaInterceptExpertTests(unittest.TestCase):
         try:
             env.reset(randomize=False, seed=20260804)
             baseline = DynamicCableGraspPolicy(env)
-            expert = FormulaInterceptExpert(env)
+            expert = FormulaInterceptExpert(env, FormulaInterceptConfig(
+                dynamic_portfolio_enabled=False,
+            ))
             baseline.phase = Phase.APPROACH
             expert.phase = Phase.APPROACH
             baseline.filtered_target = env.target_position()
@@ -50,7 +53,9 @@ class FormulaInterceptExpertTests(unittest.TestCase):
         env = self.make("id_rigid_l1_nominal")
         try:
             env.reset(randomize=False, seed=20260804)
-            expert = FormulaInterceptExpert(env)
+            expert = FormulaInterceptExpert(env, FormulaInterceptConfig(
+                dynamic_portfolio_enabled=False,
+            ))
             time_before = float(env.data.time)
             state_before = env.data.qpos.copy()
             current = expert.predict_nodes(0.0)
@@ -89,7 +94,9 @@ class FormulaInterceptExpertTests(unittest.TestCase):
         env = self.make("id_combined_l1_nominal")
         try:
             env.reset(randomize=False, seed=20260804)
-            expert = FormulaInterceptExpert(env)
+            expert = FormulaInterceptExpert(env, FormulaInterceptConfig(
+                dynamic_portfolio_enabled=False,
+            ))
             expert._replan_intercept()
             margin = expert.expert_config.endpoint_margin_nodes
             self.assertGreaterEqual(expert.expert_segment_index, margin)
@@ -105,18 +112,111 @@ class FormulaInterceptExpertTests(unittest.TestCase):
         finally:
             env.close()
 
-    def test_shape_replan_preserves_episode_target(self) -> None:
+    def test_shape_replan_searches_a_valid_internal_segment(self) -> None:
         env = self.make("id_shape_nominal_current")
         try:
             env.reset(randomize=True, seed=20260804)
-            expert = FormulaInterceptExpert(env)
+            expert = FormulaInterceptExpert(env, FormulaInterceptConfig(
+                shape_use_scripted_fallback=False,
+                search_shape_all_segments=True,
+                dynamic_portfolio_enabled=False,
+            ))
             expert._replan_intercept()
-            target_index = env.cable_ids.index(env.target_body_id)
-            self.assertEqual(expert.expert_segment_index, target_index)
-            self.assertEqual(
-                expert.expert_horizon,
-                expert.config.approach_prediction_horizon,
+            margin = expert.expert_config.endpoint_margin_nodes
+            self.assertGreaterEqual(expert.expert_segment_index, margin)
+            self.assertLess(
+                expert.expert_segment_index,
+                len(env.cable_ids) - margin - 1,
             )
+            self.assertIn(
+                expert.expert_horizon,
+                expert.expert_config.candidate_horizons,
+            )
+        finally:
+            env.close()
+
+    def test_shape_scripted_fallback_matches_baseline_prediction(self) -> None:
+        env = self.make("id_shape_nominal_current")
+        try:
+            env.reset(randomize=True, seed=20260804)
+            baseline = DynamicCableGraspPolicy(env)
+            expert = FormulaInterceptExpert(env, FormulaInterceptConfig(
+                dynamic_portfolio_enabled=False,
+            ))
+            baseline.phase = Phase.APPROACH
+            expert.phase = Phase.APPROACH
+            baseline.filtered_target = env.target_position()
+            expert.filtered_target = env.target_position()
+            self.assertTrue(np.array_equal(
+                expert._predicted_segment(), baseline._predicted_segment()
+            ))
+        finally:
+            env.close()
+
+    def test_intercept_timeout_records_failed_segment(self) -> None:
+        env = self.make("id_rigid_l1_nominal")
+        try:
+            env.reset(randomize=False, seed=20260804)
+            expert = FormulaInterceptExpert(env, FormulaInterceptConfig(
+                dynamic_portfolio_enabled=False,
+            ))
+            expert.phase = Phase.INTERCEPT
+            expert.locked_segment_index = 12
+            expert.locked_segment_alpha = 0.5
+            expert._begin_vertical_recovery(env.hand_position.copy())
+            self.assertEqual(expert.failed_segment_indices, [12])
+            self.assertEqual(expert.phase, Phase.RECOVER)
+        finally:
+            env.close()
+
+    def test_early_closure_distance_is_combined_only(self) -> None:
+        combined = self.make("id_combined_l1_nominal")
+        rigid = self.make("id_rigid_l1_nominal")
+        try:
+            combined.reset(randomize=False, seed=20260804)
+            rigid.reset(randomize=False, seed=20260804)
+            combined_expert = FormulaInterceptExpert(
+                combined,
+                FormulaInterceptConfig(
+                    close_capture_distance=0.012,
+                    combined_close_capture_distance=0.018,
+                    dynamic_portfolio_enabled=False,
+                ),
+            )
+            rigid_expert = FormulaInterceptExpert(
+                rigid,
+                FormulaInterceptConfig(
+                    close_capture_distance=0.012,
+                    combined_close_capture_distance=0.018,
+                    dynamic_portfolio_enabled=False,
+                ),
+            )
+            self.assertEqual(combined_expert._close_capture_distance(), 0.018)
+            self.assertEqual(rigid_expert._close_capture_distance(), 0.012)
+        finally:
+            combined.close()
+            rigid.close()
+
+    def test_portfolio_selects_scripted_after_formula_preview_failure(self) -> None:
+        env = self.make("id_rigid_l1_nominal")
+        try:
+            outcomes = [
+                (False, False, False, 0.05),
+                (True, True, True, 0.01),
+            ]
+            with patch.object(
+                FormulaInterceptExpert,
+                "_preview_controller",
+                side_effect=outcomes,
+            ) as preview:
+                expert = FormulaInterceptExpert(env)
+                self.assertEqual(preview.call_count, 0)
+                env.reset(randomize=False, seed=20260804)
+                expert.reset()
+            self.assertTrue(expert.episode_use_scripted)
+            self.assertFalse(expert.portfolio_formula_success)
+            self.assertTrue(expert.portfolio_scripted_success)
+            self.assertEqual(preview.call_count, 2)
         finally:
             env.close()
 

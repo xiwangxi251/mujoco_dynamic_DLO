@@ -29,8 +29,10 @@ python -m unittest discover -s tests -t . -p "test_*.py"
 规则策略与诊断：
 
 ```bash
-panda-cable-grasp --headless --trials 5 --seed 20260804
-panda-cable-benchmark --help
+panda-cable-grasp --headless --trials 5 --seed 20280804
+panda-cable-benchmark --methods scripted expert --suite core --episodes 20 \
+  --scenario-workers 2 --envs-per-scenario 4
+panda-cable-replay --help
 panda-cable-motion-diagnostics --help
 ```
 
@@ -116,6 +118,7 @@ panda_cable_grasp/
 - [当前状态](docs/current_status.md)
 - [RL 基线与奖励修正](docs/rl_baseline.md)
 - [实验协议](docs/experiment_protocol.md)
+- [统一仿真评测、并行与回放](docs/evaluation.md)
 - [服务器部署](docs/server_setup.md)
 - [DynamicVLA 零样本接入](docs/dynamicvla_zero_shot.md)
 - [DynamicVLA 微调](docs/dynamicvla_finetune.md)

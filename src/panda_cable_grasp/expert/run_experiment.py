@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
+from dataclasses import asdict
 from datetime import datetime
 import json
 import math
@@ -14,12 +15,13 @@ from typing import Any
 import numpy as np
 
 from ..evaluation.benchmark import base_row, summarize
+from ..evaluation.defaults import DEFAULT_EVALUATION_SEED
 from ..env.environment import CableGraspEnv
 from ..scenarios.registry import get_scenario, list_scenario_names
 from ..evaluation.motion_diagnostics import env_config_for_scenario
 from ..paths import output_path
 
-from .formula_intercept_policy import FormulaInterceptExpert
+from .formula_intercept_policy import FormulaInterceptConfig, FormulaInterceptExpert
 
 
 DEFAULT_SCENARIOS = (
@@ -35,6 +37,7 @@ def run_episode(
     episode: int,
     seed: int,
     episode_seconds: float,
+    expert_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     scenario = get_scenario(scenario_name)
     env = CableGraspEnv(env_config_for_scenario(
@@ -44,7 +47,10 @@ def run_episode(
     ))
     try:
         _, initial_info = env.reset(seed=seed)
-        policy = FormulaInterceptExpert(env)
+        policy = FormulaInterceptExpert(
+            env,
+            FormulaInterceptConfig(**(expert_config or {})),
+        )
         min_target_distance = math.inf
         termination_reason: str | None = None
         steps = 0
@@ -62,7 +68,11 @@ def run_episode(
             min_target_distance = min(
                 min_target_distance,
                 float(np.linalg.norm(
-                    env.hand_position - policy._selected_segment(0.0)
+                    env.hand_position - (
+                        policy._locked_segment_position(0.0)
+                        if policy.locked_segment_index is not None
+                        else policy._selected_segment(0.0)
+                    )
                 )),
             )
             if truncated:
@@ -105,9 +115,42 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_SCENARIOS),
     )
     parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=20260804)
+    parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument("--workers", type=int, default=1)
+    defaults = FormulaInterceptConfig()
+    parser.add_argument(
+        "--assumed-reach-speed", type=float,
+        default=defaults.assumed_reach_speed,
+    )
+    parser.add_argument(
+        "--search-shape-all-segments", action=argparse.BooleanOptionalAction,
+        default=defaults.search_shape_all_segments,
+    )
+    parser.add_argument(
+        "--record-intercept-failures", action=argparse.BooleanOptionalAction,
+        default=defaults.record_intercept_failures,
+    )
+    parser.add_argument(
+        "--shape-use-scripted-fallback", action=argparse.BooleanOptionalAction,
+        default=defaults.shape_use_scripted_fallback,
+    )
+    parser.add_argument(
+        "--dynamic-portfolio-enabled", action=argparse.BooleanOptionalAction,
+        default=defaults.dynamic_portfolio_enabled,
+    )
+    parser.add_argument(
+        "--close-capture-distance", type=float,
+        default=defaults.close_capture_distance,
+    )
+    parser.add_argument(
+        "--combined-close-capture-distance", type=float,
+        default=defaults.combined_close_capture_distance,
+    )
+    parser.add_argument(
+        "--close-prediction-horizon", type=float,
+        default=defaults.close_prediction_horizon,
+    )
     parser.add_argument(
         "--output", type=Path,
         default=output_path("benchmarks", "privileged_formula_expert"),
@@ -129,11 +172,22 @@ def main() -> None:
         for scenario in args.scenarios
         for episode in range(1, args.episodes + 1)
     ]
+    expert_config = asdict(FormulaInterceptConfig(
+        assumed_reach_speed=args.assumed_reach_speed,
+        search_shape_all_segments=args.search_shape_all_segments,
+        record_intercept_failures=args.record_intercept_failures,
+        shape_use_scripted_fallback=args.shape_use_scripted_fallback,
+        dynamic_portfolio_enabled=args.dynamic_portfolio_enabled,
+        close_capture_distance=args.close_capture_distance,
+        combined_close_capture_distance=args.combined_close_capture_distance,
+        close_prediction_horizon=args.close_prediction_horizon,
+    ))
     rows: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    with ProcessPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(
-                run_episode, scenario, episode, seed, args.episode_seconds
+                run_episode, scenario, episode, seed, args.episode_seconds,
+                expert_config,
             ): (scenario, episode)
             for scenario, episode, seed in jobs
         }
@@ -170,6 +224,7 @@ def main() -> None:
         "seed": args.seed,
         "episode_seconds": args.episode_seconds,
         "workers": args.workers,
+        "expert_config": expert_config,
     }
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"

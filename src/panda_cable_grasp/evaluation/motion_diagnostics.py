@@ -38,6 +38,7 @@ from ..scenarios.registry import (
     list_suite_scenarios,
 )
 from ..paths import output_path
+from .defaults import DEFAULT_EVALUATION_SEED
 
 
 ROOT = Path(__file__).resolve().parent
@@ -306,7 +307,7 @@ def parse_args() -> argparse.Namespace:
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--suite", choices=SCENARIO_SUITE_NAMES, default="core")
     selection.add_argument("--scenarios", nargs="+")
-    parser.add_argument("--seed", type=int, default=20280804)
+    parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument(
         "--seeds", type=int, default=1,
         help="number of consecutive seeds evaluated for every scenario",

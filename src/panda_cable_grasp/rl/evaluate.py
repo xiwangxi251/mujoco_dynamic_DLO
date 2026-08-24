@@ -31,6 +31,7 @@ from ..evaluation.failure_taxonomy import (
     confirmed_break_times,
     scene_fingerprint,
 )
+from ..evaluation.defaults import DEFAULT_EVALUATION_SEED
 from ..scenarios.registry import list_scenario_names
 from ..paths import output_path
 from .environment import RLCableGraspEnv
@@ -569,6 +570,8 @@ def _episode_row(
     episode_seed: int,
     success: bool,
     failure_type: str,
+    policy_internal_success: bool,
+    policy_failure_type: str,
     task_success: bool,
     task_failure_type: str,
     terminated: bool,
@@ -613,8 +616,8 @@ def _episode_row(
         "scene_fingerprint": scene_fingerprint(initial_info),
         "success": success,
         "failure_type": failure_type,
-        "policy_internal_success": success,
-        "policy_failure_type": failure_type,
+        "policy_internal_success": policy_internal_success,
+        "policy_failure_type": policy_failure_type,
         "task_success": task_success,
         "task_failure_type": task_failure_type,
         "terminated": terminated,
@@ -891,9 +894,13 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                     if wrist_writer is not None:
                         wrist_writer.release()
 
-                success = bool(info.get("success", terminated))
-                failure_type = classify_failure(success, diagnostics)
-                task_success = bool(info.get("base_success", False))
+                task_success = bool(info.get("task_success", info.get(
+                    "base_success", info.get("success", terminated)
+                )))
+                policy_internal_success = bool(info.get("strict_success", False))
+                policy_failure_type = classify_failure(
+                    policy_internal_success, diagnostics
+                )
                 task_failure_type = classify_task_outcome(
                     task_success=task_success,
                     ever_bilateral_candidate=bool(
@@ -904,14 +911,14 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                     ),
                     break_events=env.base_env.grasp_break_history,
                 )
-                outcomes[failure_type] += 1
+                outcomes[policy_failure_type] += 1
                 task_outcomes[task_failure_type] += 1
-                success_mismatches += int(success != task_success)
+                success_mismatches += int(policy_internal_success != task_success)
                 episodes_with_physical_slip += int(
                     diagnostics.ever_physical_slip_event
                 )
                 successful_episodes_with_physical_slip += int(
-                    success and diagnostics.ever_physical_slip_event
+                    policy_internal_success and diagnostics.ever_physical_slip_event
                 )
                 task_success_without_confirmed_grasp += int(
                     task_success
@@ -924,8 +931,10 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                 row = _episode_row(
                     episode=episode,
                     episode_seed=episode_seed,
-                    success=success,
-                    failure_type=failure_type,
+                    success=task_success,
+                    failure_type=task_failure_type,
+                    policy_internal_success=policy_internal_success,
+                    policy_failure_type=policy_failure_type,
                     task_success=task_success,
                     task_failure_type=task_failure_type,
                     terminated=bool(terminated),
@@ -945,7 +954,7 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                 if not args.no_video:
                     assert state_spec is not None
                     assert mjb_path is not None
-                    result = "success" if success else "truncated"
+                    result = "success" if task_success else "truncated"
                     action_array = (
                         np.stack(recorded_actions)
                         if recorded_actions
@@ -1007,14 +1016,14 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                     print(f"  wrist_video={wrist_video_path.resolve()}", flush=True)
                     print(f"  states={states_path.resolve()}", flush=True)
 
-        successes = outcomes["success"]
+        policy_successes = outcomes["success"]
         task_successes = task_outcomes["success"]
         failure_counts = {
             outcome: outcomes[outcome]
             for outcome in FAILURE_TYPES
             if outcome != "success"
         }
-        total_failures = args.episodes - successes
+        total_failures = args.episodes - policy_successes
         physical_slip_failures = outcomes["physical_slip_after_secured"]
         ambiguous_contact_loss_failures = outcomes[
             "open_during_contact_loss_after_secured"
@@ -1057,10 +1066,10 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         )
         summary = {
             "episodes": args.episodes,
-            "policy_successes": successes,
-            "policy_success_rate": successes / args.episodes,
-            "successes": successes,
-            "success_rate": successes / args.episodes,
+            "policy_successes": policy_successes,
+            "policy_success_rate": policy_successes / args.episodes,
+            "successes": task_successes,
+            "success_rate": task_successes / args.episodes,
             "task_successes": task_successes,
             "task_success_rate": task_successes / args.episodes,
             "task_policy_success_mismatches": success_mismatches,
@@ -1121,8 +1130,8 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         _write_json(manifest_path, manifest)
 
         print(
-            f"episodes={args.episodes} policy_successes={successes} "
-            f"policy_success_rate={successes / args.episodes:.1%} "
+            f"episodes={args.episodes} policy_successes={policy_successes} "
+            f"policy_success_rate={policy_successes / args.episodes:.1%} "
             f"task_successes={task_successes} "
             f"task_success_rate={task_successes / args.episodes:.1%} "
             f"mean_return={np.mean(returns):.3f} mean_steps={np.mean(lengths):.1f}",
@@ -1231,11 +1240,16 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Test a trained cable-grasp PPO policy")
+    parser = argparse.ArgumentParser(
+        description=(
+            "PPO checkpoint diagnostics; use panda-cable-benchmark for formal "
+            "cross-policy success-rate evaluation"
+        )
+    )
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--seed", type=int, default=20270804)
+    parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--disturbance", type=float, default=1.5)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     selection = parser.add_mutually_exclusive_group()
@@ -1249,7 +1263,7 @@ def parse_args() -> argparse.Namespace:
         choices=("l1", "id", "legacy"),
         default="l1",
         help=(
-            "scenario distribution; l1 matches the current PPO strict evaluation, "
+            "scenario distribution; l1 matches the current PPO evaluation, "
             "while legacy must be selected explicitly"
         ),
     )

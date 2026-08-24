@@ -177,7 +177,7 @@ class EnvConfig:
     dynamicvla_camera_width: int = 480
     dynamicvla_camera_height: int = 360
     dynamicvla_camera_fovy: float = 73.7397952917
-    dynamicvla_opst_camera_pos: tuple[float, float, float] = (1.0, 0.0, 0.6)
+    dynamicvla_opst_camera_pos: tuple[float, float, float] = (1.3, 0.0, 0.6)
     dynamicvla_opst_camera_quat: tuple[float, float, float, float] = (
         0.6123724357, 0.3535533906, 0.3535533906, 0.6123724357,
     )

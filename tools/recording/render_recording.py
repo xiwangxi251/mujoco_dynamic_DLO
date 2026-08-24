@@ -5,10 +5,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from _bootstrap import bootstrap
-
-bootstrap()
-
 from panda_cable_grasp.runtime import configure_mujoco_runtime
 
 configure_mujoco_runtime()
@@ -29,6 +25,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--camera", choices=("opst", "wrist"), default="opst",
         help="使用模型中环境定义的 DynamicVLA 命名相机",
+    )
+    parser.add_argument(
+        "--camera-x", type=float,
+        help="临时覆盖所选相机的世界/父坐标系 X；Y、Z 和朝向保持不变",
     )
     parser.add_argument("--fps", type=float, default=None,
                         help="输出帧率；默认沿用记录帧率")
@@ -72,11 +72,20 @@ def main(args: argparse.Namespace) -> None:
         if args.camera == "opst"
         else "dynamicvla_wrist_camera"
     )
-    if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name) < 0:
+    camera_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name
+    )
+    if camera_id < 0:
         raise ValueError(
             f"模型不包含环境标准相机 {camera_name!r}; "
             "旧录像请使用保存时附带的旧工具版本"
         )
+    original_camera_pos = model.cam_pos[camera_id].copy()
+    if args.camera_x is not None:
+        if not np.isfinite(args.camera_x):
+            raise ValueError("camera-x必须为有限值")
+        model.cam_pos[camera_id, 0] = args.camera_x
+    camera_pos = model.cam_pos[camera_id].copy()
     expected_state_size = mujoco.mj_stateSize(model, state_spec)
     if states.ndim != 2 or states.shape[1] != expected_state_size:
         raise ValueError(
@@ -106,7 +115,9 @@ def main(args: argparse.Namespace) -> None:
 
     print(
         f"rendered={output_path.resolve()} frames={len(states)} "
-        f"fps={fps:g} size={width}x{height} camera={camera_name}",
+        f"fps={fps:g} size={width}x{height} camera={camera_name} "
+        f"original_pos={original_camera_pos.tolist()} "
+        f"render_pos={camera_pos.tolist()}",
         flush=True,
     )
 

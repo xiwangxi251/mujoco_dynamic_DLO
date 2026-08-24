@@ -57,6 +57,29 @@ class RLBaselineContractTests(unittest.TestCase):
         self.assertAlmostEqual(opened, high)
         self.assertAlmostEqual(open_deadband, high)
 
+    def test_public_task_success_controls_terminal_reward_and_termination(self) -> None:
+        self.env.reset(seed=30)
+        base_info = self.env.base_env.info()
+        base_info["success"] = True
+        base_info["success_now"] = True
+        self.env.base_env.step = lambda action: ({}, 0.0, True, False, base_info)
+        grasp_status = self.env._empty_grasp_status()
+        grasp_status["rl_hold_success"] = False
+        self.env._update_grasp_status = lambda info: grasp_status
+
+        _, reward, terminated, truncated, info = self.env.step(
+            np.zeros(5, dtype=np.float32)
+        )
+
+        self.assertTrue(terminated)
+        self.assertFalse(truncated)
+        self.assertTrue(info["success"])
+        self.assertTrue(info["task_success"])
+        self.assertFalse(info["strict_success"])
+        self.assertFalse(info["policy_internal_success"])
+        self.assertEqual(info["reward_success"], self.env.rl_config.reward_success)
+        self.assertGreater(reward, self.env.rl_config.reward_success - 0.01)
+
     def test_capture_corridor_rewards_close_without_forcing_it_early(self) -> None:
         self.env.reset(seed=28)
         hand_position = self.env._grasp_center_position()
