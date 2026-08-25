@@ -859,6 +859,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             _, _, _, truncated, info = level1.step(level1.ready_ctrl)
             self.assertTrue(info["rigid_motion_nominal_finished"])
             self.assertFalse(info["rigid_motion_finished"])
+            self.assertFalse(info["rigid_motion_suspended"])
             self.assertFalse(info["rigid_motion_released"])
             self.assertFalse(truncated)
             self.assertIsNone(info["termination_reason"])
@@ -880,10 +881,6 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 info["termination_reason"], "rigid_motion_boundary_crossed"
             )
 
-            level1.rigid_motion_released = True
-            _, _, _, truncated, info = level1.step(level1.ready_ctrl)
-            self.assertFalse(truncated)
-            self.assertIsNone(info["termination_reason"])
         finally:
             del level1, level2
 
@@ -998,7 +995,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_rigid_motion_waits_for_confirmed_grasp_before_releasing_drive(self) -> None:
+    def test_rigid_motion_suspension_follows_current_confirmed_grasp(self) -> None:
         env = self.make("id_rigid_l1_nominal")
         try:
             env.reset(seed=47)
@@ -1010,21 +1007,67 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 last_bilateral_time=float(env.data.time),
                 lost_contact_time=0.0,
             )
-            env._update_rigid_motion_release_state()
+            env._update_rigid_motion_suspension_state()
+            self.assertFalse(env.rigid_motion_suspended)
             self.assertFalse(env.rigid_motion_released)
 
             env.grasp_state.bilateral_confirmed = True
-            env._update_rigid_motion_release_state()
+            env._update_rigid_motion_suspension_state()
+            self.assertTrue(env.rigid_motion_suspended)
             self.assertTrue(env.rigid_motion_released)
 
-            # 该状态需要锁存，防止抓取后的短暂接触抖动重新启动整体驱动。
+            env._clear_grasp_with_reason("lost_physical_pad_contact")
+            env._update_rigid_motion_suspension_state()
+            self.assertFalse(env.rigid_motion_suspended)
+            # The legacy field records that drive was released at least once.
+            self.assertTrue(env.rigid_motion_released)
+            self.assertEqual(
+                env.last_grasp_break["causal_class"], "physical_slip"
+            )
+        finally:
+            del env
+
+    def test_active_open_resumes_rigid_motion(self) -> None:
+        env = self.make("id_rigid_l1_nominal")
+        try:
+            env.reset(seed=48)
+            env.grasp_state = GraspState(
+                body_id=env.target_body_id,
+                candidate_time=float(env.data.time),
+                bilateral_confirmed=True,
+                last_bilateral_time=float(env.data.time),
+                lost_contact_time=0.0,
+            )
+            env._update_rigid_motion_suspension_state()
+            self.assertTrue(env.rigid_motion_suspended)
+
+            env._update_physical_grasp_state(gripper_closed=False)
+            env._update_rigid_motion_suspension_state()
+            self.assertFalse(env.rigid_motion_suspended)
+            self.assertEqual(env.last_grasp_break["causal_class"], "active_open")
+            self.assertTrue(env.rigid_motion_released)
+            env.data.time = RIGID_MOTION_START_TIME + 0.2
+            env.data.xfrc_applied[:] = 0.0
+            env._apply_cable_disturbance()
+            self.assertGreater(
+                np.linalg.norm(env._last_rigid_translation_acceleration), 0.0
+            )
+        finally:
+            del env
+
+    def test_rigid_motion_release_history_does_not_keep_drive_suspended(self) -> None:
+        env = self.make("id_rigid_l1_nominal")
+        try:
+            env.reset(seed=49)
+            env.rigid_motion_released = True
             env.grasp_state = None
-            env._update_rigid_motion_release_state()
+            env._update_rigid_motion_suspension_state()
+            self.assertFalse(env.rigid_motion_suspended)
             self.assertTrue(env.rigid_motion_released)
         finally:
             del env
 
-    def test_rigid_motion_releases_environment_drive_after_confirmed_grasp(self) -> None:
+    def test_rigid_motion_pauses_and_resumes_environment_drive(self) -> None:
         env = self.make("id_rigid_l1_nominal")
         try:
             env.reset(seed=44)
@@ -1033,7 +1076,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             self.assertGreater(
                 np.linalg.norm(env._last_rigid_translation_acceleration), 0.0
             )
-            env.rigid_motion_released = True
+            env.rigid_motion_suspended = True
             env.data.xfrc_applied[:] = 0.0
             env._apply_cable_disturbance()
             self.assertTrue(np.array_equal(
@@ -1048,6 +1091,12 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 env._last_rigid_shape_hold_acceleration,
                 np.zeros_like(env._last_rigid_shape_hold_acceleration),
             ))
+            env.rigid_motion_suspended = False
+            env.data.xfrc_applied[:] = 0.0
+            env._apply_cable_disturbance()
+            self.assertGreater(
+                np.linalg.norm(env._last_rigid_translation_acceleration), 0.0
+            )
         finally:
             del env
 
@@ -1108,7 +1157,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             for env in environments:
                 del env
 
-    def test_combined_motion_releases_only_rigid_drive_after_confirmed_grasp(self) -> None:
+    def test_combined_motion_pauses_and_resumes_only_rigid_drive(self) -> None:
         env = self.make("id_combined_l1_nominal")
         try:
             env.reset(seed=46)
@@ -1122,7 +1171,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 env._last_rigid_shape_hold_acceleration,
                 np.zeros_like(env._last_rigid_shape_hold_acceleration),
             ))
-            env.rigid_motion_released = True
+            env.rigid_motion_suspended = True
             env._apply_cable_disturbance()
             self.assertGreater(np.linalg.norm(env._last_shape_acceleration), 0.0)
             self.assertTrue(np.array_equal(
@@ -1133,6 +1182,12 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 env._last_rigid_rotation_acceleration,
                 np.zeros_like(env._last_rigid_rotation_acceleration),
             ))
+            env.rigid_motion_suspended = False
+            env._apply_cable_disturbance()
+            self.assertGreater(np.linalg.norm(env._last_shape_acceleration), 0.0)
+            self.assertGreater(
+                np.linalg.norm(env._last_rigid_translation_acceleration), 0.0
+            )
         finally:
             del env
 

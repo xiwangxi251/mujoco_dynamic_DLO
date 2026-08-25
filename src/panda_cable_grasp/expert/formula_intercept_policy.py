@@ -106,7 +106,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         self.shadow_trajectory: ShadowTrajectory | None = None
         self.shadow_rollouts = 0
         self.shadow_physics_steps = 0
-        self._shadow_release_state = False
+        self._shadow_suspension_state = False
         self.episode_use_scripted = False
         self.portfolio_formula_success: bool | None = None
         self.portfolio_scripted_success: bool | None = None
@@ -136,7 +136,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         self.shadow_trajectory = None
         self.shadow_rollouts = 0
         self.shadow_physics_steps = 0
-        self._shadow_release_state = bool(self.env.rigid_motion_released)
+        self._shadow_suspension_state = bool(self.env.rigid_motion_suspended)
         current_rotation = self.env.data.xmat[self.env.hand_id].reshape(3, 3)
         z_rotation = np.array([
             [0.0, -1.0, 0.0],
@@ -215,7 +215,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         self.shadow_trajectory = self.shadow_oracle.rollout(duration)
         self.shadow_rollouts += 1
         self.shadow_physics_steps += len(self.shadow_trajectory.positions) - 1
-        self._shadow_release_state = bool(self.env.rigid_motion_released)
+        self._shadow_suspension_state = bool(self.env.rigid_motion_suspended)
 
     def _shadow_node_states(
         self, horizon: float,
@@ -228,7 +228,8 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
             self.shadow_trajectory is None
             or current_time < self.shadow_trajectory.origin_time
             or required_elapsed > self.shadow_trajectory.duration
-            or self._shadow_release_state != bool(self.env.rigid_motion_released)
+            or self._shadow_suspension_state
+            != bool(self.env.rigid_motion_suspended)
         )
         if cache_invalid:
             self._refresh_shadow_trajectory(
@@ -254,7 +255,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         velocities = np.clip(velocities, -0.8, 0.8)
         uses_rigid = (
             self.env.config.motion_profile_version in RIGID_MOTION_PROFILES
-            and not self.env.rigid_motion_released
+            and not self.env.rigid_motion_suspended
         )
         if uses_rigid:
             predicted, rigid_velocity = self._rigid_future_nodes(horizon)

@@ -176,6 +176,9 @@ def _base_row(
             info.get("rigid_motion_nominal_finished", False)
         ),
         "rigid_motion_finished": bool(info.get("rigid_motion_finished", False)),
+        "rigid_motion_suspended": bool(
+            info.get("rigid_motion_suspended", False)
+        ),
         "rigid_motion_released": bool(info.get("rigid_motion_released", False)),
         "termination_reason": info.get("termination_reason"),
         "cable_length_scale": float(initial_info.get("cable_length_scale", 1.0)),

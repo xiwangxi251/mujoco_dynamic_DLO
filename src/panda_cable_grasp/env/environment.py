@@ -565,7 +565,10 @@ class CableGraspEnv:
         self.grasp_break_history: list[dict] = []
         self.ever_bilateral_candidate = False
         self.ever_confirmed_grasp = False
+        # ``released`` is retained as an episode-history flag for log
+        # compatibility.  ``suspended`` is the live, reversible drive state.
         self.rigid_motion_released = False
+        self.rigid_motion_suspended = False
         self.last_termination_reason: str | None = None
         self.episode_seed: int | None = None
         self.initial_cable_translation = np.zeros(2)
@@ -712,6 +715,7 @@ class CableGraspEnv:
         self.ever_bilateral_candidate = False
         self.ever_confirmed_grasp = False
         self.rigid_motion_released = False
+        self.rigid_motion_suspended = False
         self.last_termination_reason = None
         self._last_contact_count = 0
         self._last_shape_acceleration[:] = 0.0
@@ -778,7 +782,7 @@ class CableGraspEnv:
             # 更新抓取候选
             self._last_contact_count = len(self._finger_contact_pairs())
             self._update_physical_grasp_state(gripper_closed)
-            self._update_rigid_motion_release_state()
+            self._update_rigid_motion_suspension_state()
 
             # 任务成功所要求的几何条件检查
             last_qualification = self._success_qualification(gripper_closed)
@@ -809,7 +813,7 @@ class CableGraspEnv:
                 }
             rigid_motion_boundary_crossed = (
                 self.rigid_motion_finished
-                and not self.rigid_motion_released
+                and not self.rigid_motion_suspended
             )
             if rigid_motion_boundary_crossed:
                 self.last_termination_reason = "rigid_motion_boundary_crossed"
@@ -1165,8 +1169,9 @@ class CableGraspEnv:
             "rigid_motion_active": bool(
                 uses_rigid_motion
                 and not self.rigid_motion_finished
-                and not self.rigid_motion_released
+                and not self.rigid_motion_suspended
             ),
+            "rigid_motion_suspended": self.rigid_motion_suspended,
             "rigid_motion_released": self.rigid_motion_released,
             "termination_reason": self.last_termination_reason,
             "initial_shape_family": self._rigid_initial_shape_family,
@@ -1336,12 +1341,15 @@ class CableGraspEnv:
             <= self.config.grasp_loss_seconds
         )
 
-    def _update_rigid_motion_release_state(self) -> None:
-        """稳定双侧抓取确认后，锁存L1/L2整体运动的撤除状态。"""
-        if (
+    def _update_rigid_motion_suspension_state(self) -> None:
+        """Suspend L1/L2 drive only while a confirmed grasp remains active."""
+        self.rigid_motion_suspended = bool(
             self.config.motion_profile_version in RIGID_MOTION_PROFILES
             and self.grasp_confirmed
-        ):
+        )
+        if self.rigid_motion_suspended:
+            # Preserve the old field as an "ever released" diagnostic so
+            # existing episode logs remain comparable.
             self.rigid_motion_released = True
 
     def _update_physical_grasp_state(self, gripper_closed: bool) -> None:
@@ -1671,8 +1679,9 @@ class CableGraspEnv:
             shape = self._shape_acceleration(t, p)
         if self.config.motion_mode in {"rigid", "combined"}:
             # All rigid motion is now an explicit L1/L2 single pass.  It stops
-            # after confirmed bilateral grasp; combined shape motion continues.
-            if not self.rigid_motion_released:
+            # during confirmed bilateral grasp and resumes after grasp loss or
+            # an active-open command; combined shape motion always continues.
+            if not self.rigid_motion_suspended:
                 velocity_xy = np.array([
                     self.body_linear_velocity(body_id)[:2]
                     for body_id in self.cable_ids
