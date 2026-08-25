@@ -493,11 +493,24 @@ def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
         env = CableGraspEnv(config)
         base_env = env
         if method == "scripted":
-            policy = DynamicCableGraspPolicy(env)
+            policy = DynamicCableGraspPolicy(
+                env,
+                PolicyConfig(
+                    strict_vertical_gripper=bool(job["strict_vertical_gripper"])
+                ),
+            )
         elif method == "expert":
-            from ..expert.formula_intercept_policy import FormulaInterceptExpert
+            from ..expert.formula_intercept_policy import (
+                FormulaInterceptConfig,
+                FormulaInterceptExpert,
+            )
 
-            policy = FormulaInterceptExpert(env)
+            policy = FormulaInterceptExpert(
+                env,
+                FormulaInterceptConfig(
+                    strict_vertical_gripper=bool(job["strict_vertical_gripper"])
+                ),
+            )
         else:  # Defensive: argparse normally prevents this path.
             raise ValueError(f"unsupported evaluation method: {method}")
 
@@ -577,6 +590,8 @@ def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
             "truncated": bool(truncated),
             "compiled_model": str(job["compiled_model"]),
         })
+        if method != "ppo":
+            row.update(policy.policy_info())
         if recorder is not None:
             artifacts = recorder.finish(row)
             row.update(artifacts.relative_to(Path(job["output_dir"])))
@@ -745,6 +760,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--video-fps", type=float, default=DEFAULT_VIDEO_FPS)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--strict-vertical-gripper",
+        action="store_true",
+        help=(
+            "make the vertical grasp orientation the primary IK task and "
+            "solve translation in its nullspace"
+        ),
+    )
     parser.add_argument("--output", type=Path, default=output_path("benchmarks"))
     args = parser.parse_args()
     args.methods = list(dict.fromkeys(args.methods))
@@ -772,6 +795,9 @@ def run_benchmark(args: argparse.Namespace) -> Path:
 
     scenarios = _select_scenarios(args)
     seeds = [args.seed + index for index in range(args.episodes)]
+    strict_vertical_gripper = bool(
+        getattr(args, "strict_vertical_gripper", False)
+    )
     requested_run_name = getattr(args, "run_name", None)
     if requested_run_name is None:
         output_dir = create_unique_run_dir(args.output)
@@ -825,6 +851,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                     "episode_seconds": args.episode_seconds,
                     "ppo_model": args.ppo_model,
                     "device": args.device,
+                    "strict_vertical_gripper": strict_vertical_gripper,
                     "recording": args.recording,
                     "video_fps": args.video_fps,
                     "output_dir": output_dir,
@@ -945,7 +972,11 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                 "rl_environment": ROOT / "src" / "panda_cable_grasp" / "rl" / "environment.py",
             }.items()
         },
-        "configs": {"scripted_policy": asdict(PolicyConfig())},
+        "configs": {
+            "scripted_policy": asdict(PolicyConfig(
+                strict_vertical_gripper=strict_vertical_gripper
+            ))
+        },
         "task_outcome_types": list(TASK_OUTCOME_TYPES),
         "paired_scene_fingerprints_verified": paired_verification,
         "git_commit": _git_text("rev-parse", "HEAD"),
@@ -967,7 +998,9 @@ def run_benchmark(args: argparse.Namespace) -> Path:
         manifest["configs"]["rl"] = asdict(RLConfig())
     if "expert" in args.methods:
         from ..expert.formula_intercept_policy import FormulaInterceptConfig
-        manifest["configs"]["expert"] = asdict(FormulaInterceptConfig())
+        manifest["configs"]["expert"] = asdict(FormulaInterceptConfig(
+            strict_vertical_gripper=strict_vertical_gripper
+        ))
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )

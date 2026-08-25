@@ -506,6 +506,10 @@ class EnvironmentScenarioTests(unittest.TestCase):
         self.assertEqual(config.precision_linear_velocity_limit, 0.65)
         self.assertEqual(config.approach_orientation_gain, 0.65)
         self.assertEqual(config.precision_orientation_gain, 1.0)
+        self.assertFalse(config.strict_vertical_gripper)
+        self.assertAlmostEqual(
+            config.strict_vertical_tolerance, math.radians(5.0)
+        )
         self.assertEqual(config.policy_joint_velocity_fraction, 1.0)
         self.assertEqual(config.ik_target_horizon, 0.11)
         with self.assertRaisesRegex(ValueError, "prediction_horizon"):
@@ -646,6 +650,36 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 policy.config.policy_joint_velocity_fraction + 1e-9,
             )
             self.assertGreater(policy.config.ik_target_horizon, control_dt)
+        finally:
+            del env
+
+    def test_strict_vertical_gripper_makes_orientation_the_primary_ik_task(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1015)
+            policy = DynamicCableGraspPolicy(
+                env, PolicyConfig(strict_vertical_gripper=True)
+            )
+            self.assertTrue(np.allclose(
+                policy.desired_approach_axis, [0.0, 0.0, -1.0], atol=1e-12
+            ))
+            policy.phase = Phase.INTERCEPT
+            shared = np.zeros((3, 7))
+            shared[:, :3] = np.eye(3)
+            policy._task_jacobian = lambda: np.vstack([shared, shared])
+            policy._orientation_error = lambda: (
+                np.array([-0.10, 0.0, 0.0]), 0.10
+            )
+
+            action = policy._ik_action(
+                env.hand_position + np.array([0.01, 0.0, 0.0]), 255.0
+            )
+            requested_velocity = (
+                action[:7] - env.data.qpos[env.arm_qpos_adr]
+            ) / policy.config.ik_target_horizon
+
+            # The synthetic tasks demand opposite q0 motion. Orientation must win.
+            self.assertLess(requested_velocity[0], 0.0)
         finally:
             del env
 

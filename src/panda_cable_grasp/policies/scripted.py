@@ -57,6 +57,10 @@ class PolicyConfig:
     precision_linear_velocity_limit: float = 0.65
     approach_orientation_gain: float = 0.65
     precision_orientation_gain: float = 1.0
+    # Experimental ablation: make the complete vertical grasp orientation the
+    # primary IK task and solve translation only in its nullspace.
+    strict_vertical_gripper: bool = False
+    strict_vertical_tolerance: float = math.radians(5.0)
     policy_joint_velocity_fraction: float = 1.0
     ik_target_horizon: float = 0.11
     intercept_timeout: float = 9.0
@@ -85,7 +89,7 @@ class PolicyConfig:
             "approach_linear_velocity_limit", "intercept_linear_velocity_limit",
             "precision_linear_velocity_limit", "policy_joint_velocity_fraction",
             "approach_orientation_gain", "precision_orientation_gain",
-            "ik_target_horizon",
+            "ik_target_horizon", "strict_vertical_tolerance",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
@@ -97,6 +101,8 @@ class PolicyConfig:
             raise ValueError("target_filter_alpha must be in (0, 1]")
         if not 0.0 < self.policy_joint_velocity_fraction <= 1.0:
             raise ValueError("policy_joint_velocity_fraction must be in (0, 1]")
+        if not isinstance(self.strict_vertical_gripper, bool):
+            raise ValueError("strict_vertical_gripper must be boolean")
         for name in (
             "intercept_x_limits", "intercept_y_limits", "intercept_z_limits",
         ):
@@ -121,6 +127,9 @@ class DynamicCableGraspPolicy:
     # 成对消融没有显示减小挤压的稳定收益，反而增加了确认抓取后的终局物理滑脱，
     # 因此脚本基线恢复为完全闭合；最终开口仍由真实碰撞和执行器力范围决定。
     HOLD_GRIPPER_CTRL = 0.0
+    # Columns are the desired hand-local x/y/z axes in world coordinates.
+    # Local z points straight down and local y is the finger closing axis.
+    VERTICAL_GRASP_ROTATION = np.diag([-1.0, 1.0, -1.0])
 
     def __init__(self, env: CableGraspEnv, config: PolicyConfig | None = None):
         self.env = env
@@ -144,6 +153,12 @@ class DynamicCableGraspPolicy:
         self.recover_goal = np.zeros(3)
         self.failure_hold_position = np.zeros(3)
         self.max_recover_xy_drift = 0.0
+        self.tilt_error_sum = 0.0
+        self.tilt_error_samples = 0
+        self.max_tilt_error = 0.0
+        self.grasp_tilt_error_sum = 0.0
+        self.grasp_tilt_error_samples = 0
+        self.max_grasp_tilt_error = 0.0
         self.last_desired = np.zeros(3)
         self.desired_quat = np.array([1.0, 0.0, 0.0, 0.0])
         self.desired_approach_axis = np.array([0.0, 0.0, 1.0])
@@ -166,6 +181,12 @@ class DynamicCableGraspPolicy:
         self.failure_hold_position = self.last_desired.copy()
         self.hold_position = self.last_desired.copy()
         self.max_recover_xy_drift = 0.0
+        self.tilt_error_sum = 0.0
+        self.tilt_error_samples = 0
+        self.max_tilt_error = 0.0
+        self.grasp_tilt_error_sum = 0.0
+        self.grasp_tilt_error_samples = 0
+        self.max_grasp_tilt_error = 0.0
         rotation = self.env.data.xmat[self.env.hand_id].reshape(3, 3)
         # 线缆切向主要沿世界坐标 X，因此把平行夹爪开合方向旋转到 Y。
         z_rotation = np.array([
@@ -173,7 +194,11 @@ class DynamicCableGraspPolicy:
             [1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0],
         ])
-        desired_rotation = z_rotation @ rotation
+        desired_rotation = (
+            self.VERTICAL_GRASP_ROTATION.copy()
+            if self.config.strict_vertical_gripper
+            else z_rotation @ rotation
+        )
         self.desired_quat = rotation_to_quat(desired_rotation)
         self.desired_approach_axis = desired_rotation[:, 2].copy()
 
@@ -299,7 +324,7 @@ class DynamicCableGraspPolicy:
         return self._ik_action(hand, 255.0)
 
     def _ik_action(self, desired_position: np.ndarray, gripper: float) -> np.ndarray:
-        """用位置优先的分层阻尼IK生成关节目标和夹爪命令。"""
+        """Use the selected hierarchical damped IK ordering."""
 
         model = self.env.model
         data = self.env.data
@@ -322,55 +347,95 @@ class DynamicCableGraspPolicy:
         linear_velocity = self._limit_vector_norm(
             6.0 * position_error, linear_velocity_limit
         )
+        if (
+            self.config.strict_vertical_gripper
+            and self._tilt_error() > self.config.strict_vertical_tolerance
+        ):
+            # Do not trade tilt for progress. Once outside the five-degree
+            # operational envelope, hold translation until orientation recovers.
+            linear_velocity = np.zeros(3)
         angular_velocity = self._limit_vector_norm(2.5 * orientation_error, 1.40)
 
-        # 位置是严格的一级任务。姿态只使用位置任务的零空间，因此即使目标接近
-        # 工作空间边缘，也不能为了转动夹爪而把夹持中心压向桌面或拉离目标。
         jacobian = self._task_jacobian()
         position_jacobian = jacobian[:3]
-        position_damping = 0.04
-        position_inverse = np.linalg.solve(
-            position_jacobian @ position_jacobian.T
-            + position_damping**2 * np.eye(3),
-            np.eye(3),
-        )
-        position_pseudoinverse = position_jacobian.T @ position_inverse
-        position_velocity = position_pseudoinverse @ linear_velocity
-        position_nullspace = np.eye(7) - np.linalg.pinv(
-            position_jacobian, rcond=1e-5
-        ) @ position_jacobian
+        if self.config.strict_vertical_gripper:
+            # The full vertical grasp pose is primary. Translation receives the
+            # remaining four-DOF nullspace and may lag instead of tilting the hand.
+            # An exact pseudoinverse is intentional here: damping the primary
+            # inverse couples a requested world-z yaw into roll/pitch residuals,
+            # which defeats the strict vertical constraint.
+            orientation_jacobian = jacobian[3:]
+            orientation_pseudoinverse = np.linalg.pinv(
+                orientation_jacobian, rcond=1e-5
+            )
+            orientation_velocity = orientation_pseudoinverse @ angular_velocity
+            orientation_nullspace = (
+                np.eye(7)
+                - orientation_pseudoinverse @ orientation_jacobian
+            )
+            secondary_position_jacobian = (
+                position_jacobian @ orientation_nullspace
+            )
+            position_damping = 0.04
+            position_inverse = np.linalg.solve(
+                secondary_position_jacobian @ secondary_position_jacobian.T
+                + position_damping**2 * np.eye(3),
+                np.eye(3),
+            )
+            position_residual = (
+                linear_velocity - position_jacobian @ orientation_velocity
+            )
+            position_velocity = (
+                secondary_position_jacobian.T
+                @ position_inverse
+                @ position_residual
+            )
+            q_velocity = orientation_velocity + position_velocity
+        else:
+            # Baseline: position is primary and orientation uses only its nullspace.
+            position_damping = 0.04
+            position_inverse = np.linalg.solve(
+                position_jacobian @ position_jacobian.T
+                + position_damping**2 * np.eye(3),
+                np.eye(3),
+            )
+            position_pseudoinverse = position_jacobian.T @ position_inverse
+            position_velocity = position_pseudoinverse @ linear_velocity
+            position_nullspace = np.eye(7) - np.linalg.pinv(
+                position_jacobian, rcond=1e-5
+            ) @ position_jacobian
 
-        orientation_gain = (
-            self.config.approach_orientation_gain
-            if fast_approach
-            else self.config.precision_orientation_gain
-        )
-        orientation_jacobian = jacobian[3:] @ position_nullspace
-        orientation_sigma_min = float(
-            np.linalg.svd(orientation_jacobian, compute_uv=False)[-1]
-        )
-        orientation_singularity = float(np.clip(
-            (0.10 - orientation_sigma_min) / 0.10, 0.0, 1.0
-        ))
-        orientation_damping = (
-            0.04 + 0.12 * orientation_singularity * orientation_singularity
-        )
-        orientation_inverse = np.linalg.solve(
-            orientation_jacobian @ orientation_jacobian.T
-            + orientation_damping**2 * np.eye(3),
-            np.eye(3),
-        )
-        orientation_residual = (
-            angular_velocity - jacobian[3:] @ position_velocity
-        )
-        orientation_velocity = (
-            orientation_jacobian.T
-            @ orientation_inverse
-            @ orientation_residual
-        )
-        q_velocity = (
-            position_velocity + orientation_gain * orientation_velocity
-        )
+            orientation_gain = (
+                self.config.approach_orientation_gain
+                if fast_approach
+                else self.config.precision_orientation_gain
+            )
+            orientation_jacobian = jacobian[3:] @ position_nullspace
+            orientation_sigma_min = float(
+                np.linalg.svd(orientation_jacobian, compute_uv=False)[-1]
+            )
+            orientation_singularity = float(np.clip(
+                (0.10 - orientation_sigma_min) / 0.10, 0.0, 1.0
+            ))
+            orientation_damping = (
+                0.04 + 0.12 * orientation_singularity * orientation_singularity
+            )
+            orientation_inverse = np.linalg.solve(
+                orientation_jacobian @ orientation_jacobian.T
+                + orientation_damping**2 * np.eye(3),
+                np.eye(3),
+            )
+            orientation_residual = (
+                angular_velocity - jacobian[3:] @ position_velocity
+            )
+            orientation_velocity = (
+                orientation_jacobian.T
+                @ orientation_inverse
+                @ orientation_residual
+            )
+            q_velocity = (
+                position_velocity + orientation_gain * orientation_velocity
+            )
 
         # 最后的冗余自由度才用于回到ready姿态，避免肘部任意翻转和逼近关节限位；
         # 使用完整任务的精确零空间，不能污染上面的手部位置和姿态任务。
@@ -426,6 +491,16 @@ class DynamicCableGraspPolicy:
     def action(self) -> np.ndarray:
         """推进反应式状态机，并返回一个控制周期的动作。"""
         # 无论处于哪个阶段，策略只读取环境状态并返回动作，不直接修改线缆物理。
+        tilt_error = self._tilt_error()
+        self.tilt_error_sum += tilt_error
+        self.tilt_error_samples += 1
+        self.max_tilt_error = max(self.max_tilt_error, tilt_error)
+        if self.phase in {Phase.INTERCEPT, Phase.CLOSE}:
+            self.grasp_tilt_error_sum += tilt_error
+            self.grasp_tilt_error_samples += 1
+            self.max_grasp_tilt_error = max(
+                self.max_grasp_tilt_error, tilt_error
+            )
         hand = self.env.hand_position
         # 一旦真实指垫接触产生候选，就锁定实际进入夹爪的局部线段；否则继续追踪
         # 回合开始时选择的参考目标。这样不会夹到线后仍被远处目标节点拉走。
@@ -456,10 +531,12 @@ class DynamicCableGraspPolicy:
                 np.linalg.norm(hand - desired)
                 < self.config.approach_position_tolerance
             )
-            tilt_ready = (
-                tilt_angle
-                < self.config.approach_tilt_tolerance
+            tilt_tolerance = (
+                self.config.strict_vertical_tolerance
+                if self.config.strict_vertical_gripper
+                else self.config.approach_tilt_tolerance
             )
+            tilt_ready = tilt_angle < tilt_tolerance
             if position_ready and tilt_ready:
                 # Select one material segment when descent begins.  Re-selecting
                 # the globally nearest point every control step makes the goal
@@ -483,7 +560,14 @@ class DynamicCableGraspPolicy:
             nearest, nearest_distance, _, _ = self._nearest_cable_point(hand)
             # 截获期间持续追踪进入该阶段时锁定的材料线段，避免在相邻弯折间
             # 跳变；但闭爪触发仍以任意真实线缆中心线进入夹持区域为准。
-            if nearest_distance < self._close_capture_distance():
+            vertical_ready = (
+                not self.config.strict_vertical_gripper
+                or tilt_angle < self.config.strict_vertical_tolerance
+            )
+            if (
+                nearest_distance < self._close_capture_distance()
+                and vertical_ready
+            ):
                 desired = self._lock_segment_near(nearest)
                 self.filtered_target = desired.copy()
                 self._transition(Phase.CLOSE)
@@ -647,6 +731,23 @@ class DynamicCableGraspPolicy:
 
         self.finished = True
         return self._home_action()
+
+    def policy_info(self) -> dict[str, float | int | bool]:
+        """Return orientation-ablation diagnostics for benchmark rows."""
+
+        return {
+            "strict_vertical_gripper": self.config.strict_vertical_gripper,
+            "mean_tilt_error_rad": (
+                self.tilt_error_sum / max(self.tilt_error_samples, 1)
+            ),
+            "max_tilt_error_rad": self.max_tilt_error,
+            "grasp_mean_tilt_error_rad": (
+                self.grasp_tilt_error_sum
+                / max(self.grasp_tilt_error_samples, 1)
+            ),
+            "grasp_max_tilt_error_rad": self.max_grasp_tilt_error,
+            "grasp_tilt_samples": self.grasp_tilt_error_samples,
+        }
 
     def summary(self) -> str:
         info = self.env.info()

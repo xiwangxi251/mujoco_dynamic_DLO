@@ -143,7 +143,11 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
             [1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0],
         ])
-        self._base_grasp_rotation = z_rotation @ current_rotation
+        self._base_grasp_rotation = (
+            self.VERTICAL_GRASP_ROTATION.copy()
+            if self.config.strict_vertical_gripper
+            else z_rotation @ current_rotation
+        )
         if (
             self.expert_config.dynamic_portfolio_enabled
             and self.env.episode_seed is not None
@@ -422,7 +426,12 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
             seed = self.env.episode_seed
             preview_env.reset(seed=seed)
             if use_scripted:
-                policy: DynamicCableGraspPolicy = DynamicCableGraspPolicy(preview_env)
+                # Preserve the experimental base-policy configuration. In
+                # particular, a strict-orientation Expert portfolio must not
+                # compare against or silently select the position-first baseline.
+                policy: DynamicCableGraspPolicy = DynamicCableGraspPolicy(
+                    preview_env, self.expert_config
+                )
             else:
                 preview_config = replace(
                     self.expert_config,
