@@ -174,6 +174,14 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             scenario.name: scenario for scenario in self._scenario_configs
         }
         self._active_scenario_names = tuple(self._scenario_by_name)
+        self._active_scenario_probabilities = (
+            tuple(
+                1.0 / len(self._active_scenario_names)
+                for _ in self._active_scenario_names
+            )
+            if self._active_scenario_names
+            else ()
+        )
         self._final_disturbance_scale = float(disturbance_strength) / 1.5
         self._motion_difficulty = 1.0
         if self._scenario_configs and env_config is not None:
@@ -306,13 +314,22 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._scenario_by_name[name]
             for name in self._active_scenario_names
         )
-        # 训练中的普通reset随机采样；严格评估传连续显式seed时按模循环，保证
-        # core/ID场景近似等次数覆盖，而不是小样本恰好漏掉某种运动类型。
-        index = (
-            int(explicit_seed) % len(active_configs)
-            if explicit_seed is not None
-            else int(self.np_random.integers(0, len(active_configs)))
+        probabilities = np.asarray(
+            self._active_scenario_probabilities, dtype=float
         )
+        # 训练中的普通 reset 按课程权重采样；严格评估使用均匀分布并传连续
+        # 显式 seed，此时按模循环，保证小样本也能近似等次数覆盖目标场景。
+        if explicit_seed is not None and np.allclose(
+            probabilities, 1.0 / len(active_configs)
+        ):
+            index = int(explicit_seed) % len(active_configs)
+        elif explicit_seed is not None:
+            seeded_rng = np.random.default_rng(int(explicit_seed))
+            index = int(seeded_rng.choice(len(active_configs), p=probabilities))
+        else:
+            index = int(
+                self.np_random.choice(len(active_configs), p=probabilities)
+            )
         scenario = active_configs[index]
         overrides = scenario.to_env_overrides()
         amplitude_scale = 0.5 + (
@@ -1272,6 +1289,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         result["motion_curriculum_difficulty"] = self._motion_difficulty
         result["motion_curriculum_scenarios"] = self._active_scenario_names
+        result["motion_curriculum_scenario_probabilities"] = (
+            self._active_scenario_probabilities
+        )
         result["raw_finger_contacts"] = len(self.base_env.finger_contacts())
         result["unique_contacting_fingers"] = len({
             finger for _, finger in self.base_env._finger_contact_pairs()
@@ -1377,15 +1397,43 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
     def set_training_scenarios(self, scenario_names: Sequence[str]) -> None:
         """Restrict future resets to a curriculum subset of compiled scenarios."""
         names = tuple(str(name) for name in scenario_names)
+        self.set_training_scenario_distribution(
+            names, tuple(1.0 for _ in names)
+        )
+
+    def set_training_scenario_distribution(
+        self,
+        scenario_names: Sequence[str],
+        probabilities: Sequence[float],
+    ) -> None:
+        """Set a weighted scenario distribution used by subsequent resets."""
+        names = tuple(str(name) for name in scenario_names)
         if not names:
             raise ValueError("training scenario subset cannot be empty")
+        if len(set(names)) != len(names):
+            raise ValueError("training scenario names must be unique")
         unknown = set(names) - set(self._scenario_by_name)
         if unknown:
             raise ValueError(
                 "curriculum scenarios were not compiled into this environment: "
                 + ", ".join(sorted(unknown))
             )
+        weights = np.asarray(tuple(probabilities), dtype=float)
+        if weights.shape != (len(names),):
+            raise ValueError(
+                "scenario probabilities must match the number of scenarios"
+            )
+        if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+            raise ValueError(
+                "scenario probabilities must be finite and non-negative"
+            )
+        total = float(np.sum(weights))
+        if total <= 0.0:
+            raise ValueError("scenario probabilities must have positive mass")
         self._active_scenario_names = names
+        self._active_scenario_probabilities = tuple(
+            float(value) for value in weights / total
+        )
 
     def set_motion_difficulty(self, difficulty: float) -> None:
         """Set low-to-nominal motion difficulty for subsequent episode resets."""

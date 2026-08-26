@@ -8,6 +8,8 @@ from panda_cable_grasp.rl.environment import RLCableGraspEnv
 from panda_cable_grasp.rl.train import (
     MotionCurriculumCallback,
     RL_L1_CURRICULUM_STAGES,
+    RL_L1_CURRICULUM_TRAINING_MIXES,
+    build_l1_curriculum_training_mixes,
 )
 
 
@@ -301,7 +303,43 @@ class RLBaselineContractTests(unittest.TestCase):
         finally:
             curriculum_env.close()
 
-    def test_curriculum_uses_strict_eval_thresholds_and_discrete_intensities(self) -> None:
+    def test_curriculum_training_distribution_supports_weighted_rehearsal(
+        self,
+    ) -> None:
+        curriculum_env = RLCableGraspEnv(
+            seed=24,
+            episode_seconds=0.20,
+            scenario_names=("id_static", "id_shape_nominal_current"),
+        )
+        try:
+            curriculum_env.set_training_scenario_distribution(
+                ("id_static", "id_shape_nominal_current"),
+                (0.20, 0.80),
+            )
+            self.assertEqual(
+                curriculum_env._active_scenario_probabilities,
+                (0.20, 0.80),
+            )
+            selections = [
+                curriculum_env._select_training_scenario().name
+                for _ in range(2_000)
+            ]
+            static_rate = selections.count("id_static") / len(selections)
+            self.assertAlmostEqual(static_rate, 0.20, delta=0.04)
+
+            curriculum_env.set_training_scenarios(
+                ("id_static", "id_shape_nominal_current")
+            )
+            self.assertEqual(
+                curriculum_env._active_scenario_probabilities,
+                (0.50, 0.50),
+            )
+        finally:
+            curriculum_env.close()
+
+    def test_curriculum_uses_strict_eval_thresholds_and_discrete_intensities(
+        self,
+    ) -> None:
         callback = MotionCurriculumCallback(RL_L1_CURRICULUM_STAGES)
         self.assertEqual(
             callback.phases,
@@ -321,6 +359,71 @@ class RLBaselineContractTests(unittest.TestCase):
             "grasp_rate": 0.20,
             "success_rate": 0.10,
         }))
+
+    def test_curriculum_rehearses_easy_scenes_but_evaluates_current_stage(
+        self,
+    ) -> None:
+        callback = MotionCurriculumCallback(RL_L1_CURRICULUM_STAGES)
+        self.assertEqual(
+            callback.training_mixes,
+            RL_L1_CURRICULUM_TRAINING_MIXES,
+        )
+
+        callback.phase_index = 1
+        self.assertEqual(
+            callback.current_training_mix,
+            (
+                ("id_static", 0.20),
+                ("id_shape_nominal_current", 0.40),
+                ("id_rigid_l1_nominal", 0.40),
+            ),
+        )
+        self.assertEqual(
+            callback.current_scenarios,
+            ("id_shape_nominal_current", "id_rigid_l1_nominal"),
+        )
+
+        callback.phase_index = 4
+        self.assertEqual(
+            callback.current_training_mix,
+            (
+                ("id_static", 0.10),
+                ("id_shape_nominal_current", 0.10),
+                ("id_rigid_l1_nominal", 0.10),
+                ("id_combined_l1_nominal", 0.70),
+            ),
+        )
+        self.assertEqual(callback.current_scenarios, ("id_combined_l1_nominal",))
+
+        evaluation_env = RLCableGraspEnv(
+            seed=25,
+            episode_seconds=0.20,
+            scenario_names=(
+                "id_static",
+                "id_shape_nominal_current",
+                "id_rigid_l1_nominal",
+                "id_combined_l1_nominal",
+            ),
+        )
+        try:
+            callback.configure_evaluation_env(evaluation_env)
+            self.assertEqual(
+                evaluation_env._active_scenario_names,
+                ("id_combined_l1_nominal",),
+            )
+            self.assertEqual(
+                evaluation_env._active_scenario_probabilities,
+                (1.0,),
+            )
+        finally:
+            evaluation_env.close()
+
+    def test_curriculum_replay_fraction_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            build_l1_curriculum_training_mixes(
+                stage2_static_replay=0.60,
+                stage2_component_replay=0.40,
+            )
 
 
 if __name__ == "__main__":

@@ -42,6 +42,53 @@ RL_L1_CURRICULUM_STAGES = (
 RL_INTERFACE_VERSION = "baseline_v4"
 
 
+def build_l1_curriculum_training_mixes(
+    stage1_static_replay: float = 0.20,
+    stage2_static_replay: float = 0.10,
+    stage2_component_replay: float = 0.20,
+) -> tuple[tuple[tuple[str, float], ...], ...]:
+    """Build stage-wise training distributions with easier-scene rehearsal."""
+    fractions = (
+        float(stage1_static_replay),
+        float(stage2_static_replay),
+        float(stage2_component_replay),
+    )
+    if not all(
+        np.isfinite(value) and 0.0 <= value <= 1.0
+        for value in fractions
+    ):
+        raise ValueError("curriculum replay fractions must be finite and in [0, 1]")
+    if stage1_static_replay >= 1.0:
+        raise ValueError("stage-1 static replay fraction must be less than 1")
+    if stage2_static_replay + stage2_component_replay >= 1.0:
+        raise ValueError(
+            "stage-2 static and component replay fractions must sum to less than 1"
+        )
+
+    stage1_component = (1.0 - stage1_static_replay) / 2.0
+    stage2_component = stage2_component_replay / 2.0
+    return (
+        (("id_static", 1.0),),
+        (
+            ("id_static", stage1_static_replay),
+            ("id_shape_nominal_current", stage1_component),
+            ("id_rigid_l1_nominal", stage1_component),
+        ),
+        (
+            ("id_static", stage2_static_replay),
+            ("id_shape_nominal_current", stage2_component),
+            ("id_rigid_l1_nominal", stage2_component),
+            (
+                "id_combined_l1_nominal",
+                1.0 - stage2_static_replay - stage2_component_replay,
+            ),
+        ),
+    )
+
+
+RL_L1_CURRICULUM_TRAINING_MIXES = build_l1_curriculum_training_mixes()
+
+
 def checkpoint_interface_version(checkpoint: Path) -> str | None:
     """Find the nearest training manifest associated with a checkpoint."""
     checkpoint = Path(checkpoint).resolve()
@@ -101,7 +148,11 @@ def make_worker(rank: int, args: argparse.Namespace):
             args.training_distribution == "l1"
             and args.curriculum_stage_steps > 0
         ):
-            env.set_training_scenarios(RL_L1_CURRICULUM_STAGES[0])
+            initial_mix = args.curriculum_training_mixes[0]
+            env.set_training_scenario_distribution(
+                tuple(name for name, _ in initial_mix),
+                tuple(probability for _, probability in initial_mix),
+            )
             env.set_motion_difficulty(0.0)
         return env
     return initialize
@@ -130,6 +181,7 @@ class MotionCurriculumCallback(BaseCallback):
         aligned_pinch_rate: float = 0.50,
         secured_rate: float = 0.20,
         success_rate: float = 0.10,
+        training_mixes: tuple[tuple[tuple[str, float], ...], ...] | None = None,
     ):
         super().__init__(verbose=0)
         if not stages:
@@ -140,6 +192,39 @@ class MotionCurriculumCallback(BaseCallback):
         self.aligned_pinch_rate = float(aligned_pinch_rate)
         self.secured_rate = float(secured_rate)
         self.success_rate = float(success_rate)
+        self.training_mixes = (
+            RL_L1_CURRICULUM_TRAINING_MIXES
+            if training_mixes is None
+            else training_mixes
+        )
+        if len(self.training_mixes) != len(stages):
+            raise ValueError("curriculum training mixes must match the stages")
+        for stage_index, mix in enumerate(self.training_mixes):
+            names = tuple(name for name, _ in mix)
+            probabilities = np.asarray(
+                tuple(probability for _, probability in mix), dtype=float
+            )
+            if not names or len(names) != len(set(names)):
+                raise ValueError(
+                    "each curriculum training mix must be non-empty and unique"
+                )
+            if not set(stages[stage_index]).issubset(names):
+                raise ValueError(
+                    "each training mix must include its target scenarios"
+                )
+            if (
+                probabilities.shape != (len(names),)
+                or not np.all(np.isfinite(probabilities))
+                or np.any(probabilities < 0.0)
+                or not np.isclose(float(np.sum(probabilities)), 1.0)
+            ):
+                raise ValueError("curriculum training mix probabilities must sum to 1")
+            if sum(
+                probability
+                for name, probability in mix
+                if name in stages[stage_index]
+            ) <= 0.0:
+                raise ValueError("target scenarios must have positive training mass")
         self.phases = (
             (0, 0.0),
             *((stage, difficulty) for stage in range(1, len(stages))
@@ -159,16 +244,31 @@ class MotionCurriculumCallback(BaseCallback):
 
     @property
     def current_scenarios(self) -> tuple[str, ...]:
+        """Target scenarios used for strict evaluation and phase advancement."""
         return self.stages[self.stage_index]
+
+    @property
+    def current_training_mix(self) -> tuple[tuple[str, float], ...]:
+        return self.training_mixes[self.stage_index]
 
     def _apply(self) -> None:
         self.training_env.env_method(
-            "set_training_scenarios", self.current_scenarios
+            "set_training_scenario_distribution",
+            tuple(name for name, _ in self.current_training_mix),
+            tuple(probability for _, probability in self.current_training_mix),
         )
         self.training_env.env_method("set_motion_difficulty", self.difficulty)
         self.logger.record("curriculum/phase", self.phase_index)
         self.logger.record("curriculum/stage", self.stage_index)
         self.logger.record("curriculum/motion_difficulty", self.difficulty)
+        self.logger.record(
+            "curriculum/target_scenario_fraction",
+            sum(
+                probability
+                for name, probability in self.current_training_mix
+                if name in self.current_scenarios
+            ),
+        )
         self.logger.record(
             "curriculum/qualifying_evaluations", self.qualifying_evaluations
         )
@@ -213,7 +313,12 @@ class MotionCurriculumCallback(BaseCallback):
         print(
             f"curriculum_phase={self.phase_index} stage={self.stage_index} "
             f"difficulty={self.difficulty:.3f} "
-            f"scenarios={','.join(self.current_scenarios)}",
+            f"eval_scenarios={','.join(self.current_scenarios)} "
+            "training_mix="
+            + ",".join(
+                f"{name}:{probability:.2f}"
+                for name, probability in self.current_training_mix
+            ),
             flush=True,
         )
 
@@ -610,6 +715,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--curriculum-aligned-pinch-rate", type=float, default=0.50)
     parser.add_argument("--curriculum-secured-rate", type=float, default=0.20)
     parser.add_argument("--curriculum-success-rate", type=float, default=0.10)
+    parser.add_argument(
+        "--curriculum-stage1-static-replay",
+        type=float,
+        default=0.20,
+        help="fraction of stage-1 training episodes replayed on the static scene",
+    )
+    parser.add_argument(
+        "--curriculum-stage2-static-replay",
+        type=float,
+        default=0.10,
+        help="fraction of stage-2 training episodes replayed on the static scene",
+    )
+    parser.add_argument(
+        "--curriculum-stage2-component-replay",
+        type=float,
+        default=0.20,
+        help=(
+            "total fraction of stage-2 training episodes replayed equally on "
+            "shape-only and rigid-only scenes"
+        ),
+    )
     parser.add_argument("--eval-freq", type=int, default=100_000,
                         help="environment timesteps between strict evaluations; 0 disables")
     parser.add_argument("--eval-episodes", type=int, default=50)
@@ -695,6 +821,14 @@ def parse_args() -> argparse.Namespace:
     )
     if not all(0.0 <= value <= 1.0 for value in curriculum_rates):
         parser.error("curriculum rate thresholds must be in [0, 1]")
+    try:
+        args.curriculum_training_mixes = build_l1_curriculum_training_mixes(
+            args.curriculum_stage1_static_replay,
+            args.curriculum_stage2_static_replay,
+            args.curriculum_stage2_component_replay,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     if (
         args.training_distribution != "l1"
         and args.curriculum_stage_steps > 0
@@ -860,12 +994,13 @@ def main() -> None:
         and args.curriculum_stage_steps > 0
     ):
         curriculum_callback = MotionCurriculumCallback(
-            RL_L1_CURRICULUM_STAGES,
-            args.curriculum_update_steps,
-            args.curriculum_required_evals,
-            args.curriculum_aligned_pinch_rate,
-            args.curriculum_secured_rate,
-            args.curriculum_success_rate,
+            stages=RL_L1_CURRICULUM_STAGES,
+            update_every=args.curriculum_update_steps,
+            required_evaluations=args.curriculum_required_evals,
+            aligned_pinch_rate=args.curriculum_aligned_pinch_rate,
+            secured_rate=args.curriculum_secured_rate,
+            success_rate=args.curriculum_success_rate,
+            training_mixes=args.curriculum_training_mixes,
         )
         callback_items.append(curriculum_callback)
     eval_env: VecEnv | None = None
@@ -935,6 +1070,12 @@ def main() -> None:
         "policy_net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]},
         "policy_activation": "ReLU",
         "curriculum_stages": RL_L1_CURRICULUM_STAGES,
+        "curriculum_training_mixes": args.curriculum_training_mixes,
+        "curriculum_stage1_static_replay": args.curriculum_stage1_static_replay,
+        "curriculum_stage2_static_replay": args.curriculum_stage2_static_replay,
+        "curriculum_stage2_component_replay": (
+            args.curriculum_stage2_component_replay
+        ),
         "curriculum_stage_steps": args.curriculum_stage_steps,
         "curriculum_update_steps": args.curriculum_update_steps,
         "curriculum_required_evals": args.curriculum_required_evals,
@@ -942,8 +1083,10 @@ def main() -> None:
         "curriculum_secured_rate": args.curriculum_secured_rate,
         "curriculum_success_rate": args.curriculum_success_rate,
         "curriculum_motion_difficulty": (
-            "strict-eval-driven static -> component L1 -> combined L1; each "
-            "moving stage advances through difficulty 1/3, 2/3 and 1"
+            "strict-eval-driven static -> component L1 -> combined L1; easier "
+            "scenes remain in the weighted training distribution while strict "
+            "evaluation uses only current-stage targets; each moving stage "
+            "advances through difficulty 1/3, 2/3 and 1"
         ),
         "curriculum_final_disturbance": args.disturbance,
         "eval_freq": args.eval_freq,
