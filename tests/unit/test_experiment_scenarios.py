@@ -512,6 +512,8 @@ class EnvironmentScenarioTests(unittest.TestCase):
         )
         self.assertEqual(config.policy_joint_velocity_fraction, 1.0)
         self.assertEqual(config.ik_target_horizon, 0.11)
+        self.assertIsNone(config.max_retries)
+        self.assertEqual(config.retry_min_remaining_seconds, 3.0)
         with self.assertRaisesRegex(ValueError, "prediction_horizon"):
             PolicyConfig(prediction_horizon=-0.01)
         with self.assertRaisesRegex(ValueError, "target_filter_alpha"):
@@ -520,6 +522,83 @@ class EnvironmentScenarioTests(unittest.TestCase):
             PolicyConfig(policy_joint_velocity_fraction=1.01)
         with self.assertRaisesRegex(ValueError, "intercept_y_limits"):
             PolicyConfig(intercept_y_limits=(0.5, -0.5))
+        with self.assertRaisesRegex(ValueError, "max_retries"):
+            PolicyConfig(max_retries=-1)
+        with self.assertRaisesRegex(ValueError, "retry_min_remaining_seconds"):
+            PolicyConfig(retry_min_remaining_seconds=-0.1)
+
+    def test_confirmed_grasp_break_retries_when_time_remains(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1016)
+            env.config.episode_seconds = 15.0
+            policy = DynamicCableGraspPolicy(env)
+            policy.phase = Phase.LIFT
+            policy.phase_start = float(env.data.time)
+
+            first_action = policy.action()
+
+            self.assertIs(policy.phase, Phase.FAILURE_OBSERVE)
+            self.assertEqual(policy.result, "running")
+            self.assertEqual(policy.retry_count, 1)
+            self.assertEqual(policy.attempt_failure_count, 1)
+            self.assertFalse(policy.finished)
+            self.assertEqual(first_action[7], policy.HOLD_GRIPPER_CTRL)
+
+            policy.phase_start = (
+                float(env.data.time) - policy.config.failure_observe_seconds - 0.1
+            )
+            retry_action = policy.action()
+
+            self.assertIs(policy.phase, Phase.RECOVER)
+            self.assertFalse(policy.finished)
+            self.assertEqual(retry_action[7], 255.0)
+        finally:
+            del env
+
+    def test_zero_retry_limit_preserves_single_attempt_diagnostics(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1017)
+            policy = DynamicCableGraspPolicy(env, PolicyConfig(max_retries=0))
+            policy.phase = Phase.LIFT
+            policy.phase_start = float(env.data.time)
+
+            policy.action()
+
+            self.assertIs(policy.phase, Phase.FAILURE_OBSERVE)
+            self.assertEqual(policy.result, "failed_grasp_broke_on_lift")
+            self.assertEqual(policy.retry_count, 0)
+            policy.phase_start = (
+                float(env.data.time) - policy.config.failure_observe_seconds - 0.1
+            )
+            policy.action()
+            self.assertTrue(policy.finished)
+            self.assertIs(policy.phase, Phase.DONE)
+        finally:
+            del env
+
+    def test_retry_is_skipped_when_episode_budget_is_too_short(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1018)
+            env.config.episode_seconds = 15.0
+            policy = DynamicCableGraspPolicy(env)
+            env.data.time = (
+                env.config.episode_seconds
+                - policy.config.retry_min_remaining_seconds
+                + 0.1
+            )
+            policy.phase = Phase.LIFT
+            policy.phase_start = float(env.data.time)
+
+            policy.action()
+
+            self.assertEqual(policy.result, "failed_grasp_broke_on_lift")
+            self.assertEqual(policy.retry_count, 0)
+            self.assertFalse(policy.finished)
+        finally:
+            del env
 
     def test_prediction_uses_total_target_velocity_for_every_scenario(self) -> None:
         env = self.make("id_static")
@@ -611,6 +690,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1009)
+            env.config.episode_seconds = 15.0
             policy = DynamicCableGraspPolicy(env)
             policy.phase = Phase.APPROACH
             policy.phase_start = (
@@ -687,6 +767,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1010)
+            env.config.episode_seconds = 15.0
             policy = DynamicCableGraspPolicy(env)
             policy.phase = Phase.INTERCEPT
             policy.phase_start = float(env.data.time)

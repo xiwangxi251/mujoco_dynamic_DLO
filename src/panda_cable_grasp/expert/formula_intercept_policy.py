@@ -569,6 +569,8 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
             "expert_candidate_score": float(self.expert_score),
             "expert_replans": int(self.expert_replans),
             "expert_failed_segment_count": len(self.failed_segment_indices),
+            "policy_retry_count": int(self.retry_count),
+            "policy_attempt_failure_count": int(self.attempt_failure_count),
             "expert_shadow_rollouts": int(self.shadow_rollouts),
             "expert_shadow_physics_steps": int(self.shadow_physics_steps),
             "expert_selected_controller": (

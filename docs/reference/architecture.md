@@ -74,4 +74,4 @@ Python 代码只从 `panda_cable_grasp` 包导入。
 
 根目录只保存项目级元数据和入口文档。可执行实现全部位于
 `src/panda_cable_grasp/`，维护脚本位于 `tools/`，生成产物位于 `outputs/`。
-各根目录文件的用途见 [根目录说明](root_layout.md)。
+项目级入口、当前状态和文档分工见[项目目标与当前状态](../project_status.md)。

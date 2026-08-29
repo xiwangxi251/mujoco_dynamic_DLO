@@ -186,5 +186,8 @@ panda-cable-grasp \
 ## 9. DynamicVLA 零样本评测
 
 DynamicVLA 使用独立的 Python 3.10/PyTorch 环境，MuJoCo 环境不需要安装 Isaac Sim 或 Isaac Lab。
-完整的环境安装、无权重自检、双终端启动命令和输出说明见
-[`dynamicvla_zero_shot.md`](dynamicvla_zero_shot.md)。
+当前接口状态、已有权重结果和有效性边界见
+[DynamicVLA 实验记录](../dynamicvla_experiments.md)。安装后可分别运行
+`panda-cable-dynamicvla --help` 和
+`python -m tools.installation.check_dynamicvla_install --help` 检查当前版本参数；不要使用
+历史文档中的绝对路径或已删除的根目录脚本。

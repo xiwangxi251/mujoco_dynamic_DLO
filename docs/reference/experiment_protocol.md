@@ -2,7 +2,9 @@
 
 本文定义后续仿真与真机实验的统一口径。研究主问题是：**方法能否根据线缆的整体运动与局部形变，持续完成动态对中、夹持和抬升**。抓后滑脱是必须保留并监测的真实物理失败，但不是本项目的主要优化目标，也不能取代运动类型、难度和泛化实验。
 
-正式实验开始前，应把本文、`experiment_scenarios.py`的场景表、seed列表、公共成功判定、失败分类、checkpoint选择规则和样本量一起冻结。冻结后的OOD结果不得用于调参、选模型或修改场景。
+正式实验开始前，应把本文、`src/panda_cable_grasp/scenarios/registry.py` 的场景表、seed
+列表、公共成功判定、失败分类、checkpoint 选择规则和样本量一起冻结。冻结后的 OOD
+结果不得用于调参、选模型或修改场景。
 
 ## 1. 场景因子
 
@@ -93,7 +95,8 @@ L1/L2的平移、旋转和rigid专用构型保持力在稳定双指抓取确认�
 - `dev`：只用于环境校准、超参数与checkpoint选择。开发集结果不能作为最终泛化结论。
 - `OOD`：训练和模型选择期间完全不可见，包括带限随机运动、高幅高频组合、长度变化和材质变化。
 
-`experiment_scenarios.py`为每个场景生成稳定的`scenario_id`与完整哈希，并提供五组实验套件：
+`src/panda_cable_grasp/scenarios/registry.py` 为每个场景生成稳定的 `scenario_id` 与完整哈希，
+并提供五组实验套件：
 
 | suite | 内容 | 用途 |
 | --- | --- | --- |
@@ -107,14 +110,24 @@ L1/L2的平移、旋转和rigid专用构型保持力在稳定双指抓取确认�
 
 ## 3. 方法与公平比较
 
-当前可执行的方法只有：
+当前统一 benchmark 可执行的方法为：
 
 - `scripted`：基于目标线段预测与点跟踪控制的规则基线；
-- `ppo`：当前48维特权状态、8维动作的强化学习接口。
+- `expert`：读取仿真特权状态并搜索未来可抓线段的教师/上界，不是可部署方法；
+- `ppo`：当前 99 维完整线缆状态观测、5 维任务空间动作的强化学习接口。
 
-现有PPO checkpoint只匹配`legacy_shape_current`的`legacy_v1`旧训练分布。注册表中的`id_shape_nominal_current`虽然保留相同准周期基波和强度，但使用`factorized_v2`严格投影掉shape分量的净平动与净转动，并采用随机弯曲初态，因此也属于新分布。旧checkpoint可以做兼容性回归，但**不能**当作已经在扩展ID矩阵上训练的方法参与正式`core`、`motion_sweep`或OOD比较。应先让训练环境按预先冻结的概率覆盖ID矩阵，从头训练；只用dev选择checkpoint，然后一次性运行ID盲测和OOD。
+DynamicVLA 已有独立 ZMQ 在线适配、数据转换、微调和逐回合记录链路。由于一个模型客户端
+维护一条有状态动作流，目前不与本地 benchmark worker 共享，而是使用独立入口串行评测；
+它仍必须采用相同底层 `task_success`、场景和 paired seeds。视觉方法与状态方法输入不同，
+应分组报告，不能称为同观测公平比较。
 
-调研中建议的π0.5与Diffusion Policy目前没有环境适配器、训练数据、checkpoint或统一观测接口，因此暂时只列为待实现方法，结果表中不得填入推测值、其他任务论文数值或由脚本策略冒名生成的结果。实现后必须使用相同动作频率、相同机器人/夹爪约束、相同公共`task_success`和同一组paired seed；若视觉方法与特权状态方法的输入不同，应明确分组报告，不得称为同观测公平比较。
+现有 PPO checkpoint 只覆盖课程中的有限 ID 场景，并非按最终冻结的完整 ID 矩阵从头训练。
+它们可用于回归和方法开发，但不能直接作为最终 `paper` suite 模型。最终 PPO 应按预先冻结
+的概率覆盖 ID 矩阵，只用 dev 选择 checkpoint，然后一次性运行 ID 盲测和 OOD。
+
+调研中建议的 π0.5 与 Diffusion Policy 目前没有本项目的训练数据、checkpoint 或统一接口，
+因此只列为待实现方法。结果表中不得填入推测值、其他任务论文数值或由脚本策略冒名生成的结果。
+实现后必须使用相同动作频率、机器人/夹爪约束、公共 `task_success` 和 paired seeds。
 
 ## 4. Seed配对、重复次数与运行顺序
 
@@ -176,7 +189,8 @@ pilot后可根据方差做功效分析并提高样本量，但不能看完正式
 
 ## 6. 真实运动诊断
 
-每次场景定义或物理参数改变后，先在机器人保持ready姿态时运行`motion_diagnostics.py`，再运行抓取实验。诊断同时记录：
+每次场景定义或物理参数改变后，先在机器人保持 ready 姿态时运行
+`panda-cable-motion-diagnostics`，再运行抓取实验。诊断同时记录：
 
 - 施加的shape、rigid translation、rigid rotation和软边界加速度RMS；
 - 线缆质心位移、路径长度和速度；
@@ -191,7 +205,7 @@ combined发生明显形变后，单个Kabsch转角会混入线缆主轴随形变
 示例：
 
 ```powershell
-python .\motion_diagnostics.py `
+panda-cable-motion-diagnostics `
   --suite core --seeds 10 --seconds 8 --sample-hz 10 --seed 20280804
 ```
 

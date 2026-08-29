@@ -1,5 +1,8 @@
 # 统一仿真评测
 
+本文定义当前评测入口和产物格式。项目总体状态见[项目状态](../project_status.md)，正式实验
+样本量、统计和冻结要求见[实验协议](experiment_protocol.md)。
+
 ## 入口划分
 
 动作策略成功率只使用一个正式入口：`panda-cable-benchmark`。它目前支持

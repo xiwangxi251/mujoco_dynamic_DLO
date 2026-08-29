@@ -77,7 +77,12 @@ class PolicyConfig:
     hold_seconds: float = 0.0
     failure_observe_seconds: float = 0.6
     release_seconds: float = 1.2
-    max_retries: int = 2
+    # Formal evaluation gives every method the same episode time budget.  A
+    # fixed retry cap made scripted/expert give up while PPO and DynamicVLA
+    # could still act, so retries are unlimited by default and bounded by the
+    # environment time limit.  Set this to 0 for single-attempt diagnostics.
+    max_retries: int | None = None
+    retry_min_remaining_seconds: float = 3.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -90,6 +95,7 @@ class PolicyConfig:
             "precision_linear_velocity_limit", "policy_joint_velocity_fraction",
             "approach_orientation_gain", "precision_orientation_gain",
             "ik_target_horizon", "strict_vertical_tolerance",
+            "retry_min_remaining_seconds",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
@@ -103,6 +109,15 @@ class PolicyConfig:
             raise ValueError("policy_joint_velocity_fraction must be in (0, 1]")
         if not isinstance(self.strict_vertical_gripper, bool):
             raise ValueError("strict_vertical_gripper must be boolean")
+        if (
+            self.max_retries is not None
+            and (
+                isinstance(self.max_retries, bool)
+                or not isinstance(self.max_retries, int)
+                or self.max_retries < 0
+            )
+        ):
+            raise ValueError("max_retries must be a non-negative integer or None")
         for name in (
             "intercept_x_limits", "intercept_y_limits", "intercept_z_limits",
         ):
@@ -137,6 +152,9 @@ class DynamicCableGraspPolicy:
         self.phase = Phase.SETTLE
         self.phase_start = 0.0
         self.retry_count = 0
+        self.attempt_failure_count = 0
+        self.last_attempt_failure: str | None = None
+        self._retry_after_failure_observe = False
         self.finished = False
         self.result = "running"
         self.failure_diagnostics: dict | None = None
@@ -168,6 +186,9 @@ class DynamicCableGraspPolicy:
         self.phase = Phase.SETTLE
         self.phase_start = float(self.env.data.time)
         self.retry_count = 0
+        self.attempt_failure_count = 0
+        self.last_attempt_failure = None
+        self._retry_after_failure_observe = False
         self.finished = False
         self.result = "running"
         self.failure_diagnostics = None
@@ -313,15 +334,55 @@ class DynamicCableGraspPolicy:
     def _minimum_task_singular_value(self) -> float:
         return float(np.linalg.svd(self._task_jacobian(), compute_uv=False)[-1])
 
+    def _retry_available(self) -> bool:
+        """Return whether another complete attempt still fits this episode."""
+
+        remaining = float(self.env.config.episode_seconds - self.env.data.time)
+        within_count_limit = (
+            self.config.max_retries is None
+            or self.retry_count < self.config.max_retries
+        )
+        return bool(
+            within_count_limit
+            and remaining >= self.config.retry_min_remaining_seconds
+        )
+
     def _retry_from_unsafe_pose(self, hand: np.ndarray) -> np.ndarray:
-        """不安全或不可达时先竖直撤离，禁止直接向桌面下探。"""
-        if self.retry_count < self.config.max_retries:
+        """Record a failed attempt, then recover whenever budget remains."""
+
+        self.attempt_failure_count += 1
+        self.last_attempt_failure = "failed_no_contact"
+        if self._retry_available():
             self.retry_count += 1
+            self.result = "running"
             self._begin_vertical_recovery(hand)
             return self._ik_action(self.recover_start, 255.0)
         self.result = "failed_no_contact"
         self._transition(Phase.RELEASE)
         return self._ik_action(hand, 255.0)
+
+    def _observe_grasp_break(
+        self,
+        hand: np.ndarray,
+        failure_result: str,
+    ) -> np.ndarray:
+        """Freeze one confirmed break, then retry if the episode permits it."""
+
+        self.failure_diagnostics = (
+            None if self.env.last_grasp_break is None
+            else self.env.last_grasp_break.copy()
+        )
+        self.attempt_failure_count += 1
+        self.last_attempt_failure = failure_result
+        self.failure_hold_position = hand.copy()
+        self._retry_after_failure_observe = self._retry_available()
+        if self._retry_after_failure_observe:
+            self.retry_count += 1
+            self.result = "running"
+        else:
+            self.result = failure_result
+        self._transition(Phase.FAILURE_OBSERVE)
+        return self._ik_action(hand, self.HOLD_GRIPPER_CTRL)
 
     def _ik_action(self, desired_position: np.ndarray, gripper: float) -> np.ndarray:
         """Use the selected hierarchical damped IK ordering."""
@@ -574,8 +635,7 @@ class DynamicCableGraspPolicy:
                 self.last_close_contact_time = float(self.env.data.time)
                 return self._ik_action(desired, self.HOLD_GRIPPER_CTRL)
             elif self.phase_time > self.config.intercept_timeout:
-                self._begin_vertical_recovery(hand)
-                return self._ik_action(self.recover_start, 255.0)
+                return self._retry_from_unsafe_pose(hand)
             return self._ik_action(desired, 255.0)
 
         if self.phase is Phase.CLOSE:
@@ -611,14 +671,7 @@ class DynamicCableGraspPolicy:
                     )
                 )
             if not self.env.grasp_confirmed and close_timed_out:
-                if self.retry_count < self.config.max_retries:
-                    self.retry_count += 1
-                    self._begin_vertical_recovery(hand)
-                    return self._ik_action(hand, 255.0)
-                else:
-                    self.result = "failed_no_contact"
-                    self._transition(Phase.RELEASE)
-                    return self._ik_action(hand, 255.0)
+                return self._retry_from_unsafe_pose(hand)
             return self._ik_action(desired, self.HOLD_GRIPPER_CTRL)
 
         if self.phase is Phase.RECOVER:
@@ -637,15 +690,9 @@ class DynamicCableGraspPolicy:
         if self.phase is Phase.LIFT:
             # 把夹持点抬高22 cm；若环境报告抓取断开则保持闭爪记录失败现场。
             if self.env.grasp_state is None:
-                # 保存环境记录的断裂现场；后续不主动张开，以免掩盖最初原因。
-                self.failure_diagnostics = (
-                    None if self.env.last_grasp_break is None
-                    else self.env.last_grasp_break.copy()
+                return self._observe_grasp_break(
+                    hand, "failed_grasp_broke_on_lift"
                 )
-                self.result = "failed_grasp_broke_on_lift"
-                self.failure_hold_position = hand.copy()
-                self._transition(Phase.FAILURE_OBSERVE)
-                return self._ik_action(hand, self.HOLD_GRIPPER_CTRL)
             blend = self._smoothstep(self.phase_time / self.config.lift_seconds)
             desired = (1.0 - blend) * self.lift_start + blend * self.lift_goal
             if self.phase_time >= self.config.lift_seconds:
@@ -666,14 +713,9 @@ class DynamicCableGraspPolicy:
         if self.phase is Phase.CARRY:
             # 抬升后朝桌面中心侧移并小幅上抬，用来验证抓取不是瞬时接触。
             if self.env.grasp_state is None:
-                self.failure_diagnostics = (
-                    None if self.env.last_grasp_break is None
-                    else self.env.last_grasp_break.copy()
+                return self._observe_grasp_break(
+                    hand, "failed_grasp_broke_on_carry"
                 )
-                self.result = "failed_grasp_broke_on_carry"
-                self.failure_hold_position = hand.copy()
-                self._transition(Phase.FAILURE_OBSERVE)
-                return self._ik_action(hand, self.HOLD_GRIPPER_CTRL)
             blend = self._smoothstep(self.phase_time / self.config.carry_seconds)
             desired = (1.0 - blend) * self.carry_start + blend * self.carry_goal
             desired[2] = max(
@@ -689,13 +731,9 @@ class DynamicCableGraspPolicy:
         if self.phase is Phase.HOLD:
             # 在目标位置保持，环境成功条件需要连续满足规定时长。
             if self.env.grasp_state is None:
-                self.failure_diagnostics = (
-                    None if self.env.last_grasp_break is None
-                    else self.env.last_grasp_break.copy()
+                return self._observe_grasp_break(
+                    hand, "failed_grasp_broke_on_hold"
                 )
-                self.result = "failed_grasp_broke_on_hold"
-                self.failure_hold_position = hand.copy()
-                self._transition(Phase.FAILURE_OBSERVE)
             elif self.phase_time >= self.config.hold_seconds:
                 if self.env.success_hold >= self.env.config.success_hold_seconds:
                     self.result = "success"
@@ -715,8 +753,13 @@ class DynamicCableGraspPolicy:
             return self._ik_action(desired, self.HOLD_GRIPPER_CTRL)
 
         if self.phase is Phase.FAILURE_OBSERVE:
-            # 真正判定滑脱后保持闭爪并结束本轮，不再主动张开掩盖最初的滑脱原因。
+            # 先闭爪保留失败现场；环境已保存 break history，因此之后张爪重试
+            # 不会覆盖第一次滑脱的物理因果记录。
             if self.phase_time >= self.config.failure_observe_seconds:
+                if self._retry_after_failure_observe:
+                    self._retry_after_failure_observe = False
+                    self._begin_vertical_recovery(hand)
+                    return self._ik_action(self.recover_start, 255.0)
                 self._transition(Phase.DONE)
                 self.finished = True
             return self._ik_action(self.failure_hold_position, self.HOLD_GRIPPER_CTRL)
@@ -747,6 +790,8 @@ class DynamicCableGraspPolicy:
             ),
             "grasp_max_tilt_error_rad": self.max_grasp_tilt_error,
             "grasp_tilt_samples": self.grasp_tilt_error_samples,
+            "policy_retry_count": self.retry_count,
+            "policy_attempt_failure_count": self.attempt_failure_count,
         }
 
     def summary(self) -> str:

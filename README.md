@@ -59,8 +59,8 @@ panda-cable-dynamicvla --help
 
 并行采集时，`--workers` 控制并行场景数，`--envs-per-scenario` 控制每个场景
 内部的独立 MuJoCo 环境数。采集器会实时显示 attempts/h、successes/h 和 ETA，并可用
-`--resume --run-name <名称>` 续跑中断任务。完整说明见
-[特权专家](docs/privileged_expert.md)。
+`--resume --run-name <名称>` 续跑中断任务。当前实验状态和三个方法的实验文档入口见
+[项目状态](docs/project_status.md)。
 
 这些命令由 `pyproject.toml` 注册。Python 代码应直接从
 `panda_cable_grasp` 包导入；旧的根目录转发脚本和
@@ -72,7 +72,7 @@ panda-cable-dynamicvla --help
 panda_cable_grasp/
 ├── assets/mujoco/               # MuJoCo XML 模型
 ├── configs/                     # 训练和集成配置
-├── docs/                        # 当前文档、历史归档和参考结果
+├── docs/                        # 当前文档、实验索引和运行说明
 ├── outputs/                     # 录像、模型、指标和数据集（不入 Git）
 ├── src/panda_cable_grasp/
 │   ├── cli/                     # 用户命令入口
@@ -88,9 +88,8 @@ panda_cable_grasp/
 └── tools/                       # 安装检查、消融、录像和启动工具
 ```
 
-根目录每个文件的用途见 [根目录说明](docs/root_layout.md)，完整模块关系见
-[架构说明](docs/architecture.md)，当前可操作状态见
-[当前状态](docs/current_status.md)。
+完整模块关系见[架构说明](docs/reference/architecture.md)，当前目标、路线、进度和问题见
+[项目状态](docs/project_status.md)。
 
 ## 输出目录
 
@@ -113,15 +112,15 @@ panda_cable_grasp/
 
 ## 文档索引
 
-- [新会话入口](docs/start_here.md)
-- [架构与代码导航](docs/architecture.md)
-- [当前状态](docs/current_status.md)
-- [RL 基线与奖励修正](docs/rl_baseline.md)
-- [实验协议](docs/experiment_protocol.md)
-- [统一仿真评测、并行与回放](docs/evaluation.md)
-- [服务器部署](docs/server_setup.md)
-- [DynamicVLA 零样本接入](docs/dynamicvla_zero_shot.md)
-- [DynamicVLA 微调](docs/dynamicvla_finetune.md)
-- [特权专家](docs/privileged_expert.md)
-- [受版本控制的参考结果](docs/reference_results/)
-- [历史记录](docs/history/)
+- [项目目标、整体规划、进度和问题](docs/project_status.md)
+- [环境端进度](docs/environment.md)
+- [Scripted 与 Expert 实验记录](docs/scripted_policy_experiments.md)
+- [RL 实验记录](docs/rl_experiments.md)
+- [DynamicVLA 实验记录](docs/dynamicvla_experiments.md)
+
+架构、实验协议、统一评测和服务器部署等辅助说明位于 `docs/reference/`；实验索引和专项诊断
+位于 `docs/experiments/`。
+
+文档分工：README 只负责安装和导航；`project_status.md` 维护当前事实；
+`experiment_protocol.md` 维护冻结规则；方法实验文档保留必要的过程和结果。过期内容通过
+Git 历史追溯，不在当前文档树中重复保存。
