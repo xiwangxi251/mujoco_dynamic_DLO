@@ -99,8 +99,10 @@ ID/OOD 划分和统计方式由[实验协议](reference/experiment_protocol.md)�
 
 - 已完成柔性线缆仿真环境、基础抓取任务、统一评测框架和主要工程结构。
 - 已实现静止、整体运动、形状变化和组合运动场景，并具备长度、材质等 OOD 扩展能力。
-- 已完成 Scripted、特权 Expert 和 PPO 的初步实现与实验，DynamicVLA 已完成接入和基本闭环验证。
-- 当前仍需补充 π0.5、Diffusion Policy 等对比方法，并冻结正式实验协议。
+- 已完成 Scripted、特权 Expert、PPO 和 DynamicVLA 的初步实现与实验；Diffusion Policy
+  的双相机/末端状态训练、动作块推理和统一 benchmark 接口也已加入。
+- Diffusion Policy 仍需在冻结数据集上训练 checkpoint 并完成正式 paired 评估；π0.5
+  仍是待实现对比方法。
 - 正式大规模仿真对比、完整 OOD 实验和真机实验尚未完成。
 
 ### 4.3 目前的问题

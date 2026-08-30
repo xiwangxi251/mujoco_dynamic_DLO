@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "panda-cable-grasp"
 version = "0.4.0"
-description = "MuJoCo dynamic deformable cable grasping with scripted, PPO, and DynamicVLA policies"
+description = "MuJoCo dynamic deformable cable grasping with scripted, PPO, DynamicVLA, and Diffusion policies"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -26,6 +26,7 @@ rl = [
   "matplotlib>=3.9",
 ]
 dynamicvla = ["scipy>=1.13", "pyyaml>=6.0"]
+diffusion = ["torch>=2.6", "scipy>=1.13"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
@@ -41,6 +42,8 @@ panda-cable-expert-collect = "panda_cable_grasp.expert.collect_dataset:main"
 panda-cable-dataset-check = "panda_cable_grasp.dynamicvla.finetune.check_dataset:main"
 panda-cable-dataset-convert = "panda_cable_grasp.dynamicvla.finetune.convert_dataset:main"
 panda-cable-finetune = "panda_cable_grasp.dynamicvla.finetune.launch_finetune:main"
+panda-cable-diffusion-train = "panda_cable_grasp.diffusion_policy.train:main"
+panda-cable-diffusion-eval = "panda_cable_grasp.cli.run_diffusion_policy:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

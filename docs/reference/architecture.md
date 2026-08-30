@@ -32,7 +32,8 @@ env.environment（MuJoCo 状态、接触、夹持、扰动、成功判定）
 | `src/panda_cable_grasp/evaluation/` | 多场景两级并行基准、统一轨迹/双视频记录、回放、运动诊断与失败分类 | `benchmark`, `EpisodeRecorder`, `replay` |
 | `src/panda_cable_grasp/expert/` | 使用仿真特权状态的专家策略和数据采集 | `collect_dataset` |
 | `src/panda_cable_grasp/dynamicvla/` | DynamicVLA 动作适配、数据转换和微调启动 | `DynamicVLATaskSpaceAdapter` |
-| `src/panda_cable_grasp/cli/` | 面向用户的规则策略与 DynamicVLA 命令 | `run_grasp`, `run_dynamicvla` |
+| `src/panda_cable_grasp/diffusion_policy/` | 双相机 + 末端状态视觉 Diffusion Policy、数据集、训练和在线动作块执行 | `DiffusionPolicy`, `DiffusionEpisodeDataset` |
+| `src/panda_cable_grasp/cli/` | 面向用户的规则、DynamicVLA 与 Diffusion Policy 命令 | `run_grasp`, `run_dynamicvla`, `run_diffusion_policy` |
 
 ## 物理环境边界
 

@@ -8,6 +8,7 @@ class EntrypointImportTests(unittest.TestCase):
         modules = (
             "panda_cable_grasp.cli.run_grasp",
             "panda_cable_grasp.cli.run_dynamicvla",
+            "panda_cable_grasp.cli.run_diffusion_policy",
             "panda_cable_grasp.evaluation.benchmark",
             "panda_cable_grasp.evaluation.motion_diagnostics",
             "panda_cable_grasp.rl.train",
@@ -17,6 +18,7 @@ class EntrypointImportTests(unittest.TestCase):
             "panda_cable_grasp.dynamicvla.finetune.convert_dataset",
             "panda_cable_grasp.dynamicvla.finetune.check_dataset",
             "panda_cable_grasp.dynamicvla.finetune.launch_finetune",
+            "panda_cable_grasp.diffusion_policy.train",
         )
         for module_name in modules:
             with self.subTest(module=module_name):

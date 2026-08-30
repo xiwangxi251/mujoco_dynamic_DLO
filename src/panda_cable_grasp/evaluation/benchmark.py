@@ -486,7 +486,20 @@ def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
     )
     config = _recordable_config(config, recording)
 
-    if method == "ppo":
+    if method == "diffusion_policy":
+        # Diffusion Policy consumes the same camera rig as DynamicVLA even when
+        # benchmark recordings are disabled.
+        from ..diffusion_policy.runner import DiffusionPolicyRunner
+
+        env = CableGraspEnv(replace(config, dynamicvla_cameras_enabled=True))
+        base_env = env
+        policy = DiffusionPolicyRunner(
+            env,
+            Path(job["diffusion_policy_model"]),
+            device=str(job["device"]),
+            deterministic=True,
+        )
+    elif method == "ppo":
         from ..rl.environment import RLCableGraspEnv
 
         env: Any = RLCableGraspEnv(env_config=config)
@@ -521,7 +534,10 @@ def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
     try:
         observation, initial_info = env.reset(seed=seed)
         if method != "ppo":
-            policy.reset()
+            if method == "diffusion_policy":
+                policy.reset(seed=seed)
+            else:
+                policy.reset()
         if recording:
             recorder = EpisodeRecorder(
                 env,
@@ -727,10 +743,12 @@ def parse_args() -> argparse.Namespace:
         description="Paired scenario-matrix benchmark for cable grasping"
     )
     parser.add_argument(
-        "--methods", nargs="+", choices=("scripted", "expert", "ppo"),
+        "--methods", nargs="+",
+        choices=("scripted", "expert", "ppo", "diffusion_policy"),
         default=("scripted",)
     )
     parser.add_argument("--ppo-model", type=Path)
+    parser.add_argument("--diffusion-policy-model", type=Path)
     parser.add_argument(
         "--episodes", type=int, default=20,
         help="paired repeats per scenario",
@@ -788,8 +806,19 @@ def parse_args() -> argparse.Namespace:
         parser.error("--disturbance must be finite and non-negative")
     if "ppo" in args.methods and args.ppo_model is None:
         parser.error("--ppo-model is required when evaluating PPO")
+    if "diffusion_policy" in args.methods and args.diffusion_policy_model is None:
+        parser.error(
+            "--diffusion-policy-model is required when evaluating diffusion_policy"
+        )
     if args.ppo_model is not None and not args.ppo_model.is_file():
         parser.error(f"PPO model not found: {args.ppo_model}")
+    if (
+        args.diffusion_policy_model is not None
+        and not args.diffusion_policy_model.is_file()
+    ):
+        parser.error(
+            f"Diffusion Policy model not found: {args.diffusion_policy_model}"
+        )
     return args
 
 
@@ -801,6 +830,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
     strict_vertical_gripper = bool(
         getattr(args, "strict_vertical_gripper", False)
     )
+    diffusion_policy_model = getattr(args, "diffusion_policy_model", None)
     requested_run_name = getattr(args, "run_name", None)
     if requested_run_name is None:
         output_dir = create_unique_run_dir(args.output)
@@ -818,7 +848,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
         config = _recordable_config(_scenario_config(
             scenario, seed=args.seed, disturbance=args.disturbance,
             seconds=args.episode_seconds,
-        ), args.recording)
+        ), args.recording or "diffusion_policy" in args.methods)
         model_env = CableGraspEnv(config)
         scenario_name = config.scenario_name
         model_path = models_dir / f"{scenario_name}.mjb"
@@ -853,6 +883,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                     "disturbance": args.disturbance,
                     "episode_seconds": args.episode_seconds,
                     "ppo_model": args.ppo_model,
+                    "diffusion_policy_model": diffusion_policy_model,
                     "device": args.device,
                     "strict_vertical_gripper": strict_vertical_gripper,
                     "recording": args.recording,
@@ -956,6 +987,11 @@ def run_benchmark(args: argparse.Namespace) -> Path:
         },
         "ppo_model": None if args.ppo_model is None else str(args.ppo_model.resolve()),
         "ppo_model_sha256": _sha256(args.ppo_model),
+        "diffusion_policy_model": (
+            None if diffusion_policy_model is None
+            else str(diffusion_policy_model.resolve())
+        ),
+        "diffusion_policy_model_sha256": _sha256(diffusion_policy_model),
         "source_xml": str(XML_PATH.resolve()),
         "source_xml_sha256": _sha256(XML_PATH),
         "panda_xml": str(PANDA_XML_PATH.resolve()),
@@ -973,6 +1009,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                 "scripted_policy": ROOT / "src" / "panda_cable_grasp" / "policies" / "scripted.py",
                 "failure_taxonomy": ROOT / "src" / "panda_cable_grasp" / "evaluation" / "failure_taxonomy.py",
                 "rl_environment": ROOT / "src" / "panda_cable_grasp" / "rl" / "environment.py",
+                "diffusion_policy": ROOT / "src" / "panda_cable_grasp" / "diffusion_policy" / "runner.py",
             }.items()
         },
         "configs": {
@@ -1004,6 +1041,9 @@ def run_benchmark(args: argparse.Namespace) -> Path:
         manifest["configs"]["expert"] = asdict(FormulaInterceptConfig(
             strict_vertical_gripper=strict_vertical_gripper
         ))
+    if "diffusion_policy" in args.methods:
+        from ..diffusion_policy.config import DiffusionPolicyConfig
+        manifest["configs"]["diffusion_policy"] = asdict(DiffusionPolicyConfig())
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )

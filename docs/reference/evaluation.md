@@ -6,7 +6,7 @@
 ## 入口划分
 
 动作策略成功率只使用一个正式入口：`panda-cable-benchmark`。它目前支持
-`scripted`、`expert` 和 `ppo`，并统一调用底层 `CableGraspEnv` 的
+`scripted`、`expert`、`ppo` 和 `diffusion_policy`，并统一调用底层 `CableGraspEnv` 的
 `task_success` 作为任务成功标准。
 
 其余入口不再被视为另一套成功率测试：
@@ -16,12 +16,13 @@
 - `panda-cable-motion-diagnostics` 检查场景运动是否符合设计，不评价抓取策略。
 - `panda-cable-expert-collect` 是数据采集器，允许使用不同的数据 schema 和筛选逻辑。
 - `panda-cable-dynamicvla` 是外部模型服务适配入口，但 episode 产物采用与 benchmark 相同的记录 schema。
+- `panda-cable-diffusion-eval` 是 Diffusion Policy 的单 checkpoint 评估入口；正式跨方法结果仍使用 benchmark。
 
-这样环境、RL 和 DynamicVLA 不再各自定义一套“任务成功”，训练内部的里程碑也不会替代公共成功条件。
+这样环境、RL、DynamicVLA 和 Diffusion Policy 不再各自定义一套“任务成功”，训练内部的里程碑也不会替代公共成功条件。
 
 ## 多场景与两级并行
 
-例如同时比较三个本地策略：
+例如同时比较多个本地策略：
 
 ```bash
 panda-cable-benchmark \
@@ -36,19 +37,19 @@ panda-cable-benchmark \
 
 - `--scenario-workers`：一批中最多同时活跃的场景数。
 - `--envs-per-scenario`：每个活跃场景最多同时运行的独立 episode 环境数。
-- `--workers`：可选的总进程上限；默认是前两者乘积。
+- `--workers`：可选的总进程上限；默认是前两者乘积。`diffusion_policy` 需要额外的视觉渲染和 PyTorch 显存。
 - `--suite core|motion_sweep|ood|paper|all`：使用注册的场景集合。
 - `--scenarios ...`：显式指定多个场景。
 
 并行后每个 episode 仍由独立 MuJoCo model/data、独立 seed 和独立输出目录运行。
-PPO checkpoint 会在每个 worker 进程中缓存。视频渲染和多个 PPO worker 会明显增加显存/内存占用，服务器上应逐步提高并发量。
+PPO checkpoint 会在每个 worker 进程中缓存。视频渲染和多个 PPO/Diffusion worker 会明显增加显存/内存占用，服务器上应逐步提高并发量。
 
 DynamicVLA 的一个 ZMQ 客户端只有一条有状态动作流，不能安全地被多个环境共享。因此当前一个
 `panda-cable-dynamicvla` 服务对应一个场景，并在该场景内串行运行回合。若要并行，需要为每个环境启动独立模型客户端和独立端口；本地 benchmark 的并行参数不适用于这个外部服务入口。
 
 ## 统一输出
 
-benchmark 的默认 seed 是 `20280804`，scripted、PPO、expert 和 DynamicVLA 评测入口共用该默认值。第 `i` 个回合使用 `seed + i`。显式传入 `--seed` 时仍以命令行值为准。
+benchmark 的默认 seed 是 `20280804`，scripted、PPO、expert、Diffusion Policy 和 DynamicVLA 评测入口共用该默认值。第 `i` 个回合使用 `seed + i`。显式传入 `--seed` 时仍以命令行值为准。
 
 每次运行目录包含：
 

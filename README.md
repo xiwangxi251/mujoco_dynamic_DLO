@@ -1,7 +1,7 @@
 # Panda 动态线缆抓取
 
 这是一个基于 MuJoCo 的 Franka Panda 动态柔性线缆抓取项目，包含规则策略、
-PPO 强化学习、特权专家数据采集和 DynamicVLA 接入。产品代码统一位于
+PPO 强化学习、特权专家数据采集、DynamicVLA 和视觉 Diffusion Policy。产品代码统一位于
 `src/panda_cable_grasp/`，所有实验产物统一写入 `outputs/`。
 
 ## 快速开始
@@ -9,7 +9,7 @@ PPO 强化学习、特权专家数据采集和 DynamicVLA 接入。产品代码�
 推荐使用 Python 3.10+。在仓库根目录安装：
 
 ```bash
-python -m pip install -e ".[rl,dynamicvla,dev]"
+python -m pip install -e ".[rl,dynamicvla,diffusion,dev]"
 ```
 
 运行一个无头规则策略实验：
@@ -57,10 +57,25 @@ panda-cable-finetune --help
 panda-cable-dynamicvla --help
 ```
 
+Diffusion Policy（输入与 DynamicVLA 相同：对侧/腕部两路 RGB 加末端位姿）：
+
+```bash
+panda-cable-diffusion-train outputs/datasets/privileged_expert/<run> \
+  --output outputs/diffusion_policy/train/cable_dp --epochs 2000 --device cuda
+panda-cable-diffusion-eval \
+  --model outputs/diffusion_policy/train/cable_dp/checkpoint_best.pt \
+  --scenario id_static --trials 20 --headless --device cuda
+```
+
+该实现使用专家已执行关节目标的前向运动学生成 `[xyz, quat_wxyz, gripper]`
+任务空间标签，预测 16 步动作块，每次执行 8 步后重规划；执行端复用
+DynamicVLA 的任务空间 IK 和安全限幅。详细说明见
+[`docs/diffusion_policy.md`](docs/diffusion_policy.md)。
+
 并行采集时，`--workers` 控制并行场景数，`--envs-per-scenario` 控制每个场景
 内部的独立 MuJoCo 环境数。采集器会实时显示 attempts/h、successes/h 和 ETA，并可用
-`--resume --run-name <名称>` 续跑中断任务。当前实验状态和三个方法的实验文档入口见
-[项目状态](docs/project_status.md)。
+`--resume --run-name <名称>` 续跑中断任务。当前实验状态和各方法的实验文档入口见
+  [项目状态](docs/project_status.md)。
 
 这些命令由 `pyproject.toml` 注册。Python 代码应直接从
 `panda_cable_grasp` 包导入；旧的根目录转发脚本和
@@ -82,7 +97,8 @@ panda_cable_grasp/
 │   ├── rl/                      # PPO 环境、训练、评估和指标
 │   ├── evaluation/              # 基准测试、诊断和失败分类
 │   ├── expert/                  # 特权专家
-│   └── dynamicvla/              # DynamicVLA 适配与微调工具
+│   ├── dynamicvla/              # DynamicVLA 适配与微调工具
+│   └── diffusion_policy/        # 视觉 Diffusion Policy、数据集与训练
 ├── tests/unit/                  # 快速、隔离的单元测试
 ├── tests/integration/           # MuJoCo/RL 集成测试
 └── tools/                       # 安装检查、消融、录像和启动工具
