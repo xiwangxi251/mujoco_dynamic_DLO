@@ -8,7 +8,7 @@ configs later without making scenario bookkeeping depend on a simulator.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from enum import Enum
 import hashlib
 import json
@@ -81,6 +81,12 @@ FREQUENCY_SCALES: Mapping[FactorLevel, float] = MappingProxyType({
 # 0.2147 m/s, matching the measured L1/L2 rigid-motion speed (0.2128 m/s).
 SHAPE_MOTION_SCALE = 0.4695
 
+# New OOD sweeps sample a single multiplier per episode.  The bounds are
+# relative to the corresponding nominal value; for amplitude this means the
+# nominal disturbance_strength (1.5) is multiplied by the sampled value.
+OOD_LOW_SCALE_RANGE = (0.5, 0.9)
+OOD_HIGH_SCALE_RANGE = (1.1, 1.5)
+
 
 # Nominal values are frozen from panda_cable_grasp.xml.  Scenario configs store
 # scale factors relative to these values so an MjSpec adapter can apply them
@@ -142,6 +148,16 @@ class ScenarioConfig:
     cable_stiffness_scale: float = 1.0
     cable_damping_scale: float = 1.0
     cable_friction_scale: float = 1.0
+
+    # Optional per-episode OOD ranges.  The concrete scalar fields above hold
+    # the midpoint so the config remains directly usable by legacy callers;
+    # ``sample_for_episode`` replaces them with a deterministic draw.
+    disturbance_strength_range: tuple[float, float] | None = None
+    frequency_scale_range: tuple[float, float] | None = None
+    cable_length_scale_range: tuple[float, float] | None = None
+    cable_material_scale_range: tuple[float, float] | None = None
+    ood_factor: str | None = None
+    ood_level: str | None = None
 
     description: str = ""
     tags: tuple[str, ...] = ()
@@ -243,6 +259,46 @@ class ScenarioConfig:
                 raise ValueError(f"{field_name} must be finite")
             object.__setattr__(self, field_name, value)
 
+        range_fields = (
+            "disturbance_strength_range",
+            "frequency_scale_range",
+            "cable_length_scale_range",
+            "cable_material_scale_range",
+        )
+        for field_name in range_fields:
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, (str, bytes)):
+                raise TypeError(f"{field_name} must be a pair of numeric bounds")
+            try:
+                bounds = tuple(value)
+            except TypeError as error:
+                raise TypeError(
+                    f"{field_name} must be a pair of numeric bounds"
+                ) from error
+            if len(bounds) != 2:
+                raise ValueError(f"{field_name} must contain exactly two bounds")
+            try:
+                bounds = (float(bounds[0]), float(bounds[1]))
+            except (TypeError, ValueError) as error:
+                raise TypeError(f"{field_name} bounds must be numeric") from error
+            if (
+                not all(math.isfinite(bound) and bound > 0.0 for bound in bounds)
+                or bounds[0] > bounds[1]
+            ):
+                raise ValueError(
+                    f"{field_name} must be finite, positive and ordered"
+                )
+            object.__setattr__(self, field_name, bounds)
+
+        for field_name in ("ood_factor", "ood_level"):
+            value = getattr(self, field_name)
+            if value is not None and (
+                not isinstance(value, str) or not _NAME_PATTERN.fullmatch(value)
+            ):
+                raise ValueError(f"{field_name} must be a lowercase identifier")
+
         self.validate()
 
     def validate(self) -> None:
@@ -263,12 +319,18 @@ class ScenarioConfig:
         else:
             expected_strength = AMPLITUDE_STRENGTHS[self.amplitude_level]
             expected_frequency = FREQUENCY_SCALES[self.frequency_level]
-            if not _is_close(self.disturbance_strength, expected_strength):
+            if (
+                self.disturbance_strength_range is None
+                and not _is_close(self.disturbance_strength, expected_strength)
+            ):
                 raise ValueError(
                     "disturbance_strength does not match amplitude_level: "
                     f"expected {expected_strength}, got {self.disturbance_strength}"
                 )
-            if not _is_close(self.frequency_scale, expected_frequency):
+            if (
+                self.frequency_scale_range is None
+                and not _is_close(self.frequency_scale, expected_frequency)
+            ):
                 raise ValueError(
                     "frequency_scale does not match frequency_level: "
                     f"expected {expected_frequency}, got {self.frequency_scale}"
@@ -285,6 +347,45 @@ class ScenarioConfig:
         for field_name in positive_fields:
             if getattr(self, field_name) <= 0.0:
                 raise ValueError(f"{field_name} must be positive")
+
+        for field_name, value_name in (
+            ("disturbance_strength_range", "disturbance_strength"),
+            ("frequency_scale_range", "frequency_scale"),
+            ("cable_length_scale_range", "cable_length_scale"),
+        ):
+            bounds = getattr(self, field_name)
+            if bounds is not None and not (bounds[0] <= getattr(self, value_name) <= bounds[1]):
+                raise ValueError(
+                    f"{value_name} midpoint must lie inside {field_name}"
+                )
+            if bounds is not None and self.split is not ScenarioSplit.OOD:
+                raise ValueError(f"{field_name} is only valid in the OOD split")
+
+        material_range = self.cable_material_scale_range
+        if material_range is not None:
+            if self.split is not ScenarioSplit.OOD:
+                raise ValueError("cable_material_scale_range is only valid in OOD")
+            material_values = (
+                self.cable_density_scale,
+                self.cable_stiffness_scale,
+                self.cable_damping_scale,
+                self.cable_friction_scale,
+            )
+            if not all(
+                material_range[0] <= value <= material_range[1]
+                for value in material_values
+            ) or not all(_is_close(value, material_values[0]) for value in material_values[1:]):
+                raise ValueError(
+                    "material range requires one shared midpoint for all material scales"
+                )
+
+        if self.ood_factor is not None or self.ood_level is not None:
+            if self.split is not ScenarioSplit.OOD:
+                raise ValueError("ood_factor/ood_level are only valid in OOD")
+            if self.ood_factor not in {"amplitude", "frequency", "length", "material"}:
+                raise ValueError(f"unsupported ood_factor: {self.ood_factor!r}")
+            if self.ood_level not in {"low", "high"}:
+                raise ValueError(f"unsupported ood_level: {self.ood_level!r}")
 
         length_is_nominal = _is_close(self.cable_length_scale, 1.0)
         if self.cable_length_ood == length_is_nominal:
@@ -303,6 +404,8 @@ class ScenarioConfig:
             self.cable_material_profile == "nominal"
             and all(_is_close(value, nominal) for value, nominal in nominal_material_values)
         )
+        if material_range is not None:
+            material_is_nominal = False
         if self.cable_material_ood == material_is_nominal:
             expected = "non-nominal" if self.cable_material_ood else "nominal"
             raise ValueError(
@@ -330,6 +433,24 @@ class ScenarioConfig:
         # Prose and search tags can evolve without changing the actual scenario.
         payload.pop("description")
         payload.pop("tags")
+        # A sampled episode has different concrete scalar values, but it is
+        # still the same registered scenario/paired seed.  Keep the declared
+        # range in the identity and omit the sampled realization.
+        for range_name, value_name in (
+            ("disturbance_strength_range", "disturbance_strength"),
+            ("frequency_scale_range", "frequency_scale"),
+            ("cable_length_scale_range", "cable_length_scale"),
+        ):
+            if payload.get(range_name) is not None:
+                payload.pop(value_name, None)
+        if payload.get("cable_material_scale_range") is not None:
+            for value_name in (
+                "cable_density_scale",
+                "cable_stiffness_scale",
+                "cable_damping_scale",
+                "cable_friction_scale",
+            ):
+                payload.pop(value_name, None)
         return payload
 
     @property
@@ -379,6 +500,46 @@ class ScenarioConfig:
             "cable_damping_scale": self.cable_damping_scale,
             "cable_friction_scale": self.cable_friction_scale,
         }
+
+    def sample_for_episode(self, seed: int) -> "ScenarioConfig":
+        """Return a deterministic realization of any declared OOD ranges.
+
+        The draw is keyed by the registered scenario identity, seed and field
+        name, so paired methods receive exactly the same physical parameters
+        even when they run in different worker processes.
+        """
+
+        updates: dict[str, Any] = {}
+
+        def draw(bounds: tuple[float, float], field_name: str) -> float:
+            token = f"{self.scenario_id}:{int(seed)}:{field_name}".encode("ascii")
+            digest = hashlib.sha256(token).digest()
+            unit = int.from_bytes(digest[:8], "big") / float(1 << 64)
+            return bounds[0] + (bounds[1] - bounds[0]) * unit
+
+        if self.disturbance_strength_range is not None:
+            updates["disturbance_strength"] = draw(
+                self.disturbance_strength_range, "disturbance_strength"
+            )
+        if self.frequency_scale_range is not None:
+            updates["frequency_scale"] = draw(
+                self.frequency_scale_range, "frequency_scale"
+            )
+        if self.cable_length_scale_range is not None:
+            updates["cable_length_scale"] = draw(
+                self.cable_length_scale_range, "cable_length_scale"
+            )
+        if self.cable_material_scale_range is not None:
+            material_scale = draw(
+                self.cable_material_scale_range, "cable_material_scale"
+            )
+            updates.update({
+                "cable_density_scale": material_scale,
+                "cable_stiffness_scale": material_scale,
+                "cable_damping_scale": material_scale,
+                "cable_friction_scale": material_scale,
+            })
+        return self if not updates else replace(self, **updates)
 
     @classmethod
     def from_dict(cls, source: Mapping[str, Any]) -> "ScenarioConfig":
@@ -464,6 +625,24 @@ def _scenario(
     else:
         strength = AMPLITUDE_STRENGTHS[amplitude]
         frequency_scale = FREQUENCY_SCALES[frequency]
+    disturbance_range = overrides.get("disturbance_strength_range")
+    frequency_range = overrides.get("frequency_scale_range")
+    length_range = overrides.get("cable_length_scale_range")
+    material_range = overrides.get("cable_material_scale_range")
+    if disturbance_range is not None:
+        strength = sum(disturbance_range) / 2.0
+    if frequency_range is not None:
+        frequency_scale = sum(frequency_range) / 2.0
+    if length_range is not None:
+        overrides["cable_length_scale"] = sum(length_range) / 2.0
+    if material_range is not None:
+        material_midpoint = sum(material_range) / 2.0
+        overrides.update({
+            "cable_density_scale": material_midpoint,
+            "cable_stiffness_scale": material_midpoint,
+            "cable_damping_scale": material_midpoint,
+            "cable_friction_scale": material_midpoint,
+        })
     return ScenarioConfig(
         name=name,
         split=split,
@@ -567,75 +746,74 @@ def _registered_scenarios() -> list[ScenarioConfig]:
         ),
     ])
 
-    # Until L1/L2 selection is frozen, OOD variants remain paired.  The
-    # trajectory is encoded in every name instead of silently choosing one.
-    for trajectory, profile in (
-        ("l1", "rigid_level1_single_pass_v2"),
-        ("l2", "rigid_level2_single_pass_v2"),
+    # OOD is intentionally L1-only for this experiment.  Each factor has a
+    # low/high interval and is sampled independently for every episode.
+    trajectory = "l1"
+    profile = "rigid_level1_single_pass_v2"
+    common = dict(
+        split=ScenarioSplit.OOD,
+        motion_type=MotionType.COMBINED,
+        motion_profile_version=profile,
+    )
+    nominal_strength = AMPLITUDE_STRENGTHS[FactorLevel.NOMINAL]
+    for level, scale_range in (
+        ("high", OOD_HIGH_SCALE_RANGE),
+        ("low", OOD_LOW_SCALE_RANGE),
     ):
-        prefix = f"ood_combined_{trajectory}"
-        common = dict(
-            split=ScenarioSplit.OOD,
-            motion_type=MotionType.COMBINED,
-            motion_profile_version=profile,
-        )
-        scenarios.extend([
-            _scenario(
-                f"{prefix}_dynamics_high_stochastic",
-                amplitude=FactorLevel.HIGH,
-                frequency=FactorLevel.HIGH,
-                regularity=MotionRegularity.STOCHASTIC,
-                description=(
-                    f"Held-out compound dynamics stress test with {trajectory.upper()}."
-                ),
-                tags=("dynamics_ood", f"rigid_{trajectory}"),
-                **common,
+        amplitude_range = tuple(nominal_strength * value for value in scale_range)
+        scenarios.append(_scenario(
+            f"ood_combined_{trajectory}_amplitude_{level}",
+            amplitude=FactorLevel.HIGH if level == "high" else FactorLevel.LOW,
+            disturbance_strength_range=amplitude_range,
+            ood_factor="amplitude",
+            ood_level=level,
+            description=(
+                f"L1 combined OOD shape-motion amplitude sampled at "
+                f"{scale_range[0]:.1f}-{scale_range[1]:.1f}x nominal."
             ),
-            _scenario(
-                f"{prefix}_length_short",
-                cable_length_scale=0.80,
-                cable_length_ood=True,
-                description=f"Held-out 20 percent shorter cable with {trajectory.upper()}.",
-                tags=("length_ood", f"rigid_{trajectory}"),
-                **common,
+            tags=("amplitude_ood", "rigid_l1"),
+            **common,
+        ))
+        scenarios.append(_scenario(
+            f"ood_combined_{trajectory}_frequency_{level}",
+            frequency=FactorLevel.HIGH if level == "high" else FactorLevel.LOW,
+            frequency_scale_range=scale_range,
+            ood_factor="frequency",
+            ood_level=level,
+            description=(
+                f"L1 combined OOD frequency sampled at "
+                f"{scale_range[0]:.1f}-{scale_range[1]:.1f}x nominal."
             ),
-            _scenario(
-                f"{prefix}_length_long",
-                cable_length_scale=1.20,
-                cable_length_ood=True,
-                description=f"Held-out 20 percent longer cable with {trajectory.upper()}.",
-                tags=("length_ood", f"rigid_{trajectory}"),
-                **common,
+            tags=("frequency_ood", "rigid_l1"),
+            **common,
+        ))
+        scenarios.append(_scenario(
+            f"ood_combined_{trajectory}_length_{level}",
+            cable_length_ood=True,
+            cable_length_scale_range=scale_range,
+            ood_factor="length",
+            ood_level=level,
+            description=(
+                f"L1 combined OOD cable length sampled at "
+                f"{scale_range[0]:.1f}-{scale_range[1]:.1f}x nominal."
             ),
-            _scenario(
-                f"{prefix}_material_soft",
-                cable_material_profile="soft",
-                cable_material_ood=True,
-                cable_density_scale=0.80,
-                cable_stiffness_scale=0.50,
-                cable_damping_scale=0.72,
-                cable_friction_scale=0.70,
-                description=(
-                    f"Held-out softer, lighter and lower-friction cable with {trajectory.upper()}."
-                ),
-                tags=("material_ood", f"rigid_{trajectory}"),
-                **common,
+            tags=("length_ood", "rigid_l1"),
+            **common,
+        ))
+        scenarios.append(_scenario(
+            f"ood_combined_{trajectory}_material_{level}",
+            cable_material_profile=f"range_{level}",
+            cable_material_ood=True,
+            cable_material_scale_range=scale_range,
+            ood_factor="material",
+            ood_level=level,
+            description=(
+                f"L1 combined OOD material scales jointly sampled at "
+                f"{scale_range[0]:.1f}-{scale_range[1]:.1f}x nominal."
             ),
-            _scenario(
-                f"{prefix}_material_stiff",
-                cable_material_profile="stiff",
-                cable_material_ood=True,
-                cable_density_scale=1.20,
-                cable_stiffness_scale=2.00,
-                cable_damping_scale=1.60,
-                cable_friction_scale=1.30,
-                description=(
-                    f"Held-out stiffer, heavier and higher-friction cable with {trajectory.upper()}."
-                ),
-                tags=("material_ood", f"rigid_{trajectory}"),
-                **common,
-            ),
-        ])
+            tags=("material_ood", "rigid_l1"),
+            **common,
+        ))
     return scenarios
 
 
@@ -743,7 +921,13 @@ def validate_registry(registry: ScenarioRegistry = SCENARIO_REGISTRY) -> None:
             {item.frequency_level for item in scenarios if item.motion_type is not MotionType.STATIC},
             set(FactorLevel),
         ),
-        "regularities": ({item.regularity for item in scenarios}, set(MotionRegularity)),
+        # Stochastic regularity was part of the previous OOD suite.  The
+        # current protocol samples continuous amplitudes/frequencies instead;
+        # regular and quasiperiodic remain the registered regularities.
+        "regularities": (
+            {item.regularity for item in scenarios},
+            {MotionRegularity.REGULAR, MotionRegularity.QUASIPERIODIC},
+        ),
         "splits": ({item.split for item in scenarios}, set(ScenarioSplit)),
     }
     for label, (actual, expected) in required_checks.items():
@@ -816,6 +1000,8 @@ __all__ = [
     "SCENARIO_SCHEMA_VERSION",
     "SCENARIO_SUITE_NAMES",
     "SHAPE_MOTION_SCALE",
+    "OOD_HIGH_SCALE_RANGE",
+    "OOD_LOW_SCALE_RANGE",
     "ScenarioConfig",
     "ScenarioRegistry",
     "ScenarioSplit",

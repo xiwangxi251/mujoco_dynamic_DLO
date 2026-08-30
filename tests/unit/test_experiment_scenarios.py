@@ -399,6 +399,10 @@ class EnvironmentScenarioTests(unittest.TestCase):
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1008)
+            center_index = env.cable_index[env.target_body_id]
+            offset_body_id = env.cable_ids[
+                center_index + env.config.confirmed_grasp_contact_index_radius
+            ]
             env.grasp_state = GraspState(
                 body_id=env.target_body_id,
                 candidate_time=float(env.data.time),
@@ -409,7 +413,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             env._physical_grasp_candidate = lambda: None
             env._finger_body_contact_pairs = lambda cable_body=None: [
                 (env.target_body_id, env.left_finger_id),
-                (env.target_body_id, env.right_finger_id),
+                (offset_body_id, env.right_finger_id),
             ]
             steps = math.ceil(
                 1.5 * env.config.grasp_loss_seconds / env.model.opt.timestep
@@ -421,10 +425,16 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_confirmed_grasp_still_clears_without_bilateral_finger_contact(self) -> None:
+    def test_confirmed_grasp_clears_outside_retention_neighborhood(self) -> None:
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1009)
+            center_index = env.cable_index[env.target_body_id]
+            outside_body_id = env.cable_ids[
+                center_index
+                + env.config.confirmed_grasp_contact_index_radius
+                + 1
+            ]
             env.grasp_state = GraspState(
                 body_id=env.target_body_id,
                 candidate_time=float(env.data.time),
@@ -435,6 +445,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             env._physical_grasp_candidate = lambda: None
             env._finger_body_contact_pairs = lambda cable_body=None: [
                 (env.target_body_id, env.left_finger_id),
+                (outside_body_id, env.right_finger_id),
             ]
             steps = math.ceil(
                 env.config.grasp_loss_seconds / env.model.opt.timestep
@@ -448,12 +459,20 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_curved_grasp_uses_two_node_contact_radius(self) -> None:
-        config = EnvConfig(grasp_contact_index_radius=2)
+    def test_curved_grasp_uses_five_node_confirmation_and_retention_radii(
+        self,
+    ) -> None:
+        config = EnvConfig(
+            grasp_contact_index_radius=5,
+            confirmed_grasp_contact_index_radius=5,
+        )
         self.assertEqual(config.episode_seconds, 15.0)
-        self.assertEqual(config.grasp_contact_index_radius, 2)
+        self.assertEqual(config.grasp_contact_index_radius, 5)
+        self.assertEqual(config.confirmed_grasp_contact_index_radius, 5)
         with self.assertRaisesRegex(ValueError, "non-negative integer"):
             EnvConfig(grasp_contact_index_radius=-1)
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            EnvConfig(confirmed_grasp_contact_index_radius=-1)
 
     def test_oblique_bilateral_grasp_accepts_39_mm_aperture(self) -> None:
         env = self.make("id_static")
@@ -779,7 +798,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             del env
 
     def test_seed_reproduces_initial_scene_and_motion_profile(self) -> None:
-        env = self.make("ood_combined_l1_dynamics_high_stochastic")
+        env = self.make("ood_combined_l1_amplitude_high")
         try:
             _, first = env.reset(seed=9001)
             _, second = env.reset(seed=9001)
@@ -792,8 +811,27 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 tuple(first[key] for key in keys),
                 tuple(second[key] for key in keys),
             )
+            bounds = get_scenario(
+                "ood_combined_l1_amplitude_high"
+            ).disturbance_strength_range
+            self.assertIsNotNone(bounds)
+            self.assertTrue(bounds[0] <= first["disturbance_strength"] <= bounds[1])
         finally:
             del env
+
+    def test_ood_range_sampling_is_seeded_and_identity_stable(self) -> None:
+        scenario = get_scenario("ood_combined_l1_frequency_high")
+        first = scenario.sample_for_episode(9001)
+        repeat = scenario.sample_for_episode(9001)
+        other = scenario.sample_for_episode(9002)
+        self.assertEqual(first, repeat)
+        self.assertEqual(first.scenario_id, scenario.scenario_id)
+        self.assertEqual(other.scenario_id, scenario.scenario_id)
+        bounds = scenario.frequency_scale_range
+        self.assertIsNotNone(bounds)
+        self.assertTrue(bounds[0] <= first.frequency_scale <= bounds[1])
+        self.assertTrue(bounds[0] <= other.frequency_scale <= bounds[1])
+        self.assertNotEqual(first.frequency_scale, other.frequency_scale)
 
     def test_core_force_components_switch_exactly(self) -> None:
         expected = {
@@ -1404,8 +1442,14 @@ class EnvironmentScenarioTests(unittest.TestCase):
 
     def test_ood_length_and_material_change_compiled_physics(self) -> None:
         nominal = self.make("id_combined_l1_nominal")
-        short = self.make("ood_combined_l1_length_short")
-        soft = self.make("ood_combined_l1_material_soft")
+        short_scenario = get_scenario("ood_combined_l1_length_low").sample_for_episode(1234)
+        soft_scenario = get_scenario("ood_combined_l1_material_low").sample_for_episode(1234)
+        short = CableGraspEnv(env_config_for_scenario(
+            short_scenario, seed=1234, episode_seconds=0.1,
+        ))
+        soft = CableGraspEnv(env_config_for_scenario(
+            soft_scenario, seed=1234, episode_seconds=0.1,
+        ))
         try:
             nominal_span = np.linalg.norm(
                 nominal.data.xpos[nominal.cable_ids[-1]]
@@ -1415,16 +1459,25 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 short.data.xpos[short.cable_ids[-1]]
                 - short.data.xpos[short.cable_ids[0]]
             )
-            self.assertAlmostEqual(short_span / nominal_span, 0.8, delta=0.01)
             self.assertAlmostEqual(
-                soft.cable_mass.sum() / nominal.cable_mass.sum(), 0.8, delta=0.02
+                short_span / nominal_span,
+                short.config.cable_length_scale,
+                delta=0.01,
+            )
+            self.assertTrue(0.5 <= short.config.cable_length_scale <= 0.9)
+            self.assertAlmostEqual(
+                soft.cable_mass.sum() / nominal.cable_mass.sum(),
+                soft.config.cable_density_scale,
+                delta=0.02,
             )
             nominal_damping = nominal.model.dof_damping[
                 nominal.model.jnt_dofadr[10]
             ]
             soft_damping = soft.model.dof_damping[soft.model.jnt_dofadr[10]]
             self.assertAlmostEqual(
-                soft_damping / nominal_damping, 0.72, delta=1e-6
+                soft_damping / nominal_damping,
+                soft.config.cable_damping_scale,
+                delta=1e-6,
             )
         finally:
             del nominal, short, soft

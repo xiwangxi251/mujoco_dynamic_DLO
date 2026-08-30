@@ -159,7 +159,8 @@ class EnvConfig:
     success_hold_seconds: float = 0.80  
     grasp_confirm_seconds: float = 0.06 
     grasp_candidate_gap_seconds: float = 0.02  
-    grasp_contact_index_radius: int = 2  
+    grasp_contact_index_radius: int = 5
+    confirmed_grasp_contact_index_radius: int = 5
     grasp_loss_seconds: float = 0.35   
     # A 20 mm cable can hold the Panda fingers near 39 mm when it enters the
     # pads obliquely.  Bilateral pad force and center-distance checks below
@@ -310,14 +311,17 @@ class EnvConfig:
                     raise ValueError(f"{name} must be a normalized quaternion")
         if self.grasp_candidate_gap_seconds < 0.0:
             raise ValueError("grasp_candidate_gap_seconds must be non-negative")
-        if (
-            isinstance(self.grasp_contact_index_radius, bool)
-            or not isinstance(self.grasp_contact_index_radius, int)
-            or self.grasp_contact_index_radius < 0
+        for name in (
+            "grasp_contact_index_radius",
+            "confirmed_grasp_contact_index_radius",
         ):
-            raise ValueError(
-                "grasp_contact_index_radius must be a non-negative integer"
-            )
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer")
         for name in (
             "arm_joint_velocity_limits", "arm_joint_acceleration_limits",
         ):
@@ -634,15 +638,16 @@ class CableGraspEnv:
         base_cable_xy = self.data.xpos[self.cable_ids, :2].copy()
         base_com_xy = np.average(base_cable_xy, axis=0, weights=self.cable_mass)
         if randomize:
-            # 每轮改变线缆初始位置、运动相位和目标段；固定seed时完整场景可复现。
+            # 临时消融：保留场景随机化，但固定目标为线缆中部节点。
             dx = float(self.rng.uniform(-0.10, 0.10))
             dy = float(self.rng.uniform(-0.13, 0.13))
             self.phase_offset = self.rng.uniform(0.0, 2.0 * math.pi)
             self.spatial_phase = self.rng.uniform(0.0, 2.0 * math.pi)
             lo = len(self.cable_ids) // 4
             hi = len(self.cable_ids) - lo
-            target_index = int(self.rng.integers(lo, hi))
-            self.target_body_id = self.cable_ids[target_index]
+            # 保留原随机数消耗，使该消融实验与原实验严格配对；抽样结果不用于目标选择。
+            self.rng.integers(lo, hi)
+            self.target_body_id = self.cable_ids[len(self.cable_ids) // 2]
         else:
             dx = 0.0
             dy = 0.0
@@ -1367,7 +1372,7 @@ class CableGraspEnv:
             # 求解器法向力可能短暂低于阈值，而真实碰撞仍同时存在于左右指垫。
             # 这种情况不是滑脱，不能把它累计成“无接触”并清除抓取状态。
             center_index = self.cable_index[self.grasp_state.body_id]
-            radius = self.config.grasp_contact_index_radius
+            radius = self.config.confirmed_grasp_contact_index_radius
             raw_pairs = [
                 (body_id, finger_id)
                 for body_id, finger_id in self._finger_body_contact_pairs()

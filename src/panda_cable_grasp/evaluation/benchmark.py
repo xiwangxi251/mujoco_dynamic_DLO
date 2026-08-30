@@ -100,6 +100,10 @@ def _scenario_config(
 ) -> EnvConfig:
     if scenario is None:
         return _legacy_config(seed, disturbance, seconds)
+    # OOD range scenarios are realized independently per paired episode.  The
+    # scenario identity remains stable while concrete physical values are
+    # sampled deterministically from the episode seed.
+    scenario = scenario.sample_for_episode(seed)
     return env_config_for_scenario(
         scenario,
         seed=seed,
@@ -231,6 +235,13 @@ def _base_row(
             "nominal" if scenario is None else scenario.cable_material_profile
         ),
         "cable_material_ood": bool(scenario and scenario.cable_material_ood),
+        "ood_factor": None if scenario is None else scenario.ood_factor,
+        "ood_level": None if scenario is None else scenario.ood_level,
+        "ood_factor_level": (
+            None
+            if scenario is None or scenario.ood_factor is None
+            else f"{scenario.ood_factor}_{scenario.ood_level}"
+        ),
         "requested_seed": seed,
         "actual_episode_seed": actual_seed,
         "base_scene_fingerprint": base_scene_fingerprint(initial_info),
@@ -711,6 +722,7 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     for method in sorted({str(row["method"]) for row in rows}):
         selected = [row for row in rows if row["method"] == method]
         by_scenario = _group(selected, "scenario_name")
+        ood_rows = [row for row in selected if row.get("ood_factor")]
         scenario_rates = [
             float(summary["task_success_rate"])
             for summary in by_scenario.values()
@@ -724,6 +736,14 @@ def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "by_scenario": by_scenario,
             "by_motion_type": _group(selected, "motion_type"),
             "by_split": _group(selected, "scenario_split"),
+            # ``by_ood_factor`` deliberately pools low/high samples, e.g.
+            # amplitude total success rate across both amplitude ranges.
+            "by_ood_factor": (
+                _group(ood_rows, "ood_factor") if ood_rows else {}
+            ),
+            "by_ood_factor_level": (
+                _group(ood_rows, "ood_factor_level") if ood_rows else {}
+            ),
         }
     return result
 
