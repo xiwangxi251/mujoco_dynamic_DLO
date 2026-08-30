@@ -13,6 +13,37 @@ import shutil
 from typing import Any
 
 
+class ExponentialMovingAverage:
+    """Keep the reference-style power-law EMA model for inference."""
+
+    def __init__(self, model, power: float) -> None:
+        self.power = float(power)
+        self.step_count = 0
+        self.shadow = {
+            name: value.detach().clone()
+            for name, value in model.state_dict().items()
+        }
+
+    def update(self, model) -> None:
+        self.step_count += 1
+        decay = 1.0 - (self.step_count + 1) ** (-self.power)
+        for name, value in model.state_dict().items():
+            target = value.detach()
+            if not torch_is_floating(target):
+                self.shadow[name].copy_(target)
+            else:
+                self.shadow[name].mul_(decay).add_(target, alpha=1.0 - decay)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {name: value.clone() for name, value in self.shadow.items()}
+
+
+def torch_is_floating(value) -> bool:
+    """Avoid importing torch before the optional dependency check in train()."""
+
+    return value.is_floating_point() or value.is_complex()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a DynamicVLA-compatible visual Diffusion Policy"
@@ -177,6 +208,11 @@ def train(args: argparse.Namespace) -> Path:
 
     device = torch.device(args.device)
     model = DiffusionPolicy(config).to(device)
+    ema = (
+        ExponentialMovingAverage(model, config.ema_power)
+        if config.ema_enabled
+        else None
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -212,6 +248,8 @@ def train(args: argparse.Namespace) -> Path:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
                 optimizer.step()
+                if ema is not None:
+                    ema.update(model)
                 scheduler.step()
                 epoch_losses.append(float(loss.item()))
                 global_step += 1
@@ -228,8 +266,9 @@ def train(args: argparse.Namespace) -> Path:
             })
             metrics_file.flush()
             checkpoint = {
-                "format": "panda_cable_diffusion_policy_v1",
+                "format": "panda_cable_diffusion_policy_v2",
                 "model": model.state_dict(),
+                "ema_model": None if ema is None else ema.state_dict(),
                 "config": asdict(config),
                 "state_low": train_dataset.state_low.tolist(),
                 "state_high": train_dataset.state_high.tolist(),
@@ -252,8 +291,19 @@ def train(args: argparse.Namespace) -> Path:
             )
 
     manifest: dict[str, Any] = {
-        "format": "panda_cable_diffusion_policy_v1",
+        "format": "panda_cable_diffusion_policy_v2",
         "method": "diffusion_policy",
+        "architecture": {
+            "visual_encoder": "separate_resnet18_spatial_softmax",
+            "visual_feature_dimension": config.image_feature_dim,
+            "spatial_keypoints": config.spatial_num_keypoints,
+            "crop": [config.crop_height, config.crop_width],
+            "action_head": "conditional_unet_1d",
+            "unet_down_dims": list(config.unet_down_dims),
+            "diffusion_step_embed_dim": config.diffusion_step_embed_dim,
+            "ema": config.ema_enabled,
+        },
+        "model_parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "config": asdict(config),
         "data": {
             "inputs": [str(Path(item).expanduser().resolve()) for item in args.inputs],

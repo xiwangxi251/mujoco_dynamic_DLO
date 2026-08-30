@@ -49,9 +49,9 @@ class DiffusionPolicyTorchShapeTests(unittest.TestCase):
 
         config = DiffusionPolicyConfig(
             image_feature_dim=16,
-            state_feature_dim=8,
-            denoiser_dim=32,
-            denoiser_blocks=2,
+            spatial_num_keypoints=8,
+            diffusion_step_embed_dim=32,
+            unet_down_dims=(32, 64, 128),
             diffusion_steps=8,
             inference_steps=3,
             prediction_horizon=4,
@@ -64,6 +64,7 @@ class DiffusionPolicyTorchShapeTests(unittest.TestCase):
             "state": torch.rand(2, 2, 7),
         }
         actions = torch.rand(2, 4, 8) * 2.0 - 1.0
+        self.assertIsNot(model.opst_encoder, model.wrist_encoder)
         loss = model.forward_loss(**observations, action=actions)
         sample = model.sample(**observations)
         self.assertEqual(loss.ndim, 0)

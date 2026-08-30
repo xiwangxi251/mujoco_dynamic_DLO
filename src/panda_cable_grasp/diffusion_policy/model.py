@@ -1,21 +1,154 @@
-"""Conditional action-diffusion model used by the cable-grasping method."""
+"""DynaMimicGen-style visual Diffusion Policy for cable grasping.
+
+The implementation follows the image-based robomimic / DynaMimicGen design:
+independent ResNet18 + SpatialSoftmax encoders for each camera, raw low-
+dimensional state concatenation, and a FiLM-conditioned 1-D temporal U-Net
+that predicts diffusion noise for an action sequence.
+"""
 
 from __future__ import annotations
 
 import math
+from typing import Union
 
+import numpy as np
 import torch
-from torch import Tensor, nn
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import models as vision_models
 
 from .config import DiffusionPolicyConfig
 
 
-class SinusoidalEmbedding(nn.Module):
+def _replace_batchnorm_with_groupnorm(
+    module: nn.Module, features_per_group: int = 16
+) -> None:
+    """Replace ResNet BatchNorm with GroupNorm as in the reference setup."""
+
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            groups = max(1, child.num_features // features_per_group)
+            setattr(module, name, nn.GroupNorm(groups, child.num_features))
+        else:
+            _replace_batchnorm_with_groupnorm(child, features_per_group)
+
+
+class SpatialSoftmax(nn.Module):
+    """Learn keypoint heatmaps and return expected normalized coordinates."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        input_height: int,
+        input_width: int,
+        num_keypoints: int,
+        temperature: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.keypoint_projection = nn.Conv2d(
+            input_channels, num_keypoints, kernel_size=1
+        )
+        pos_x, pos_y = np.meshgrid(
+            np.linspace(-1.0, 1.0, input_width),
+            np.linspace(-1.0, 1.0, input_height),
+            indexing="xy",
+        )
+        self.register_buffer(
+            "pos_x", torch.from_numpy(pos_x.reshape(1, input_height * input_width)).float()
+        )
+        self.register_buffer(
+            "pos_y", torch.from_numpy(pos_y.reshape(1, input_height * input_width)).float()
+        )
+        self.temperature = float(temperature)
+        self.num_keypoints = num_keypoints
+
+    def forward(self, feature: torch.Tensor) -> torch.Tensor:
+        feature = self.keypoint_projection(feature)
+        batch = feature.shape[0]
+        attention = F.softmax(
+            feature.reshape(batch, self.num_keypoints, -1) / self.temperature,
+            dim=-1,
+        )
+        expected_x = torch.sum(self.pos_x * attention, dim=-1, keepdim=True)
+        expected_y = torch.sum(self.pos_y * attention, dim=-1, keepdim=True)
+        return torch.cat((expected_x, expected_y), dim=-1)
+
+
+class ResNet18SpatialSoftmaxEncoder(nn.Module):
+    """Reference image encoder: ResNet18, spatial softmax, linear projection."""
+
+    def __init__(self, config: DiffusionPolicyConfig) -> None:
+        super().__init__()
+        network = vision_models.resnet18(weights=None)
+        _replace_batchnorm_with_groupnorm(network)
+        self.backbone = nn.Sequential(*list(network.children())[:-2])
+        feature_height = math.ceil(config.crop_height / 32)
+        feature_width = math.ceil(config.crop_width / 32)
+        self.spatial_softmax = SpatialSoftmax(
+            input_channels=512,
+            input_height=feature_height,
+            input_width=feature_width,
+            num_keypoints=config.spatial_num_keypoints,
+        )
+        self.projection = nn.Linear(
+            config.spatial_num_keypoints * 2, config.image_feature_dim
+        )
+        self.image_height = config.image_height
+        self.image_width = config.image_width
+        self.crop_height = config.crop_height
+        self.crop_width = config.crop_width
+
+    def _crop(self, image: torch.Tensor) -> torch.Tensor:
+        if image.shape[-2:] != (self.image_height, self.image_width):
+            image = F.interpolate(
+                image,
+                size=(self.image_height, self.image_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        if (self.crop_height, self.crop_width) == (
+            self.image_height,
+            self.image_width,
+        ):
+            return image
+        if self.training:
+            max_y = self.image_height - self.crop_height
+            max_x = self.image_width - self.crop_width
+            top = torch.randint(0, max_y + 1, (image.shape[0],), device=image.device)
+            left = torch.randint(0, max_x + 1, (image.shape[0],), device=image.device)
+        else:
+            top = torch.full(
+                (image.shape[0],),
+                (self.image_height - self.crop_height) // 2,
+                device=image.device,
+                dtype=torch.long,
+            )
+            left = torch.full(
+                (image.shape[0],),
+                (self.image_width - self.crop_width) // 2,
+                device=image.device,
+                dtype=torch.long,
+            )
+        return torch.stack(
+            [
+                image[index, :, row : row + self.crop_height, column : column + self.crop_width]
+                for index, (row, column) in enumerate(zip(top.tolist(), left.tolist()))
+            ]
+        )
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        image = self._crop(image)
+        feature = self.backbone(image)
+        keypoints = self.spatial_softmax(feature)
+        return self.projection(keypoints.flatten(start_dim=1))
+
+
+class SinusoidalPosEmb(nn.Module):
     def __init__(self, dimension: int) -> None:
         super().__init__()
         self.dimension = dimension
 
-    def forward(self, value: Tensor) -> Tensor:
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
         value = value.float().reshape(-1, 1)
         half = self.dimension // 2
         scale = math.log(10000.0) / max(half - 1, 1)
@@ -25,167 +158,252 @@ class SinusoidalEmbedding(nn.Module):
         embedding = value * frequencies.reshape(1, -1)
         result = torch.cat((embedding.sin(), embedding.cos()), dim=-1)
         if result.shape[-1] < self.dimension:
-            result = torch.nn.functional.pad(result, (0, self.dimension - result.shape[-1]))
+            result = F.pad(result, (0, self.dimension - result.shape[-1]))
         return result
 
 
-class ImageEncoder(nn.Module):
-    """Small image encoder suitable for two 84x84 camera streams."""
+class Conv1dBlock(nn.Module):
+    """Conv1d -> GroupNorm -> Mish, matching the reference U-Net block."""
 
-    def __init__(self, feature_dim: int) -> None:
+    def __init__(
+        self, input_channels: int, output_channels: int, kernel_size: int, groups: int
+    ) -> None:
         super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.SiLU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.SiLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-        self.projection = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128, feature_dim),
-            nn.LayerNorm(feature_dim),
-            nn.SiLU(),
+        self.block = nn.Sequential(
+            nn.Conv1d(
+                input_channels,
+                output_channels,
+                kernel_size,
+                padding=kernel_size // 2,
+            ),
+            nn.GroupNorm(groups, output_channels),
+            nn.Mish(),
         )
 
-    def forward(self, image: Tensor) -> Tensor:
-        return self.projection(self.backbone(image))
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.block(value)
 
 
-class ResidualTemporalBlock(nn.Module):
-    """FiLM-conditioned temporal convolution block.
-
-    This is the core of the 1-D conditional U-Net style denoiser used in
-    Diffusion Policy: actions remain a time sequence, while the visual/state
-    context and diffusion timestep modulate every temporal feature channel.
-    """
-
-    def __init__(self, channels: int, condition_dim: int) -> None:
-        super().__init__()
-        self.norm1 = nn.GroupNorm(8, channels)
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size=5, padding=2)
-        self.norm2 = nn.GroupNorm(8, channels)
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size=5, padding=2)
-        self.film = nn.Linear(condition_dim, channels * 2)
-
-    def forward(self, value: Tensor, condition: Tensor) -> Tensor:
-        residual = value
-        value = self.conv1(torch.nn.functional.silu(self.norm1(value)))
-        scale, bias = self.film(condition).chunk(2, dim=-1)
-        value = self.norm2(value)
-        value = value * (1.0 + scale.unsqueeze(-1)) + bias.unsqueeze(-1)
-        value = self.conv2(torch.nn.functional.silu(value))
-        return residual + value
-
-
-class ConditionalTemporalDenoiser(nn.Module):
-    """Predict diffusion noise for an action chunk."""
+class ConditionalResidualBlock1D(nn.Module):
+    """Residual temporal block with FiLM scale and bias conditioning."""
 
     def __init__(
         self,
-        action_dim: int,
+        input_channels: int,
+        output_channels: int,
         condition_dim: int,
-        hidden_dim: int,
-        blocks: int,
+        kernel_size: int,
+        groups: int,
     ) -> None:
         super().__init__()
-        time_dim = 128
-        self.time_embedding = nn.Sequential(
-            SinusoidalEmbedding(time_dim),
-            nn.Linear(time_dim, time_dim),
-            nn.SiLU(),
-            nn.Linear(time_dim, time_dim),
-        )
-        self.condition = nn.Sequential(
-            nn.Linear(condition_dim + time_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-        self.input_projection = nn.Conv1d(action_dim, hidden_dim, kernel_size=1)
         self.blocks = nn.ModuleList(
-            ResidualTemporalBlock(hidden_dim, hidden_dim) for _ in range(blocks)
+            [
+                Conv1dBlock(input_channels, output_channels, kernel_size, groups),
+                Conv1dBlock(output_channels, output_channels, kernel_size, groups),
+            ]
         )
-        self.output = nn.Sequential(
-            nn.GroupNorm(8, hidden_dim),
-            nn.SiLU(),
-            nn.Conv1d(hidden_dim, action_dim, kernel_size=1),
+        self.condition_encoder = nn.Sequential(
+            nn.Mish(),
+            nn.Linear(condition_dim, output_channels * 2),
+            nn.Unflatten(-1, (-1, 1)),
+        )
+        self.residual_conv = (
+            nn.Conv1d(input_channels, output_channels, 1)
+            if input_channels != output_channels
+            else nn.Identity()
+        )
+        self.output_channels = output_channels
+
+    def forward(self, value: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        result = self.blocks[0](value)
+        modulation = self.condition_encoder(condition).reshape(
+            condition.shape[0], 2, self.output_channels, 1
+        )
+        result = modulation[:, 0] * result + modulation[:, 1]
+        result = self.blocks[1](result)
+        return result + self.residual_conv(value)
+
+
+class Downsample1d(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv = nn.Conv1d(channels, channels, 3, 2, 1)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.conv(value)
+
+
+class Upsample1d(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(channels, channels, 4, 2, 1)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.conv(value)
+
+
+class ConditionalUnet1D(nn.Module):
+    """Three-level FiLM-conditioned temporal U-Net from the reference DP."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        global_condition_dim: int,
+        diffusion_step_embed_dim: int,
+        down_dims: tuple[int, ...],
+        kernel_size: int,
+        groups: int,
+    ) -> None:
+        super().__init__()
+        all_dims = [input_dim, *down_dims]
+        start_dim = down_dims[0]
+        condition_dim = diffusion_step_embed_dim + global_condition_dim
+        self.diffusion_step_encoder = nn.Sequential(
+            SinusoidalPosEmb(diffusion_step_embed_dim),
+            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim),
+        )
+        in_out = list(zip(all_dims[:-1], all_dims[1:]))
+        mid_dim = all_dims[-1]
+        self.mid_modules = nn.ModuleList(
+            [
+                ConditionalResidualBlock1D(
+                    mid_dim, mid_dim, condition_dim, kernel_size, groups
+                ),
+                ConditionalResidualBlock1D(
+                    mid_dim, mid_dim, condition_dim, kernel_size, groups
+                ),
+            ]
+        )
+        self.down_modules = nn.ModuleList()
+        for index, (dim_in, dim_out) in enumerate(in_out):
+            is_last = index >= len(in_out) - 1
+            self.down_modules.append(
+                nn.ModuleList(
+                    [
+                        ConditionalResidualBlock1D(
+                            dim_in, dim_out, condition_dim, kernel_size, groups
+                        ),
+                        ConditionalResidualBlock1D(
+                            dim_out, dim_out, condition_dim, kernel_size, groups
+                        ),
+                        Downsample1d(dim_out) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
+        self.up_modules = nn.ModuleList()
+        for index, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = index >= len(in_out) - 1
+            self.up_modules.append(
+                nn.ModuleList(
+                    [
+                        ConditionalResidualBlock1D(
+                            dim_out * 2,
+                            dim_in,
+                            condition_dim,
+                            kernel_size,
+                            groups,
+                        ),
+                        ConditionalResidualBlock1D(
+                            dim_in, dim_in, condition_dim, kernel_size, groups
+                        ),
+                        Upsample1d(dim_in) if not is_last else nn.Identity(),
+                    ]
+                )
+            )
+        self.final_conv = nn.Sequential(
+            Conv1dBlock(start_dim, start_dim, kernel_size, groups),
+            nn.Conv1d(start_dim, input_dim, 1),
         )
 
-    def forward(self, noisy_action: Tensor, timestep: Tensor, condition: Tensor) -> Tensor:
-        time = self.time_embedding(timestep)
-        condition = self.condition(torch.cat((condition, time), dim=-1))
-        value = self.input_projection(noisy_action.transpose(1, 2))
-        for block in self.blocks:
-            value = block(value, condition)
-        return self.output(value).transpose(1, 2)
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        global_condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        value = sample.moveaxis(-1, -2)
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=value.device)
+        elif timestep.ndim == 0:
+            timestep = timestep[None]
+        timestep = timestep.to(device=value.device).expand(value.shape[0])
+        condition = self.diffusion_step_encoder(timestep)
+        if global_condition is not None:
+            condition = torch.cat((condition, global_condition), dim=-1)
+
+        skips: list[torch.Tensor] = []
+        for residual, residual2, downsample in self.down_modules:
+            value = residual(value, condition)
+            value = residual2(value, condition)
+            skips.append(value)
+            value = downsample(value)
+        for residual, residual2, upsample in self.up_modules:
+            value = torch.cat((value, skips.pop()), dim=1)
+            value = residual(value, condition)
+            value = residual2(value, condition)
+            value = upsample(value)
+        return self.final_conv(value).moveaxis(-1, -2)
 
 
-class DDPMSchedule(nn.Module):
-    """DDPM training schedule with deterministic DDIM-style inference."""
+class DDPMSchedule:
+    """Diffusers DDPM schedule used for both training and sampling."""
 
     def __init__(self, config: DiffusionPolicyConfig) -> None:
-        super().__init__()
-        betas = torch.linspace(
-            config.beta_start, config.beta_end, config.diffusion_steps,
-            dtype=torch.float32,
-        )
-        alphas = 1.0 - betas
-        alpha_bars = torch.cumprod(alphas, dim=0)
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alpha_bars", alpha_bars)
+        try:
+            from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+        except ImportError as error:
+            raise RuntimeError(
+                "Diffusion Policy requires diffusers; install with "
+                "`python -m pip install -e \".[diffusion]\"`"
+            ) from error
+        kwargs = {
+            "num_train_timesteps": config.diffusion_steps,
+            "beta_schedule": config.beta_schedule,
+            "clip_sample": config.clip_sample,
+            "prediction_type": "epsilon",
+        }
+        self.training = DDPMScheduler(**kwargs)
+        self.inference = DDPMScheduler(**kwargs)
 
-    def add_noise(self, clean: Tensor, noise: Tensor, timestep: Tensor) -> Tensor:
-        alpha_bar = self.alpha_bars[timestep].reshape(-1, 1, 1)
-        return alpha_bar.sqrt() * clean + (1.0 - alpha_bar).sqrt() * noise
+    def add_noise(
+        self,
+        clean: torch.Tensor,
+        noise: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.training.add_noise(clean, noise, timestep)
 
     @torch.no_grad()
-    def ddim_sample(
+    def sample(
         self,
-        denoiser,
-        condition: Tensor,
+        denoiser: nn.Module,
+        condition: torch.Tensor,
         shape: tuple[int, int, int],
         inference_steps: int,
         generator: torch.Generator | None,
-    ) -> Tensor:
+    ) -> torch.Tensor:
         value = torch.randn(shape, device=condition.device, generator=generator)
-        schedule = torch.linspace(
-            len(self.betas) - 1, 0, inference_steps, device=condition.device,
-        ).round().long().unique()
-        # ``linspace`` is descending; unique keeps the denoising order on
-        # current PyTorch versions, but sort explicitly for portability.
-        schedule = torch.sort(schedule, descending=True).values
-        for index, timestep in enumerate(schedule):
-            timestep_value = int(timestep.item())
-            timestep_batch = torch.full(
-                (shape[0],), timestep_value, device=condition.device, dtype=torch.long,
-            )
-            noise_prediction = denoiser(value, timestep_batch, condition)
-            alpha_bar = self.alpha_bars[timestep_value]
-            clean = (value - (1.0 - alpha_bar).sqrt() * noise_prediction) / alpha_bar.sqrt()
-            clean = clean.clamp(-1.5, 1.5)
-            if index == len(schedule) - 1:
-                value = clean
-                continue
-            previous_timestep = int(schedule[index + 1].item())
-            previous_alpha_bar = self.alpha_bars[previous_timestep]
-            value = (
-                previous_alpha_bar.sqrt() * clean
-                + (1.0 - previous_alpha_bar).sqrt() * noise_prediction
-            )
+        try:
+            self.inference.set_timesteps(inference_steps, device=condition.device)
+        except TypeError:
+            self.inference.set_timesteps(inference_steps)
+        for timestep in self.inference.timesteps:
+            noise_prediction = denoiser(value, timestep, condition)
+            kwargs = {
+                "model_output": noise_prediction,
+                "timestep": timestep,
+                "sample": value,
+            }
+            if generator is not None:
+                kwargs["generator"] = generator
+            value = self.inference.step(**kwargs).prev_sample
         return value
 
 
 class DiffusionPolicy(nn.Module):
-    """Two-camera + end-effector-state conditional action diffusion policy."""
+    """DynaMimicGen-style two-camera conditional action diffusion policy."""
 
     action_dim = 8
     state_dim = 7
@@ -193,65 +411,64 @@ class DiffusionPolicy(nn.Module):
     def __init__(self, config: DiffusionPolicyConfig) -> None:
         super().__init__()
         self.config = config
-        self.image_encoder = ImageEncoder(config.image_feature_dim)
-        self.state_encoder = nn.Sequential(
-            nn.Linear(self.state_dim, config.state_feature_dim),
-            nn.LayerNorm(config.state_feature_dim),
-            nn.SiLU(),
-            nn.Linear(config.state_feature_dim, config.state_feature_dim),
-            nn.SiLU(),
-        )
-        per_observation = 2 * config.image_feature_dim + config.state_feature_dim
-        condition_dim = config.observation_horizon * per_observation
-        self.denoiser = ConditionalTemporalDenoiser(
-            self.action_dim,
-            condition_dim,
-            config.denoiser_dim,
-            config.denoiser_blocks,
+        self.opst_encoder = ResNet18SpatialSoftmaxEncoder(config)
+        self.wrist_encoder = ResNet18SpatialSoftmaxEncoder(config)
+        per_observation = 2 * config.image_feature_dim + self.state_dim
+        global_condition_dim = config.observation_horizon * per_observation
+        self.denoiser = ConditionalUnet1D(
+            input_dim=self.action_dim,
+            global_condition_dim=global_condition_dim,
+            diffusion_step_embed_dim=config.diffusion_step_embed_dim,
+            down_dims=config.unet_down_dims,
+            kernel_size=config.unet_kernel_size,
+            groups=config.unet_groups,
         )
         self.schedule = DDPMSchedule(config)
 
     def encode_condition(
-        self, opst_cam: Tensor, wrist_cam: Tensor, state: Tensor
-    ) -> Tensor:
+        self, opst_cam: torch.Tensor, wrist_cam: torch.Tensor, state: torch.Tensor
+    ) -> torch.Tensor:
         if opst_cam.ndim != 5 or wrist_cam.ndim != 5 or state.ndim != 3:
             raise ValueError("expected camera tensors (B,K,C,H,W) and state (B,K,7)")
         batch, horizon = opst_cam.shape[:2]
         if wrist_cam.shape[:2] != (batch, horizon) or state.shape[:2] != (batch, horizon):
             raise ValueError("observation history lengths must match")
-        opst = self.image_encoder(opst_cam.reshape(batch * horizon, *opst_cam.shape[2:]))
-        wrist = self.image_encoder(wrist_cam.reshape(batch * horizon, *wrist_cam.shape[2:]))
-        state_feature = self.state_encoder(state.reshape(batch * horizon, -1))
-        condition = torch.cat((opst, wrist, state_feature), dim=-1)
+        if state.shape[-1] != self.state_dim:
+            raise ValueError(f"expected state dimension {self.state_dim}, got {state.shape[-1]}")
+        opst = self.opst_encoder(opst_cam.reshape(batch * horizon, *opst_cam.shape[2:]))
+        wrist = self.wrist_encoder(wrist_cam.reshape(batch * horizon, *wrist_cam.shape[2:]))
+        condition = torch.cat((opst, wrist, state.reshape(batch * horizon, -1)), dim=-1)
         return condition.reshape(batch, -1)
 
     def forward_loss(
         self,
-        opst_cam: Tensor,
-        wrist_cam: Tensor,
-        state: Tensor,
-        action: Tensor,
-    ) -> Tensor:
+        opst_cam: torch.Tensor,
+        wrist_cam: torch.Tensor,
+        state: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
         condition = self.encode_condition(opst_cam, wrist_cam, state)
         timestep = torch.randint(
-            0, self.config.diffusion_steps, (action.shape[0],),
+            0,
+            self.config.diffusion_steps,
+            (action.shape[0],),
             device=action.device,
         )
         noise = torch.randn_like(action)
         noisy_action = self.schedule.add_noise(action, noise, timestep)
         prediction = self.denoiser(noisy_action, timestep, condition)
-        return torch.nn.functional.mse_loss(prediction, noise)
+        return F.mse_loss(prediction, noise)
 
     @torch.no_grad()
     def sample(
         self,
-        opst_cam: Tensor,
-        wrist_cam: Tensor,
-        state: Tensor,
+        opst_cam: torch.Tensor,
+        wrist_cam: torch.Tensor,
+        state: torch.Tensor,
         generator: torch.Generator | None = None,
-    ) -> Tensor:
+    ) -> torch.Tensor:
         condition = self.encode_condition(opst_cam, wrist_cam, state)
-        return self.schedule.ddim_sample(
+        return self.schedule.sample(
             self.denoiser,
             condition,
             (

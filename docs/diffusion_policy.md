@@ -42,8 +42,14 @@ panda-cable-diffusion-train \
 episode 级别划分训练/验证集，不会把同一 episode 的帧同时放入两边。
 
 默认超参数是 2 帧观测历史、16 步预测块、执行 8 步后重规划、100 个 DDPM 训练
-步和 20 步确定性 DDIM 推理步。模型使用双相机 CNN、末端状态 MLP 和带 FiLM
-条件的 1-D 时序卷积去噪器。
+步和 100 步 DDPM 推理步，与 DynaMimicGen 的 image-DP 配置一致。每个相机使用
+独立的、未共享权重的 ResNet-18（BatchNorm 替换为 GroupNorm），接 32 个关键点的
+SpatialSoftmax 和 64 维特征投影；训练时使用 76×76 随机裁剪，评估时使用中心裁剪。
+动作去噪器是三层 1-D Conditional U-Net，通道为 `[512, 1024, 2048]`，卷积核为 5，
+GroupNorm 分组数为 8，并在残差块中使用 FiLM 条件调制。扩散时间步嵌入维度为 256，
+噪声调度为 squared-cosine DDPM，同时使用 power=0.75 的 EMA 权重进行推理。
+
+该配置约有 2.82 亿个可训练参数，因此训练显存和速度要求明显高于普通行为克隆模型。
 
 ## 评估
 

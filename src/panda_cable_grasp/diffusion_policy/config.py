@@ -10,10 +10,10 @@ import math
 class DiffusionPolicyConfig:
     """Training and inference parameters for the visual action diffusion model.
 
-    The defaults follow the practical settings reported for Diffusion Policy
-    evaluation in DynaMimicGen: 84x84 RGB inputs, a short observation history,
-    a 16-step prediction chunk, and 1e-4 initial learning rate.  The policy
-    runs at the environment control rate (normally 25 Hz here).
+    The defaults mirror the image-based Diffusion Policy configuration used by
+    DynaMimicGen: 84x84 RGB inputs with a 76x76 crop, a short observation
+    history, a 16-step prediction chunk, a ResNet18 + SpatialSoftmax visual
+    encoder, and a three-level 1-D conditional U-Net action head.
     """
 
     observation_horizon: int = 2
@@ -21,14 +21,20 @@ class DiffusionPolicyConfig:
     action_horizon: int = 8
     image_height: int = 84
     image_width: int = 84
-    image_feature_dim: int = 128
-    state_feature_dim: int = 64
-    denoiser_dim: int = 256
-    denoiser_blocks: int = 6
+    crop_height: int = 76
+    crop_width: int = 76
+    image_feature_dim: int = 64
+    spatial_num_keypoints: int = 32
+    diffusion_step_embed_dim: int = 256
+    unet_down_dims: tuple[int, ...] = (512, 1024, 2048)
+    unet_kernel_size: int = 5
+    unet_groups: int = 8
     diffusion_steps: int = 100
-    inference_steps: int = 20
-    beta_start: float = 1.0e-4
-    beta_end: float = 2.0e-2
+    inference_steps: int = 100
+    beta_schedule: str = "squaredcos_cap_v2"
+    clip_sample: bool = True
+    ema_enabled: bool = True
+    ema_power: float = 0.75
     learning_rate: float = 1.0e-4
     weight_decay: float = 1.0e-6
     batch_size: int = 16
@@ -42,10 +48,10 @@ class DiffusionPolicyConfig:
     def __post_init__(self) -> None:
         positive_integer_names = (
             "observation_horizon", "prediction_horizon", "action_horizon",
-            "image_height", "image_width", "image_feature_dim",
-            "state_feature_dim", "denoiser_dim", "denoiser_blocks",
-            "diffusion_steps", "inference_steps", "batch_size", "epochs",
-            "warmup_steps", "cache_episodes",
+            "image_height", "image_width", "crop_height", "crop_width",
+            "image_feature_dim", "spatial_num_keypoints", "diffusion_step_embed_dim",
+            "unet_kernel_size", "unet_groups", "diffusion_steps",
+            "inference_steps", "batch_size", "epochs", "warmup_steps", "cache_episodes",
         )
         for name in positive_integer_names:
             value = getattr(self, name)
@@ -53,16 +59,27 @@ class DiffusionPolicyConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if self.action_horizon > self.prediction_horizon:
             raise ValueError("action_horizon cannot exceed prediction_horizon")
+        if self.crop_height > self.image_height or self.crop_width > self.image_width:
+            raise ValueError("crop dimensions cannot exceed image dimensions")
+        if not self.unet_down_dims:
+            raise ValueError("unet_down_dims must not be empty")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in self.unet_down_dims
+        ):
+            raise ValueError("unet_down_dims must contain positive integers")
+        if any(value % self.unet_groups != 0 for value in self.unet_down_dims):
+            raise ValueError("all unet_down_dims must be divisible by unet_groups")
         if self.inference_steps > self.diffusion_steps:
             raise ValueError("inference_steps cannot exceed diffusion_steps")
         if isinstance(self.num_workers, bool) or not isinstance(self.num_workers, int):
             raise ValueError("num_workers must be an integer")
         if self.num_workers < 0:
             raise ValueError("num_workers must be non-negative")
-        if not 0.0 < self.beta_start < self.beta_end < 1.0:
-            raise ValueError("beta_start and beta_end must satisfy 0 < start < end < 1")
+        if not isinstance(self.beta_schedule, str) or not self.beta_schedule:
+            raise ValueError("beta_schedule must be a non-empty string")
         for name in (
-            "learning_rate", "weight_decay", "grad_clip_norm",
+            "learning_rate", "weight_decay", "grad_clip_norm", "ema_power",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:

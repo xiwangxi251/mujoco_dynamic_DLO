@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
         "--deterministic", action=argparse.BooleanOptionalAction, default=True,
-        help="use DDIM eta=0 sampling and a seedable initial noise tensor",
+        help="use a seedable diffusion noise generator for repeatable evaluation",
     )
     parser.add_argument("--video-dir", type=Path, default=output_path("diffusion_policy", "evaluation"))
     parser.add_argument("--run-name")

@@ -63,12 +63,20 @@ class DiffusionPolicyRunner:
             payload = torch.load(self.checkpoint_path, map_location=self.device)
         if not isinstance(payload, dict) or "model" not in payload:
             raise ValueError(f"invalid Diffusion Policy checkpoint: {checkpoint}")
+        if payload.get("format") != "panda_cable_diffusion_policy_v2":
+            raise ValueError(
+                "unsupported Diffusion Policy checkpoint format; retrain with "
+                "the DynaMimicGen-style v2 implementation"
+            )
         config_values = dict(payload.get("config", {}))
         from .config import DiffusionPolicyConfig
 
         self.config = DiffusionPolicyConfig(**config_values)
         self.model = DiffusionPolicy(self.config).to(self.device)
         self.model.load_state_dict(payload["model"])
+        self.using_ema = payload.get("ema_model") is not None
+        if self.using_ema:
+            self.model.load_state_dict(payload["ema_model"])
         self.model.eval()
         self.state_low = np.asarray(payload.get("state_low", STATE_LOW), dtype=np.float32)
         self.state_high = np.asarray(payload.get("state_high", STATE_HIGH), dtype=np.float32)
