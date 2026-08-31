@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
@@ -79,6 +79,13 @@ def _read_video(path: Path, size: tuple[int, int]) -> np.ndarray:
     return np.stack(frames).astype(np.uint8, copy=False)
 
 
+@lru_cache(maxsize=32)
+def _forward_kinematics(model_path: str) -> JointTargetForwardKinematics:
+    """Reuse the immutable FK model shared by trajectories from one scene."""
+
+    return JointTargetForwardKinematics(Path(model_path))
+
+
 def _episode_record(path: Path, action_source: str, gripper_threshold: float) -> EpisodeRecord:
     with np.load(path, allow_pickle=False) as data:
         required = {"hand_position", "hand_quaternion", "scenario_name", "seed"}
@@ -104,7 +111,7 @@ def _episode_record(path: Path, action_source: str, gripper_threshold: float) ->
         scenario = _scalar(data["scenario_name"])
         seed = int(data["seed"])
 
-    fk = JointTargetForwardKinematics(model_path)
+    fk = _forward_kinematics(str(model_path.resolve()))
     action_position, action_quaternion = fk.poses(command[:, :7])
     gripper = np.where(command[:, 7] > gripper_threshold, 1.0, -1.0)[:, None]
     action = np.concatenate((action_position, action_quaternion, gripper), axis=-1)
@@ -150,6 +157,37 @@ class DiffusionEpisodeDataset(Dataset):
             _episode_record(path, action_source, gripper_threshold)
             for path in _find_trajectories(inputs)
         ]
+        self._initialize_from_records(records, episode_indices)
+
+    @classmethod
+    def from_records(
+        cls,
+        records: list[EpisodeRecord],
+        *,
+        config,
+        episode_indices: Iterable[int] | None = None,
+    ) -> "DiffusionEpisodeDataset":
+        """Create a split view without reparsing trajectories or rebuilding FK."""
+
+        dataset = cls.__new__(cls)
+        dataset.config = config
+        dataset._initialize_from_records(records, episode_indices)
+        return dataset
+
+    def subset(self, episode_indices: Iterable[int]) -> "DiffusionEpisodeDataset":
+        """Return a split view sharing the already parsed episode records."""
+
+        return type(self).from_records(
+            self.records,
+            config=self.config,
+            episode_indices=episode_indices,
+        )
+
+    def _initialize_from_records(
+        self,
+        records: list[EpisodeRecord],
+        episode_indices: Iterable[int] | None,
+    ) -> None:
         selected = list(range(len(records))) if episode_indices is None else list(episode_indices)
         if not selected:
             raise ValueError("dataset split contains no episodes")

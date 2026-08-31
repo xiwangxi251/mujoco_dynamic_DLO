@@ -74,11 +74,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--validation-fraction must be in [0, 1)")
     for name in (
         "limit_episodes", "epochs", "batch_size", "observation_horizon",
-        "prediction_horizon", "action_horizon", "inference_steps", "num_workers",
+        "prediction_horizon", "action_horizon", "inference_steps",
     ):
         value = getattr(args, name)
         if value is not None and value <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.num_workers is not None and args.num_workers < 0:
+        parser.error("--num-workers must be non-negative")
     if args.learning_rate is not None and args.learning_rate <= 0.0:
         parser.error("--learning-rate must be positive")
     if args.max_validation_batches <= 0:
@@ -184,23 +186,20 @@ def train(args: argparse.Namespace) -> Path:
     )
     train_episode_indices = [episode_indices[index] for index in train_indices]
     validation_episode_indices = [episode_indices[index] for index in validation_indices]
-    train_dataset = DiffusionEpisodeDataset(
-        args.inputs,
-        config=config,
-        action_source=args.action_source,
-        gripper_threshold=args.gripper_threshold,
-        episode_indices=train_episode_indices,
-    )
+    train_dataset = all_dataset.subset(train_episode_indices)
     validation_dataset = None
     if validation_episode_indices:
-        validation_dataset = DiffusionEpisodeDataset(
-            args.inputs,
-            config=config,
-            action_source=args.action_source,
-            gripper_threshold=args.gripper_threshold,
-            episode_indices=validation_episode_indices,
-        )
-    train_loader = _loader(train_dataset, config=config, shuffle=True)
+        validation_dataset = all_dataset.subset(validation_episode_indices)
+    print(
+        f"dataset episodes={len(episode_indices)} train={len(train_episode_indices)} "
+        f"validation={len(validation_episode_indices)} train_frames={len(train_dataset)} "
+        f"validation_frames={None if validation_dataset is None else len(validation_dataset)} "
+        f"num_workers={config.num_workers}",
+        flush=True,
+    )
+    # Keep frames from one episode contiguous so the lazy video cache is useful.
+    # The episode split itself is already seeded and randomized once per run.
+    train_loader = _loader(train_dataset, config=config, shuffle=False)
     validation_loader = (
         None if validation_dataset is None
         else _loader(validation_dataset, config=config, shuffle=False)
@@ -241,7 +240,7 @@ def train(args: argparse.Namespace) -> Path:
         for epoch in range(1, config.epochs + 1):
             model.train()
             epoch_losses: list[float] = []
-            for batch in train_loader:
+            for batch_index, batch in enumerate(train_loader):
                 batch = {key: value.to(device) for key, value in batch.items()}
                 optimizer.zero_grad(set_to_none=True)
                 loss = model.forward_loss(**batch)
@@ -253,6 +252,13 @@ def train(args: argparse.Namespace) -> Path:
                 scheduler.step()
                 epoch_losses.append(float(loss.item()))
                 global_step += 1
+                if batch_index == 0 or global_step % 100 == 0:
+                    print(
+                        f"progress epoch={epoch}/{config.epochs} "
+                        f"batch={batch_index + 1}/{len(train_loader)} "
+                        f"step={global_step} loss={loss.item():.6f}",
+                        flush=True,
+                    )
             train_loss = sum(epoch_losses) / len(epoch_losses)
             validation_loss = _evaluate(
                 model, validation_loader, device, args.max_validation_batches
