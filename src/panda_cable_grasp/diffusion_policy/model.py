@@ -405,8 +405,8 @@ class DDPMSchedule:
 class DiffusionPolicy(nn.Module):
     """DynaMimicGen-style two-camera conditional action diffusion policy."""
 
-    action_dim = 8
-    state_dim = 7
+    action_dim = 7
+    state_dim = 6
 
     def __init__(self, config: DiffusionPolicyConfig) -> None:
         super().__init__()
@@ -429,7 +429,7 @@ class DiffusionPolicy(nn.Module):
         self, opst_cam: torch.Tensor, wrist_cam: torch.Tensor, state: torch.Tensor
     ) -> torch.Tensor:
         if opst_cam.ndim != 5 or wrist_cam.ndim != 5 or state.ndim != 3:
-            raise ValueError("expected camera tensors (B,K,C,H,W) and state (B,K,7)")
+            raise ValueError("expected camera tensors (B,K,C,H,W) and state (B,K,6)")
         batch, horizon = opst_cam.shape[:2]
         if wrist_cam.shape[:2] != (batch, horizon) or state.shape[:2] != (batch, horizon):
             raise ValueError("observation history lengths must match")

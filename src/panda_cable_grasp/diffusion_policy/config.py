@@ -41,7 +41,9 @@ class DiffusionPolicyConfig:
     epochs: int = 2000
     warmup_steps: int = 500
     grad_clip_norm: float = 1.0
-    num_workers: int = 0
+    # Video-backed LeRobot samples must be decoded outside the training process.
+    # Eight workers matches the verified DynamicVLA data-loader configuration.
+    num_workers: int = 8
     cache_episodes: int = 2
     seed: int = 20260804
 
@@ -86,20 +88,20 @@ class DiffusionPolicyConfig:
                 raise ValueError(f"{name} must be finite and non-negative")
 
 
-# DynamicVLA's task-space action is [xyz, quaternion(wxyz), gripper].  The
-# position bounds intentionally match DynamicVLAAdapterConfig.  Quaternion and
-# gripper values are already naturally represented in [-1, 1].
+# DynamicVLA's converted LeRobot data uses [xyz, Euler_xyz, gripper].  The
+# first three bounds match DynamicVLAAdapterConfig.  The converter wraps x/z
+# Euler angles to [0, 2*pi] and leaves y in the conventional [-pi, pi] range.
 STATE_LOW = (
-    0.20, -0.55, 0.005, -1.0, -1.0, -1.0, -1.0,
+    0.20, -0.55, 0.005, 0.0, -math.pi, 0.0,
 )
 STATE_HIGH = (
-    0.85, 0.55, 0.70, 1.0, 1.0, 1.0, 1.0,
+    0.85, 0.55, 0.70, 2.0 * math.pi, math.pi, 2.0 * math.pi,
 )
 ACTION_LOW = (
-    0.20, -0.55, 0.005, -1.0, -1.0, -1.0, -1.0, -1.0,
+    0.20, -0.55, 0.005, 0.0, -math.pi, 0.0, -1.0,
 )
 ACTION_HIGH = (
-    0.85, 0.55, 0.70, 1.0, 1.0, 1.0, 1.0, 1.0,
+    0.85, 0.55, 0.70, 2.0 * math.pi, math.pi, 2.0 * math.pi, 1.0,
 )
 
 
@@ -115,7 +117,7 @@ def normalize_array(value, low, high):
 
 
 def denormalize_array(value, low, high):
-    """Map a model array back to the physical DynamicVLA task space."""
+    """Map a model array back to the DynamicVLA task space."""
 
     import numpy as np
 
@@ -123,6 +125,40 @@ def denormalize_array(value, low, high):
     lower = np.asarray(low, dtype=np.float32)
     upper = np.asarray(high, dtype=np.float32)
     return lower + 0.5 * (array + 1.0) * (upper - lower)
+
+
+def wxyz_to_euler_xyz(value):
+    """Convert scalar-first quaternions using DynamicVLA's Euler convention."""
+
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    quaternion = np.asarray(value, dtype=np.float64)
+    if quaternion.shape[-1] != 4:
+        raise ValueError(f"quaternion array must end in 4 values, got {quaternion.shape}")
+    norms = np.linalg.norm(quaternion, axis=-1, keepdims=True)
+    if np.any(norms < 1e-8):
+        raise ValueError("zero-length quaternion")
+    euler = Rotation.from_quat(
+        quaternion / norms, scalar_first=True
+    ).as_euler("xyz", degrees=False)
+    euler[..., [0, 2]] = np.mod(euler[..., [0, 2]], 2.0 * np.pi)
+    return euler.astype(np.float32)
+
+
+def euler_xyz_to_wxyz(value):
+    """Convert DynamicVLA Euler_xyz actions to scalar-first quaternions."""
+
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    euler = np.asarray(value, dtype=np.float64)
+    if euler.shape[-1] != 3:
+        raise ValueError(f"Euler array must end in 3 values, got {euler.shape}")
+    quaternion = Rotation.from_euler("xyz", euler, degrees=False).as_quat(
+        scalar_first=True
+    )
+    return quaternion.astype(np.float32)
 
 
 def split_episode_indices(

@@ -175,9 +175,9 @@ def run(args: argparse.Namespace) -> Path:
         "camera_input": {
             "keys": ["observation.images.opst_cam", "observation.images.wrist_cam"],
             "resolution": [480, 360],
-            "state": "observation.state.end_effector.pos + quat(wxyz)",
+            "state": "observation.state.end_effector.pos + euler_xyz",
         },
-        "action": "absolute_xyz_quaternion_wxyz_gripper_through_dynamicvla_ik",
+        "action": "absolute_xyz_euler_xyz_gripper_through_dynamicvla_ik",
         "compiled_model": str(compiled_model.resolve()),
         "compiled_model_sha256": sha256_file(compiled_model),
         "source_xml": str(XML_PATH.resolve()),
