@@ -123,6 +123,8 @@ class EnvConfig:
     scenario_name: str = "legacy_shape_current"
     scenario_id: str | None = None
     scenario_split: str = "legacy"
+    # 目标节点选择：环境默认保持随机；规则 scripted 评测在入口处覆盖为 middle。
+    target_selection: str = "random"  # random / middle
 
     # 线缆运动参数
     motion_mode: str = "shape"          # static / rigid / shape / combined
@@ -209,6 +211,10 @@ class EnvConfig:
 
     # 合法性检查
     def __post_init__(self) -> None:
+        if self.target_selection not in {"random", "middle"}:
+            raise ValueError(
+                "target_selection must be either 'random' or 'middle'"
+            )
         if self.motion_mode not in {"static", "rigid", "shape", "combined"}:
             raise ValueError(f"unsupported motion_mode: {self.motion_mode!r}")
         if self.motion_regularity not in {
@@ -638,16 +644,18 @@ class CableGraspEnv:
         base_cable_xy = self.data.xpos[self.cable_ids, :2].copy()
         base_com_xy = np.average(base_cable_xy, axis=0, weights=self.cable_mass)
         if randomize:
-            # 临时消融：保留场景随机化，但固定目标为线缆中部节点。
+            # 保留随机抽样的消耗，使 random/middle 两种目标策略仍共享同一
+            # seed 下的初始线缆形状和运动相位，便于逐回合配对比较。
             dx = float(self.rng.uniform(-0.10, 0.10))
             dy = float(self.rng.uniform(-0.13, 0.13))
             self.phase_offset = self.rng.uniform(0.0, 2.0 * math.pi)
             self.spatial_phase = self.rng.uniform(0.0, 2.0 * math.pi)
             lo = len(self.cable_ids) // 4
             hi = len(self.cable_ids) - lo
-            # 保留原随机数消耗，使该消融实验与原实验严格配对；抽样结果不用于目标选择。
-            self.rng.integers(lo, hi)
-            self.target_body_id = self.cable_ids[len(self.cable_ids) // 2]
+            target_index = int(self.rng.integers(lo, hi))
+            if self.config.target_selection == "middle":
+                target_index = len(self.cable_ids) // 2
+            self.target_body_id = self.cable_ids[target_index]
         else:
             dx = 0.0
             dy = 0.0

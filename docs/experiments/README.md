@@ -20,10 +20,10 @@
 
 | 方法/实验 | 状态 | 样本量 | 当前结论 | 详细记录 |
 |---|---|---:|---|---|
-| Scripted 当前基线 | `EVALUATED` | 4×50 | 91/200（45.5%）；主要瓶颈是形成双指候选 | [Scripted/Expert](../scripted_policy_experiments.md) |
+| Scripted 当前基线 | `EVALUATED` | 4×50 | 固定中部+最近点 105/200（52.5%）；主要瓶颈是形成双指候选 | [Scripted/Expert](../scripted_policy_experiments.md) |
 | Expert 当前基线 | `EVALUATED` | 4×50 | 130/200（65%）；rigid 41/50 | [Scripted/Expert](../scripted_policy_experiments.md) |
 | 严格竖直夹爪 | `EVALUATED` | 2 方法×4×50 | 明显降低动态可达性，不作为默认设置 | [Scripted/Expert](../scripted_policy_experiments.md) |
-| Scripted 固定中部目标消融 | `PROVISIONAL` | 3 配置×4×50 | 固定中部+最近点 105/200；移除最近点 82/200；Rigid 为例外 | [Scripted/Expert](../scripted_policy_experiments.md) |
+| Scripted 固定中部目标消融 | `PROVISIONAL` | 3 配置×4×50 | 固定中部+最近点 105/200，现已升级为默认；移除最近点 82/200；Rigid 为例外 | [Scripted/Expert](../scripted_policy_experiments.md) |
 | PPO v6 3.801M | `EVALUATED` | 4×20 | 19/80；combined 0/20 | [RL](../rl_experiments.md) |
 | PPO v6 8.8M best | `PROVISIONAL` | 4×20 | 45/80；rigid 19/20，combined 4/20 | [RL](../rl_experiments.md) |
 | PPO v6 19.87M | `PILOT` | 训练曲线 | 最近训练窗口约 59%；尚无固定四场景严格评估 | [RL](../rl_experiments.md) |

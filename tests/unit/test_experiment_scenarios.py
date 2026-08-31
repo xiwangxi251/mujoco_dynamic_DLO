@@ -96,6 +96,10 @@ class ScenarioRegistryTests(unittest.TestCase):
                 motion_profile_version="factorized_v2",
             )
 
+    def test_environment_validates_target_selection(self) -> None:
+        with self.assertRaisesRegex(ValueError, "target_selection"):
+            EnvConfig(target_selection="unsupported")
+
 
 class EnvironmentScenarioTests(unittest.TestCase):
     @staticmethod
@@ -253,6 +257,23 @@ class EnvironmentScenarioTests(unittest.TestCase):
             self.assertTrue(info["motion_limit_active"])
             self.assertFalse(info["motion_limit_flags"]["acceleration"])
             self.assertTrue(info["motion_limit_flags"]["gripper_velocity"])
+        finally:
+            del env
+
+    def test_middle_target_selection_is_fixed_at_cable_midpoint(self) -> None:
+        scenario = get_scenario("id_static")
+        config = env_config_for_scenario(
+            scenario,
+            seed=1234,
+            episode_seconds=0.1,
+        )
+        config.target_selection = "middle"
+        env = CableGraspEnv(config)
+        try:
+            for seed in (1001, 1002, 1003):
+                _, info = env.reset(seed=seed)
+                midpoint = env.cable_ids[len(env.cable_ids) // 2]
+                self.assertEqual(info["target_body_id"], midpoint)
         finally:
             del env
 

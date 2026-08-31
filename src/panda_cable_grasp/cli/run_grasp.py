@@ -24,6 +24,7 @@ def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
             seed=args.seed,
             episode_seconds=args.episode_seconds,
             disturbance_strength=args.disturbance,
+            target_selection="middle",
         )
     scenario = get_scenario(args.scenario)
     return EnvConfig(
@@ -32,6 +33,7 @@ def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
         scenario_name=scenario.name,
         scenario_id=scenario.scenario_id,
         scenario_split=scenario.split.value,
+        target_selection="middle",
         **scenario.to_env_overrides(),
     )
 

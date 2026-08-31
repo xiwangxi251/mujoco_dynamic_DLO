@@ -119,6 +119,14 @@ def _recordable_config(config: EnvConfig, enabled: bool) -> EnvConfig:
     return replace(config, dynamicvla_cameras_enabled=enabled)
 
 
+def _config_for_method(config: EnvConfig, method: str) -> EnvConfig:
+    """Apply method-specific task defaults without changing other baselines."""
+
+    if method == "scripted":
+        return replace(config, target_selection="middle")
+    return config
+
+
 def _base_row(
     method: str,
     episode: int,
@@ -344,6 +352,7 @@ def _run_scripted(
     config = _scenario_config(
         scenario, seed=seeds[0], disturbance=disturbance, seconds=episode_seconds,
     )
+    config = _config_for_method(config, "scripted")
     env = CableGraspEnv(config)
     policy = DynamicCableGraspPolicy(env)
     rows: list[dict[str, Any]] = []
@@ -495,6 +504,7 @@ def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
         disturbance=float(job["disturbance"]),
         seconds=float(job["episode_seconds"]),
     )
+    config = _config_for_method(config, method)
     config = _recordable_config(config, recording)
 
     if method == "diffusion_policy":
