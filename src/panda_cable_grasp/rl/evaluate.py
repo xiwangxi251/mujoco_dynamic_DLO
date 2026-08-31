@@ -23,7 +23,12 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.utils import set_random_seed
 
-from ..env.environment import PANDA_XML_PATH, XML_PATH, resolve_menagerie_panda_dir
+from ..env.environment import (
+    PANDA_XML_PATH,
+    ROBOT_SPECS,
+    XML_PATH,
+    resolve_menagerie_panda_dir,
+)
 from ..evaluation.failure_taxonomy import (
     TASK_OUTCOME_TYPES,
     break_causal_class,
@@ -480,9 +485,14 @@ def _manifest(
         "checkpoint": _file_record(args.model),
         "environment": {
             "rl_interface_version": RL_INTERFACE_VERSION,
+            "robot": env.base_env.robot,
             "source_xml": _file_record(XML_PATH),
             "panda_xml": _file_record(PANDA_XML_PATH),
-            "menagerie_panda_assets": str(resolve_menagerie_panda_dir()),
+            "robot_xml": _file_record(env.base_env.robot_spec.xml_path),
+            "menagerie_panda_assets": (
+                str(resolve_menagerie_panda_dir())
+                if env.base_env.robot == "panda" else None
+            ),
             "compiled_model_sha256": _compiled_model_sha256(env.model),
             "base_environment_source": (
                 _file_record(Path(base_source)) if base_source else None
@@ -745,6 +755,7 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
     successful_episodes_with_physical_slip = 0
     task_success_without_confirmed_grasp = 0
     env = RLCableGraspEnv(
+        robot=getattr(args, "robot", "panda"),
         seed=args.seed,
         disturbance_strength=args.disturbance,
         episode_seconds=args.episode_seconds,
@@ -1171,6 +1182,7 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
     from mujoco import viewer
 
     env = RLCableGraspEnv(
+        robot=getattr(args, "robot", "panda"),
         seed=args.seed,
         disturbance_strength=args.disturbance,
         episode_seconds=args.episode_seconds,
@@ -1252,6 +1264,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--disturbance", type=float, default=1.5)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
+    parser.add_argument(
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        help="robot model used by the MuJoCo environment",
+    )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument(
         "--scenario",

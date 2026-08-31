@@ -28,6 +28,7 @@ from ..env.environment import (
     CableGraspEnv,
     EnvConfig,
     PANDA_XML_PATH,
+    ROBOT_SPECS,
     XML_PATH,
     resolve_menagerie_panda_dir,
 )
@@ -58,10 +59,12 @@ def env_config_for_scenario(
     *,
     seed: int,
     episode_seconds: float,
+    robot: str = "panda",
 ) -> EnvConfig:
     """把方法无关的场景协议转换成底层环境配置。"""
 
     return EnvConfig(
+        robot=robot,
         seed=seed,
         episode_seconds=episode_seconds,
         scenario_name=scenario.name,
@@ -196,11 +199,13 @@ def diagnose_scenario(
     seed: int,
     seconds: float,
     sample_hz: float,
+    robot: str = "panda",
 ) -> dict[str, Any]:
     env = CableGraspEnv(env_config_for_scenario(
         scenario,
         seed=seed,
         episode_seconds=seconds,
+        robot=robot,
     ))
     try:
         observation, initial_info = env.reset(seed=seed)
@@ -315,6 +320,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seconds", type=float, default=4.0)
     parser.add_argument("--sample-hz", type=float, default=10.0)
     parser.add_argument(
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        help="robot model used by the MuJoCo environment",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=DIAGNOSTIC_OUTPUT_ROOT / "runs",
@@ -336,6 +345,7 @@ def main() -> None:
     rows = [
         diagnose_scenario(
             scenario, seed=seed, seconds=args.seconds, sample_hz=args.sample_hz,
+            robot=args.robot,
         )
         for scenario in scenarios
         for seed in seeds
@@ -356,15 +366,21 @@ def main() -> None:
         "seeds": seeds,
         "seconds": args.seconds,
         "sample_hz": args.sample_hz,
+        "robot": args.robot,
         "force_decomposition_valid": not force_errors,
         "force_decomposition_errors": force_errors,
         "core_motion_semantics_valid": not motion_errors,
         "core_motion_semantics_errors": motion_errors,
         "source_xml": str(XML_PATH.resolve()),
         "source_xml_sha256": _sha256(XML_PATH),
+        "robot_xml": str(ROBOT_SPECS[args.robot].xml_path.resolve()),
+        "robot_xml_sha256": _sha256(ROBOT_SPECS[args.robot].xml_path),
         "panda_xml": str(PANDA_XML_PATH.resolve()),
         "panda_xml_sha256": _sha256(PANDA_XML_PATH),
-        "menagerie_panda_assets": str(resolve_menagerie_panda_dir()),
+        "menagerie_panda_assets": (
+            str(resolve_menagerie_panda_dir())
+            if args.robot == "panda" else None
+        ),
         "source_files": {
             name: {
                 "path": str(path.resolve()),

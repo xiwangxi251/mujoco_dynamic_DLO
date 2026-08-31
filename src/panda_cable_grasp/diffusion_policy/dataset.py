@@ -86,7 +86,11 @@ def _forward_kinematics(model_path: str) -> JointTargetForwardKinematics:
     return JointTargetForwardKinematics(Path(model_path))
 
 
-def _episode_record(path: Path, action_source: str, gripper_threshold: float) -> EpisodeRecord:
+def _episode_record(
+    path: Path,
+    action_source: str,
+    gripper_threshold: float | None,
+) -> EpisodeRecord:
     with np.load(path, allow_pickle=False) as data:
         required = {"hand_position", "hand_quaternion", "scenario_name", "seed"}
         missing = sorted(required.difference(data.files))
@@ -113,7 +117,14 @@ def _episode_record(path: Path, action_source: str, gripper_threshold: float) ->
 
     fk = _forward_kinematics(str(model_path.resolve()))
     action_position, action_quaternion = fk.poses(command[:, :7])
-    gripper = np.where(command[:, 7] > gripper_threshold, 1.0, -1.0)[:, None]
+    threshold = (
+        float(gripper_threshold)
+        if gripper_threshold is not None
+        else float(np.mean(fk.gripper_ctrl_range))
+    )
+    gripper = np.where(
+        command[:, fk.gripper_actuator_id] > threshold, 1.0, -1.0
+    )[:, None]
     action = np.concatenate((action_position, action_quaternion, gripper), axis=-1)
     state = np.asarray(state, dtype=np.float32)
     action = np.asarray(action, dtype=np.float32)
@@ -149,7 +160,7 @@ class DiffusionEpisodeDataset(Dataset):
         *,
         config,
         action_source: str = "applied",
-        gripper_threshold: float = 127.5,
+        gripper_threshold: float | None = None,
         episode_indices: Iterable[int] | None = None,
     ) -> None:
         self.config = config

@@ -8,9 +8,12 @@ from unittest.mock import patch
 
 from panda_cable_grasp.env.environment import (
     MENAGERIE_ENV_VAR,
+    NERO_XML_PATH,
     PANDA_XML_PATH,
+    ROBOT_SPECS,
     ROOT,
     XML_PATH,
+    robot_spec,
     resolve_menagerie_panda_dir,
 )
 from panda_cable_grasp.paths import OUTPUT_ROOT_ENV_VAR, output_path
@@ -26,6 +29,17 @@ class PortabilityTests(unittest.TestCase):
         )
         self.assertTrue(XML_PATH.is_file())
         self.assertTrue(PANDA_XML_PATH.is_file())
+
+    def test_nero_model_sources_are_owned_by_repository(self) -> None:
+        spec = robot_spec("NERO")
+        self.assertIs(spec, ROBOT_SPECS["nero"])
+        self.assertEqual(spec.xml_path, NERO_XML_PATH)
+        self.assertEqual(spec.hand_body_name, "link7")
+        self.assertEqual(spec.finger_joint_names, ("gripper_joint1", "gripper_joint2"))
+        self.assertTrue(NERO_XML_PATH.is_file())
+        self.assertTrue(spec.asset_dir.is_dir())
+        self.assertTrue((spec.asset_dir / "gripper_link1.stl").is_file())
+        self.assertTrue((spec.asset_dir / "gripper_link2.stl").is_file())
 
     def test_menagerie_can_be_located_outside_project_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -12,15 +12,20 @@ from ..paths import output_path
 
 def parse_args() -> argparse.Namespace:
     from ..scenarios.registry import list_scenario_names
+    from ..env.environment import ROBOT_SPECS
 
     parser = argparse.ArgumentParser(
-        description="Evaluate a visual Diffusion Policy on the Panda cable task"
+        description="Evaluate a visual Diffusion Policy on the cable task"
     )
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--scenario", choices=list_scenario_names(), required=True)
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--seed", type=int, default=20260804)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
+    parser.add_argument(
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        help="robot model used by the MuJoCo environment",
+    )
     parser.add_argument("--video-fps", type=float, default=25.0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
@@ -47,7 +52,10 @@ def run(args: argparse.Namespace) -> Path:
     import mujoco
 
     from ..diffusion_policy.runner import DiffusionPolicyRunner
-    from ..env.environment import CableGraspEnv, EnvConfig, PANDA_XML_PATH, XML_PATH, resolve_menagerie_panda_dir
+    from ..env.environment import (
+        CableGraspEnv, EnvConfig, PANDA_XML_PATH, XML_PATH,
+        resolve_menagerie_panda_dir,
+    )
     from ..evaluation.benchmark import base_row, sha256_file, summarize, write_csv
     from ..evaluation.defaults import DEFAULT_VIDEO_FPS
     from ..evaluation.motion_diagnostics import env_config_for_scenario
@@ -63,6 +71,7 @@ def run(args: argparse.Namespace) -> Path:
             **vars(config),
             "frame_skip": 20,
             "dynamicvla_cameras_enabled": True,
+            "robot": args.robot,
         }
     )
     env = CableGraspEnv(config)
@@ -178,13 +187,19 @@ def run(args: argparse.Namespace) -> Path:
             "state": "observation.state.end_effector.pos + quat(wxyz)",
         },
         "action": "absolute_xyz_quaternion_wxyz_gripper_through_dynamicvla_ik",
+        "robot": env.robot,
         "compiled_model": str(compiled_model.resolve()),
         "compiled_model_sha256": sha256_file(compiled_model),
         "source_xml": str(XML_PATH.resolve()),
         "source_xml_sha256": sha256_file(XML_PATH),
+        "robot_xml": str(env.robot_spec.xml_path.resolve()),
+        "robot_xml_sha256": sha256_file(env.robot_spec.xml_path),
         "panda_xml": str(PANDA_XML_PATH.resolve()),
         "panda_xml_sha256": sha256_file(PANDA_XML_PATH),
-        "menagerie_panda_assets": str(resolve_menagerie_panda_dir()),
+        "menagerie_panda_assets": (
+            str(resolve_menagerie_panda_dir())
+            if env.robot == "panda" else None
+        ),
         "summary": summary,
     }
     (run_dir / "manifest.json").write_text(

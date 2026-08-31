@@ -28,6 +28,7 @@ from ..env.environment import (
     CableGraspEnv,
     EnvConfig,
     PANDA_XML_PATH,
+    ROBOT_SPECS,
     XML_PATH,
     resolve_menagerie_panda_dir,
 )
@@ -97,18 +98,21 @@ def _scenario_config(
     seed: int,
     disturbance: float,
     seconds: float,
+    robot: str = "panda",
 ) -> EnvConfig:
     if scenario is None:
-        return _legacy_config(seed, disturbance, seconds)
+        return replace(
+            _legacy_config(seed, disturbance, seconds), robot=robot,
+        )
     # OOD range scenarios are realized independently per paired episode.  The
     # scenario identity remains stable while concrete physical values are
     # sampled deterministically from the episode seed.
     scenario = scenario.sample_for_episode(seed)
-    return env_config_for_scenario(
+    return replace(env_config_for_scenario(
         scenario,
         seed=seed,
         episode_seconds=seconds,
-    )
+    ), robot=robot)
 
 
 def _recordable_config(config: EnvConfig, enabled: bool) -> EnvConfig:
@@ -120,11 +124,17 @@ def _recordable_config(config: EnvConfig, enabled: bool) -> EnvConfig:
 
 
 def _config_for_method(config: EnvConfig, method: str) -> EnvConfig:
-    """Apply method-specific task defaults without changing other baselines."""
+    """Use one target node for every method in a paired benchmark.
 
-    if method == "scripted":
-        return replace(config, target_selection="middle")
-    return config
+    The scripted baseline historically forced the middle node while expert and
+    learned methods inherited the environment's random target.  That made the
+    final paired-scene fingerprint check compare different targets under the
+    same seed.  Keep the baseline's deterministic middle-node convention and
+    apply it consistently to all methods.
+    """
+
+    del method
+    return replace(config, target_selection="middle")
 
 
 def _base_row(
@@ -348,9 +358,11 @@ def _run_scripted(
     scenario: ScenarioConfig | None,
     disturbance: float,
     episode_seconds: float,
+    robot: str = "panda",
 ) -> list[dict[str, Any]]:
     config = _scenario_config(
         scenario, seed=seeds[0], disturbance=disturbance, seconds=episode_seconds,
+        robot=robot,
     )
     config = _config_for_method(config, "scripted")
     env = CableGraspEnv(config)
@@ -405,11 +417,12 @@ def _run_scripted_episode(
     scenario: ScenarioConfig | None,
     disturbance: float,
     episode_seconds: float,
+    robot: str = "panda",
 ) -> dict[str, Any]:
     """Run one isolated scripted episode for parallel matrix evaluation."""
 
     row = _run_scripted(
-        [seed], scenario, disturbance, episode_seconds,
+        [seed], scenario, disturbance, episode_seconds, robot,
     )[0]
     row["episode"] = episode
     return row
@@ -422,12 +435,14 @@ def _run_ppo(
     episode_seconds: float,
     model_path: Path,
     device: str,
+    robot: str = "panda",
 ) -> list[dict[str, Any]]:
     from stable_baselines3 import PPO
     from ..rl.environment import RLCableGraspEnv
 
     config = _scenario_config(
         scenario, seed=seeds[0], disturbance=disturbance, seconds=episode_seconds,
+        robot=robot,
     )
     env = RLCableGraspEnv(env_config=config)
     model = PPO.load(model_path, device=device)
@@ -503,6 +518,7 @@ def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
         seed=seed,
         disturbance=float(job["disturbance"]),
         seconds=float(job["episode_seconds"]),
+        robot=str(job.get("robot", "panda")),
     )
     config = _config_for_method(config, method)
     config = _recordable_config(config, recording)
@@ -785,6 +801,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--disturbance", type=float, default=1.5)
+    parser.add_argument(
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        help="robot model used by the MuJoCo environment",
+    )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--scenario", choices=list_scenario_names())
     selection.add_argument(
@@ -878,6 +898,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
         config = _recordable_config(_scenario_config(
             scenario, seed=args.seed, disturbance=args.disturbance,
             seconds=args.episode_seconds,
+            robot=getattr(args, "robot", "panda"),
         ), args.recording or "diffusion_policy" in args.methods)
         model_env = CableGraspEnv(config)
         scenario_name = config.scenario_name
@@ -902,6 +923,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             config = _scenario_config(
                 scenario, seed=args.seed, disturbance=args.disturbance,
                 seconds=args.episode_seconds,
+                robot=getattr(args, "robot", "panda"),
             )
             model_path = model_paths[config.scenario_name]
             per_scenario.append([
@@ -920,6 +942,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                     "video_fps": args.video_fps,
                     "output_dir": output_dir,
                     "compiled_model": model_path,
+                    "robot": getattr(args, "robot", "panda"),
                 }
                 for episode, seed in enumerate(seeds, start=1)
                 for method in args.methods
@@ -1022,11 +1045,21 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             else str(diffusion_policy_model.resolve())
         ),
         "diffusion_policy_model_sha256": _sha256(diffusion_policy_model),
+        "robot": getattr(args, "robot", "panda"),
         "source_xml": str(XML_PATH.resolve()),
         "source_xml_sha256": _sha256(XML_PATH),
+        "robot_xml": str(
+            ROBOT_SPECS[getattr(args, "robot", "panda")].xml_path.resolve()
+        ),
+        "robot_xml_sha256": _sha256(
+            ROBOT_SPECS[getattr(args, "robot", "panda")].xml_path
+        ),
         "panda_xml": str(PANDA_XML_PATH.resolve()),
         "panda_xml_sha256": _sha256(PANDA_XML_PATH),
-        "menagerie_panda_assets": str(resolve_menagerie_panda_dir()),
+        "menagerie_panda_assets": (
+            str(resolve_menagerie_panda_dir())
+            if getattr(args, "robot", "panda") == "panda" else None
+        ),
         "compiled_models": compiled_models,
         "source_files": {
             name: {"path": str(path.resolve()), "sha256": _sha256(path)}

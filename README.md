@@ -1,8 +1,9 @@
-# Panda 动态线缆抓取
+# MuJoCo 动态线缆抓取
 
-这是一个基于 MuJoCo 的 Franka Panda 动态柔性线缆抓取项目，包含规则策略、
+这是一个基于 MuJoCo 的 Franka Panda / 松灵 NERO 动态柔性线缆抓取项目，包含规则策略、
 PPO 强化学习、特权专家数据采集、DynamicVLA 和视觉 Diffusion Policy。产品代码统一位于
-`src/panda_cable_grasp/`，所有实验产物统一写入 `outputs/`。
+`src/panda_cable_grasp/`，所有实验产物统一写入 `outputs/`。默认机器人仍为 Panda；NERO
+使用仓库内 `assets/mujoco/nero/` 的 AgileX 官方模型和网格资源。
 
 ## 快速开始
 
@@ -17,6 +18,17 @@ python -m pip install -e ".[rl,dynamicvla,diffusion,dev]"
 ```bash
 panda-cable-grasp --headless --trials 1
 ```
+
+选择松灵 NERO：
+
+```bash
+panda-cable-grasp --headless --robot nero --trials 1
+```
+
+`panda-cable-benchmark`、`panda-cable-rl-train`、`panda-cable-rl-eval`、
+`panda-cable-dynamicvla`、`panda-cable-diffusion-eval` 和运动诊断命令同样支持
+`--robot nero`。已有 Panda checkpoint 不能直接视为 NERO checkpoint，NERO 训练或评估应
+使用对应机器人采集/训练的模型。
 
 运行测试：
 

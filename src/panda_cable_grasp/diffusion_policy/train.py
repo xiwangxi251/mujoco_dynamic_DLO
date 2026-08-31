@@ -54,7 +54,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--action-source", choices=("requested", "applied"), default="applied")
-    parser.add_argument("--gripper-threshold", type=float, default=127.5)
+    parser.add_argument(
+        "--gripper-threshold", type=float, default=None,
+        help="override the model-derived gripper threshold",
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--limit-episodes", type=int)
     parser.add_argument("--epochs", type=int)

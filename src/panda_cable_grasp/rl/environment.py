@@ -128,7 +128,7 @@ class RLConfig:
 
 
 class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
-    """Panda dynamic-cable grasping with a conventional task-space RL API.
+    """Dynamic-cable grasping with a conventional task-space RL API.
 
     The policy observes the whole DLO through 14 arc-length samples and receives
     no privileged target segment.  Five-dimensional TCP actions are converted
@@ -157,6 +157,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
     def __init__(
         self,
         *,
+        robot: str = "panda",
         seed: int = 20260804,
         disturbance_strength: float = 1.5,
         episode_seconds: float = 15.0,
@@ -211,6 +212,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 * self._final_disturbance_scale
             )
             env_config = EnvConfig(
+                robot=robot,
                 seed=seed,
                 episode_seconds=episode_seconds,
                 scenario_name=first_scenario.name,
@@ -223,6 +225,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             env_config
             if env_config is not None
             else EnvConfig(
+                robot=robot,
                 seed=seed,
                 disturbance_strength=disturbance_strength,
                 episode_seconds=episode_seconds,
@@ -476,10 +479,11 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
 
         arm_qpos = self.data.qpos[self.base_env.arm_qpos_adr]
         arm_qvel = self.data.qvel[self.base_env.arm_dof_adr]
-        finger_qpos = self.data.qpos[self.base_env.finger_qpos_adr]
         finger_ranges = self.model.jnt_range[self.base_env.finger_joint_ids]
-        maximum_aperture = max(float(np.sum(finger_ranges[:, 1])), 1e-6)
-        aperture = float(np.sum(finger_qpos))
+        maximum_aperture = max(
+            float(np.sum(np.max(np.abs(finger_ranges), axis=1))), 1e-6
+        )
+        aperture = self.base_env.finger_aperture
         observation = np.concatenate([
             dlo_state,
             (arm_qpos - self._arm_center) / self._arm_half_range,
@@ -502,15 +506,23 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
 
     @staticmethod
     def _planar_perpendicular_alignment(
-        hand_rotation: np.ndarray, tangent: np.ndarray,
+        hand_rotation: np.ndarray,
+        tangent: np.ndarray,
+        closing_axis_local: np.ndarray | None = None,
     ) -> float:
         """Return 1 when the finger closing axis is perpendicular to the DLO.
 
-        Panda fingers close along hand-local y.  Grasp alignment is therefore a
-        table-plane relationship between that axis and the local cable tangent;
-        using a 3-D dot product lets tool tilt contaminate the yaw objective.
+        The selected robot supplies its local jaw-closing axis.  Grasp alignment
+        is therefore a table-plane relationship between that axis and the local
+        cable tangent; using a 3-D dot product lets tool tilt contaminate the
+        yaw objective.
         """
-        closing_axis = np.asarray(hand_rotation, dtype=float)[:2, 1]
+        if closing_axis_local is None:
+            closing_axis_local = np.array([0.0, 1.0, 0.0])
+        closing_axis = (
+            np.asarray(hand_rotation, dtype=float)
+            @ np.asarray(closing_axis_local, dtype=float)
+        )[:2]
         cable_axis = np.asarray(tangent, dtype=float)[:2]
         closing_norm = float(np.linalg.norm(closing_axis))
         cable_norm = float(np.linalg.norm(cable_axis))
@@ -527,7 +539,11 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self, distance: float, tangent: np.ndarray,
     ) -> tuple[float, float]:
         hand_rotation = self.data.xmat[self.base_env.hand_id].reshape(3, 3)
-        score = self._planar_perpendicular_alignment(hand_rotation, tangent)
+        score = self._planar_perpendicular_alignment(
+            hand_rotation,
+            tangent,
+            self.base_env.gripper_closing_axis_local,
+        )
         distance_scale = self.rl_config.alignment_distance_scale
         proximity = float(np.exp(-np.square(distance / distance_scale)))
         return score, proximity * score
@@ -537,8 +553,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
     ) -> tuple[np.ndarray, float, bool]:
         """Measure whether the cable centerline is inside the usable pad region.
 
-        Hand-local ``y`` is the finger closing axis and local ``z`` runs from
-        the finger roots towards the tips.  Distance and yaw alignment alone
+        The robot-specific local jaw axes identify the closing direction and the
+        root-to-tip direction.  Distance and yaw alignment alone
         cannot distinguish a cable at the fingertips from one seated between
         the pads, so closure readiness also requires lateral centering and a
         minimum insertion depth past the fingertip edge.
@@ -547,13 +563,17 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         local_offset = (
             np.asarray(cable_point, dtype=float) - self._grasp_center_position()
         ) @ hand_rotation
-        insertion_depth = float(
-            self.rl_config.capture_pad_tip_offset - local_offset[2]
+        longitudinal = float(
+            local_offset @ self.base_env.gripper_longitudinal_axis_local
         )
+        lateral = float(
+            local_offset @ self.base_env.gripper_lateral_axis_local
+        )
+        insertion_depth = float(self.rl_config.capture_pad_tip_offset - longitudinal)
         inside = bool(
-            abs(float(local_offset[0]))
+            abs(lateral)
             <= self.rl_config.capture_longitudinal_tolerance
-            and abs(float(local_offset[1]))
+            and abs(float(local_offset @ self.base_env.gripper_closing_axis_local))
             <= self.rl_config.capture_lateral_tolerance
             and self.rl_config.capture_min_insertion_depth
             <= insertion_depth
@@ -631,12 +651,14 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._gripper_closed != previous_gripper_closed
         )
         self._gripper_switch_count += int(self._gripper_switch_event)
-        gripper_range = self.model.actuator_ctrlrange[7]
+        gripper_range = self.model.actuator_ctrlrange[
+            self.base_env.gripper_actuator_id
+        ]
         closed_ctrl = float(np.clip(
             self.rl_config.gripper_closed_ctrl,
             gripper_range[0], gripper_range[1],
         ))
-        mujoco_action[7] = (
+        mujoco_action[self.base_env.gripper_actuator_id] = (
             closed_ctrl if self._gripper_closed else float(gripper_range[1])
         )
         return mujoco_action
@@ -688,7 +710,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             - self._episode_initial_cable_z[body_index]
         )
 
-        aperture = float(np.sum(self.data.qpos[self.base_env.finger_qpos_adr]))
+        aperture = self.base_env.finger_aperture
         distance = float(np.linalg.norm(
             self.data.xpos[body_id] - self._grasp_center_position()
         ))

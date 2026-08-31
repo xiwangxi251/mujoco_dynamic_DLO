@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 import time
 
-from ..env.environment import CableGraspEnv, EnvConfig, XML_PATH
+from ..env.environment import CableGraspEnv, EnvConfig, ROBOT_SPECS
 from ..evaluation.benchmark import run_benchmark
 from ..evaluation.defaults import DEFAULT_EVALUATION_SEED, DEFAULT_VIDEO_FPS
 from ..paths import output_path
@@ -19,8 +19,10 @@ from ..scenarios.registry import (
 
 
 def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
+    robot = getattr(args, "robot", "panda")
     if args.scenario is None:
         return EnvConfig(
+            robot=robot,
             seed=args.seed,
             episode_seconds=args.episode_seconds,
             disturbance_strength=args.disturbance,
@@ -28,6 +30,7 @@ def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
         )
     scenario = get_scenario(args.scenario)
     return EnvConfig(
+        robot=robot,
         seed=args.seed,
         episode_seconds=args.episode_seconds,
         scenario_name=scenario.name,
@@ -69,6 +72,7 @@ def run_headless(args: argparse.Namespace) -> None:
         device="cpu",
         output=args.video_dir,
         run_name=args.run_name,
+        robot=getattr(args, "robot", "panda"),
     ))
 
 
@@ -92,7 +96,7 @@ def run_viewer(args: argparse.Namespace) -> None:
         elif keycode in (ord("-"), ord("[")):
             controls["speed"] = max(0.25, controls["speed"] / 2.0)
 
-    print(f"model={XML_PATH}", flush=True)
+    print(f"robot={env.robot} model={env.robot_spec.xml_path}", flush=True)
     print(
         "GUI controls: = or ] speed up, - or [ slow down, Space pause, "
         "Backspace/R reset, N new random trial",
@@ -170,13 +174,17 @@ def run_viewer(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reactive Panda grasping of a continuously deforming cable"
+        description="Reactive robot grasping of a continuously deforming cable"
     )
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--disturbance", type=float, default=1.5)
+    parser.add_argument(
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        help="robot model used by the MuJoCo environment",
+    )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--scenario", choices=list_scenario_names())
     selection.add_argument("--scenarios", nargs="+", choices=list_scenario_names())

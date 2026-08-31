@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import math
 
@@ -51,13 +52,18 @@ class ShadowCableRollout:
         timestep = float(self.env.model.opt.timestep)
         steps = int(math.ceil(duration / timestep))
         live_data = self.env.data
-        mujoco.mj_copyData(self.data, self.env.model, live_data)
+        # ``mj_copyData`` is exposed by some MuJoCo Python bindings but not
+        # others.  MjData supports deepcopy in the latter case.
+        if hasattr(mujoco, "mj_copyData"):
+            mujoco.mj_copyData(self.data, self.env.model, live_data)
+        else:
+            self.data = copy.deepcopy(live_data)
 
         # The oracle predicts exogenous cable motion. Holding the arm at its
         # current configuration prevents a stale live command from creating a
         # fictitious future robot/cable interaction inside the cloned state.
-        held_arm_qpos = self.data.qpos[:7].copy()
-        held_gripper_qpos = self.data.qpos[7:9].copy()
+        held_arm_qpos = self.data.qpos[self.env.arm_qpos_adr].copy()
+        held_gripper_qpos = self.data.qpos[self.env.finger_qpos_adr].copy()
         self.data.ctrl[:7] = held_arm_qpos
 
         positions = np.empty(
@@ -79,9 +85,10 @@ class ShadowCableRollout:
         try:
             self.env.data = self.data
             for step in range(1, steps + 1):
-                self.data.qpos[:7] = held_arm_qpos
-                self.data.qpos[7:9] = held_gripper_qpos
-                self.data.qvel[:9] = 0.0
+                self.data.qpos[self.env.arm_qpos_adr] = held_arm_qpos
+                self.data.qpos[self.env.finger_qpos_adr] = held_gripper_qpos
+                self.data.qvel[self.env.arm_dof_adr] = 0.0
+                self.data.qvel[self.env.finger_dof_adr] = 0.0
                 self.data.xfrc_applied[:] = 0.0
                 self.env._apply_cable_disturbance()
                 mujoco.mj_step(self.env.model, self.data)

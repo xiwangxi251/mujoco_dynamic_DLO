@@ -138,7 +138,8 @@ class DynamicCableGraspPolicy:
     该类只读取环境状态并输出执行器命令，绝不缩放外力或修改线缆物理。
     """
 
-    # actuator8 将255映射为每根手指张开40 mm，0为完全闭合。20对0的20-seed
+    # Panda actuator8 and NERO's gripper actuator both use the environment's
+    # native open/closed command values.  The environment resolves the scale.
     # 成对消融没有显示减小挤压的稳定收益，反而增加了确认抓取后的终局物理滑脱，
     # 因此脚本基线恢复为完全闭合；最终开口仍由真实碰撞和执行器力范围决定。
     HOLD_GRIPPER_CTRL = 0.0
@@ -215,13 +216,20 @@ class DynamicCableGraspPolicy:
             [1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0],
         ])
-        desired_rotation = (
-            self.VERTICAL_GRASP_ROTATION.copy()
-            if self.config.strict_vertical_gripper
-            else z_rotation @ rotation
-        )
+        if self.env.robot == "nero":
+            # NERO's jaw closing and tool approach axes differ from Panda's
+            # link frame, so use the calibrated robot-frame convention.
+            desired_rotation = self.env.vertical_grasp_rotation()
+        else:
+            desired_rotation = (
+                self.VERTICAL_GRASP_ROTATION.copy()
+                if self.config.strict_vertical_gripper
+                else z_rotation @ rotation
+            )
         self.desired_quat = rotation_to_quat(desired_rotation)
-        self.desired_approach_axis = desired_rotation[:, 2].copy()
+        self.desired_approach_axis = (
+            desired_rotation @ self.env.gripper_approach_axis_local
+        )
 
     @property
     def phase_time(self) -> float:
@@ -316,7 +324,7 @@ class DynamicCableGraspPolicy:
         """返回夹爪接近轴相对安全竖直方向的倾斜角，不把平面内偏航算作横倒。"""
 
         rotation = self.env.data.xmat[self.env.hand_id].reshape(3, 3)
-        actual_axis = rotation[:, 2]
+        actual_axis = rotation @ self.env.gripper_approach_axis_local
         cosine = float(np.clip(
             np.dot(actual_axis, self.desired_approach_axis), -1.0, 1.0
         ))
@@ -356,10 +364,10 @@ class DynamicCableGraspPolicy:
             self.retry_count += 1
             self.result = "running"
             self._begin_vertical_recovery(hand)
-            return self._ik_action(self.recover_start, 255.0)
+            return self._ik_action(self.recover_start, self.env.gripper_open_ctrl)
         self.result = "failed_no_contact"
         self._transition(Phase.RELEASE)
-        return self._ik_action(hand, 255.0)
+        return self._ik_action(hand, self.env.gripper_open_ctrl)
 
     def _observe_grasp_break(
         self,
@@ -529,7 +537,7 @@ class DynamicCableGraspPolicy:
         )
         action = np.empty(8)
         action[:7] = q_target
-        action[7] = gripper
+        action[self.env.gripper_actuator_id] = gripper
         self.last_desired = desired_position.copy()
         return action
 
@@ -582,7 +590,7 @@ class DynamicCableGraspPolicy:
             # 线缆自然运动期间保持夹持中心位置，同时先完成夹爪朝向对齐。
             if self.phase_time >= self.config.settle_seconds:
                 self._transition(Phase.APPROACH)
-            return self._ik_action(self.last_desired, 255.0)
+            return self._ik_action(self.last_desired, self.env.gripper_open_ctrl)
 
         if self.phase is Phase.APPROACH:
             # 让实际两指夹持中心移动到预测线段上方20 cm，夹爪保持张开。
@@ -606,7 +614,7 @@ class DynamicCableGraspPolicy:
                 self._transition(Phase.INTERCEPT)
             elif self.phase_time > self.config.approach_timeout:
                 return self._retry_from_unsafe_pose(hand)
-            return self._ik_action(desired, 255.0)
+            return self._ik_action(desired, self.env.gripper_open_ctrl)
 
         if self.phase is Phase.INTERCEPT:
             # 实际两指夹持中心直接追踪目标线缆段中心，不再使用旧虚拟点的z补偿。
@@ -636,7 +644,7 @@ class DynamicCableGraspPolicy:
                 return self._ik_action(desired, self.HOLD_GRIPPER_CTRL)
             elif self.phase_time > self.config.intercept_timeout:
                 return self._retry_from_unsafe_pose(hand)
-            return self._ik_action(desired, 255.0)
+            return self._ik_action(desired, self.env.gripper_open_ctrl)
 
         if self.phase is Phase.CLOSE:
             # 闭爪时继续追踪已经进入夹持中心的局部线段；真实接触存在时延长确认窗口，
@@ -685,7 +693,7 @@ class DynamicCableGraspPolicy:
             if self.phase_time > 1.0:
                 self.filtered_target = self.env.target_position()
                 self._transition(Phase.APPROACH)
-            return self._ik_action(desired, 255.0)
+            return self._ik_action(desired, self.env.gripper_open_ctrl)
 
         if self.phase is Phase.LIFT:
             # 把夹持点抬高22 cm；若环境报告抓取断开则保持闭爪记录失败现场。
@@ -759,7 +767,9 @@ class DynamicCableGraspPolicy:
                 if self._retry_after_failure_observe:
                     self._retry_after_failure_observe = False
                     self._begin_vertical_recovery(hand)
-                    return self._ik_action(self.recover_start, 255.0)
+                    return self._ik_action(
+                        self.recover_start, self.env.gripper_open_ctrl
+                    )
                 self._transition(Phase.DONE)
                 self.finished = True
             return self._ik_action(self.failure_hold_position, self.HOLD_GRIPPER_CTRL)
@@ -770,7 +780,7 @@ class DynamicCableGraspPolicy:
             if self.phase_time >= self.config.release_seconds:
                 self._transition(Phase.DONE)
                 self.finished = True
-            return self._ik_action(desired, 255.0)
+            return self._ik_action(desired, self.env.gripper_open_ctrl)
 
         self.finished = True
         return self._home_action()

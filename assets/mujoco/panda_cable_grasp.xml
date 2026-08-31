@@ -1,6 +1,7 @@
 <mujoco model="Panda dynamic cable grasp">
   <compiler meshdir="assets" angle="radian" autolimits="true"/>
-  <include file="panda.xml"/>
+  <!-- The environment injects either Panda or AgileX NERO at compile time. -->
+  <include file="robot.xml"/>
 
   <extension>
     <plugin plugin="mujoco.elasticity.cable"/>

@@ -23,6 +23,7 @@ from stable_baselines3.common.vec_env import (
 )
 
 from ..scenarios.registry import list_scenario_names
+from ..env.environment import ROBOT_SPECS
 from ..paths import output_path
 from .environment import RLCableGraspEnv, RLConfig
 from .metrics import TrainingMetricsCallback, plot_training_curves
@@ -139,6 +140,7 @@ def make_worker(rank: int, args: argparse.Namespace):
     """返回可由Windows spawn进程安全构造的独立环境工厂。"""
     def initialize():
         env = RLCableGraspEnv(
+            robot=getattr(args, "robot", "panda"),
             seed=args.seed + rank,
             disturbance_strength=args.disturbance,
             episode_seconds=args.episode_seconds,
@@ -162,6 +164,7 @@ def make_eval_worker(rank: int, args: argparse.Namespace):
     """Build one deterministic strict-evaluation environment."""
     def initialize():
         return RLCableGraspEnv(
+            robot=getattr(args, "robot", "panda"),
             seed=args.eval_seed + rank,
             disturbance_strength=args.disturbance,
             episode_seconds=args.episode_seconds,
@@ -655,6 +658,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disturbance", type=float, default=1.5)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument(
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        help="robot model used by the MuJoCo environment",
+    )
+    parser.add_argument(
         "--training-distribution", choices=("legacy", "l1", "id"), default="l1",
         help=(
             "l1 uses the four nominal L1 curriculum scenes; id samples the "
@@ -871,6 +878,7 @@ def main() -> None:
 
     # 启动大批量训练前先检查一次Gymnasium API、shape和数据类型。
     check_candidate = RLCableGraspEnv(
+        robot=getattr(args, "robot", "panda"),
         seed=args.seed,
         disturbance_strength=args.disturbance,
         episode_seconds=args.episode_seconds,

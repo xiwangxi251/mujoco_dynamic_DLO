@@ -144,9 +144,13 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
             [0.0, 0.0, 1.0],
         ])
         self._base_grasp_rotation = (
-            self.VERTICAL_GRASP_ROTATION.copy()
-            if self.config.strict_vertical_gripper
-            else z_rotation @ current_rotation
+            self.env.vertical_grasp_rotation()
+            if self.env.robot == "nero"
+            else (
+                self.VERTICAL_GRASP_ROTATION.copy()
+                if self.config.strict_vertical_gripper
+                else z_rotation @ current_rotation
+            )
         )
         if (
             self.expert_config.dynamic_portfolio_enabled
@@ -340,7 +344,9 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         ])
         desired_rotation = yaw @ self._base_grasp_rotation
         self.desired_quat = rotation_to_quat(desired_rotation)
-        self.desired_approach_axis = desired_rotation[:, 2].copy()
+        self.desired_approach_axis = (
+            desired_rotation @ self.env.gripper_approach_axis_local
+        )
 
     def _replan_intercept(self) -> None:
         if self.env.config.motion_mode in {"shape", "combined"}:

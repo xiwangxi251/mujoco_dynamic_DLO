@@ -1,4 +1,4 @@
-"""DynamicVLA task-space action adapter for the MuJoCo Panda environment.
+"""DynamicVLA task-space action adapter for the cable-grasp environment.
 
 DynamicVLA's DOM checkpoint consumes two RGB streams plus a 6-D absolute
 end-effector state and emits ``xyz + quaternion(wxyz) + gripper``.  The local
@@ -34,8 +34,10 @@ class DynamicVLAAdapterConfig:
     ik_target_horizon: float = 0.11
     nullspace_gain: float = 0.8
     gripper_threshold: float = 0.0
-    gripper_open_ctrl: float = 255.0
-    gripper_close_ctrl: float = 0.0
+    # ``None`` means use the selected robot's native actuator range.  Explicit
+    # values remain available for reproducing older Panda experiments.
+    gripper_open_ctrl: float | None = None
+    gripper_close_ctrl: float | None = None
 
 
 class DynamicVLATaskSpaceAdapter:
@@ -54,6 +56,16 @@ class DynamicVLATaskSpaceAdapter:
     ) -> None:
         self.env = env
         self.config = config or DynamicVLAAdapterConfig()
+        self._gripper_open_ctrl = (
+            env.gripper_open_ctrl
+            if self.config.gripper_open_ctrl is None
+            else float(self.config.gripper_open_ctrl)
+        )
+        self._gripper_close_ctrl = (
+            env.gripper_closed_ctrl
+            if self.config.gripper_close_ctrl is None
+            else float(self.config.gripper_close_ctrl)
+        )
         self.has_model_action = False
         self.last_raw_action = np.full(8, np.nan, dtype=float)
         self.last_pose_command = np.zeros(7, dtype=float)
@@ -119,9 +131,9 @@ class DynamicVLATaskSpaceAdapter:
         self.last_pose_command[:3] = position
         self.last_pose_command[3:] = quaternion
         self._gripper_ctrl = (
-            self.config.gripper_open_ctrl
+            self._gripper_open_ctrl
             if value[-1] > self.config.gripper_threshold
-            else self.config.gripper_close_ctrl
+            else self._gripper_close_ctrl
         )
         self.has_model_action = True
 
@@ -216,7 +228,7 @@ class DynamicVLATaskSpaceAdapter:
         )
 
         self.last_joint_action[:7] = q_target
-        self.last_joint_action[7] = self._gripper_ctrl
+        self.last_joint_action[self.env.gripper_actuator_id] = self._gripper_ctrl
         return self.last_joint_action.copy()
 
     def diagnostics(self) -> dict:

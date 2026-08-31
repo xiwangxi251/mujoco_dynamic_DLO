@@ -213,7 +213,7 @@ def _read_selected_rgb(path: Path, indices: np.ndarray) -> list[np.ndarray]:
 
 
 class JointTargetForwardKinematics:
-    """Compute the cable environment's grasp-center pose from Panda targets."""
+    """Compute grasp-center poses from saved Panda or NERO joint targets."""
 
     def __init__(self, model_path: Path) -> None:
         try:
@@ -249,7 +249,7 @@ class JointTargetForwardKinematics:
                 )
             joint_ids.append(joint_id)
         self.arm_qpos_addresses = self.model.jnt_qposadr[np.asarray(joint_ids)]
-        self.hand_id = next(
+        panda_hand_id = next(
             (
                 body_id
                 for name in ("hand", "panda_hand")
@@ -262,8 +262,39 @@ class JointTargetForwardKinematics:
             ),
             -1,
         )
-        if self.hand_id < 0:
-            raise ValueError(f"panda_hand not found in {model_path}")
+        if panda_hand_id >= 0:
+            self.robot = "panda"
+            self.hand_id = panda_hand_id
+            self.grasp_center_local = GRASP_CENTER_LOCAL.copy()
+        else:
+            self.robot = "nero"
+            self.hand_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, "link7"
+            )
+            if self.hand_id < 0:
+                raise ValueError(
+                    f"neither Panda hand nor NERO link7 was found in {model_path}"
+                )
+            self.grasp_center_local = np.array(
+                [0.1733, 0.0, -0.0235], dtype=np.float64
+            )
+        self.gripper_actuator_id = next(
+            (
+                actuator_id
+                for name in ("actuator8", "gripper")
+                if (
+                    actuator_id := mujoco.mj_name2id(
+                        self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name
+                    )
+                )
+                >= 0
+            ),
+            7,
+        )
+
+    @property
+    def gripper_ctrl_range(self) -> np.ndarray:
+        return self.model.actuator_ctrlrange[self.gripper_actuator_id].copy()
 
     def poses(self, joint_targets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         joint_targets = np.asarray(joint_targets, dtype=np.float64)
@@ -279,7 +310,8 @@ class JointTargetForwardKinematics:
             mujoco.mj_forward(self.model, self.data)
             rotation = self.data.xmat[self.hand_id].reshape(3, 3)
             positions[index] = (
-                self.data.xpos[self.hand_id] + rotation @ GRASP_CENTER_LOCAL
+                self.data.xpos[self.hand_id]
+                + rotation @ self.grasp_center_local
             )
             mujoco.mju_mat2Quat(quat, rotation.reshape(-1))
             if index > 0 and np.dot(quat, quaternions[index - 1]) < 0.0:
@@ -292,7 +324,7 @@ def _episode_arrays(
     source: EpisodeSource,
     target_fps: int,
     joint_target_source: str,
-    gripper_threshold: float,
+    gripper_threshold: float | None,
 ) -> tuple[dict[str, np.ndarray], list[np.ndarray], list[np.ndarray], dict]:
     with np.load(source.trajectory, allow_pickle=False) as data:
         times = np.asarray(data["times"], dtype=np.float64)
@@ -312,8 +344,13 @@ def _episode_arrays(
     fk = JointTargetForwardKinematics(model_path)
     action_position, action_quaternion = fk.poses(command[selected, :7])
     action_rotation = _wxyz_to_euler_xyz(action_quaternion)
+    threshold = (
+        float(gripper_threshold)
+        if gripper_threshold is not None
+        else float(np.mean(fk.gripper_ctrl_range))
+    )
     gripper = np.where(
-        command[selected, 7] > gripper_threshold, 1.0, -1.0
+        command[selected, fk.gripper_actuator_id] > threshold, 1.0, -1.0
     ).astype(np.float32)[:, None]
     arrays = {
         "observation.state": np.concatenate(
@@ -334,6 +371,8 @@ def _episode_arrays(
         "source_frames": int(len(times)),
         "converted_frames": int(len(selected)),
         "source_fps": float(1.0 / np.median(np.diff(times))) if len(times) > 1 else None,
+        "robot": fk.robot,
+        "gripper_threshold": threshold,
     }
     return arrays, opst, wrist, metadata
 
@@ -377,7 +416,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--joint-target-source", choices=("requested", "applied"), default="requested"
     )
-    parser.add_argument("--gripper-threshold", type=float, default=127.5)
+    parser.add_argument(
+        "--gripper-threshold", type=float, default=None,
+        help="override the model-derived gripper threshold",
+    )
     parser.add_argument(
         "--duplicate-policy", choices=("error", "skip", "keep"), default="error"
     )
@@ -419,11 +461,12 @@ def main() -> None:
     height, width = first_opst[0].shape[:2]
     if first_wrist[0].shape[:2] != (height, width):
         raise ValueError("opposite and wrist camera dimensions differ")
+    robot_type = "agilex_nero" if first_metadata["robot"] == "nero" else "franka"
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
         fps=args.target_fps,
         root=output,
-        robot_type="franka",
+        robot_type=robot_type,
         features=_features(height, width),
         use_videos=True,
         image_writer_threads=4,

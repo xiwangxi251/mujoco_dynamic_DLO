@@ -22,7 +22,109 @@ import numpy as np
 ROOT = PROJECT_ROOT
 XML_PATH = ROOT / "assets" / "mujoco" / "panda_cable_grasp.xml"
 PANDA_XML_PATH = ROOT / "assets" / "mujoco" / "panda.xml"
+NERO_XML_PATH = ROOT / "assets" / "mujoco" / "nero" / "nero.xml"
 MENAGERIE_ENV_VAR = "MUJOCO_MENAGERIE_PATH"
+
+
+@dataclass(frozen=True)
+class RobotSpec:
+    """Names and geometric conventions shared by the control stack."""
+
+    name: str
+    xml_path: Path
+    asset_dir: Path | None
+    base_body_name: str
+    base_offset: tuple[float, float, float]
+    arm_joint_names: tuple[str, ...]
+    hand_body_name: str
+    left_finger_body_name: str
+    right_finger_body_name: str
+    finger_joint_names: tuple[str, str]
+    gripper_actuator_name: str
+    grasp_center_local: tuple[float, float, float]
+    ready_arm_qpos: tuple[float, ...]
+    ready_finger_qpos: tuple[float, float] | None
+    gripper_open_ctrl: float
+    gripper_closed_ctrl_threshold: float
+    gripper_ctrl_to_aperture: float | None
+    closing_axis_local: tuple[float, float, float]
+    approach_axis_local: tuple[float, float, float]
+    longitudinal_axis_local: tuple[float, float, float]
+    lateral_axis_local: tuple[float, float, float]
+    pad_geom_kind: str
+
+
+ROBOT_SPECS = {
+    "panda": RobotSpec(
+        name="panda",
+        xml_path=PANDA_XML_PATH,
+        asset_dir=None,
+        base_body_name="link0",
+        base_offset=(0.0, 0.0, 0.0),
+        arm_joint_names=tuple(f"joint{i}" for i in range(1, 8)),
+        hand_body_name="hand",
+        left_finger_body_name="left_finger",
+        right_finger_body_name="right_finger",
+        finger_joint_names=("finger_joint1", "finger_joint2"),
+        gripper_actuator_name="actuator8",
+        grasp_center_local=(0.0, 0.0, 0.1029),
+        ready_arm_qpos=(0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, -0.7853),
+        ready_finger_qpos=None,
+        gripper_open_ctrl=255.0,
+        gripper_closed_ctrl_threshold=100.0,
+        gripper_ctrl_to_aperture=None,
+        closing_axis_local=(0.0, 1.0, 0.0),
+        approach_axis_local=(0.0, 0.0, 1.0),
+        longitudinal_axis_local=(0.0, 0.0, 1.0),
+        lateral_axis_local=(1.0, 0.0, 0.0),
+        pad_geom_kind="box",
+    ),
+    "nero": RobotSpec(
+        name="nero",
+        xml_path=NERO_XML_PATH,
+        asset_dir=NERO_XML_PATH.parent / "assets",
+        base_body_name="base_link",
+        # NERO's downward-facing workspace is closer to the table center than
+        # Panda's.  Keep the task geometry unchanged and place the robot base
+        # 20 cm toward the table instead.
+        base_offset=(0.20, 0.0, 0.0),
+        arm_joint_names=tuple(f"joint{i}" for i in range(1, 8)),
+        hand_body_name="link7",
+        left_finger_body_name="gripper_link1",
+        right_finger_body_name="gripper_link2",
+        finger_joint_names=("gripper_joint1", "gripper_joint2"),
+        gripper_actuator_name="gripper",
+        # Midpoint of the two NERO finger roots, expressed in link7.  The
+        # official mesh extends symmetrically from this point in the two jaw
+        # directions, so it is the correct point for TCP IK and contact tests.
+        grasp_center_local=(0.1733, 0.0, -0.0235),
+        # Calibrated to a reachable, non-singular pose: TCP at approximately
+        # (0.55, 0, 0.25) in the task frame with the approach axis downward.
+        ready_arm_qpos=(
+            0.546612, -0.327276, 2.381604, 1.360838,
+            0.217447, -0.193041, 1.539675,
+        ),
+        ready_finger_qpos=(0.05, -0.05),
+        gripper_open_ctrl=0.05,
+        gripper_closed_ctrl_threshold=0.005,
+        # NERO's actuator command is the positive slide distance of one jaw;
+        # the equality constraint moves the other jaw by the same amount.
+        gripper_ctrl_to_aperture=2.0,
+        closing_axis_local=(0.0, 0.0, 1.0),
+        approach_axis_local=(1.0, 0.0, 0.0),
+        longitudinal_axis_local=(1.0, 0.0, 0.0),
+        lateral_axis_local=(0.0, 1.0, 0.0),
+        pad_geom_kind="collision",
+    ),
+}
+
+
+def robot_spec(name: str) -> RobotSpec:
+    try:
+        return ROBOT_SPECS[str(name).lower()]
+    except KeyError as error:
+        supported = ", ".join(sorted(ROBOT_SPECS))
+        raise ValueError(f"unsupported robot {name!r}; choose one of {supported}") from error
 
 # -------------------------------------------------------------------------
 # 找 MuJoCo Menagerie 里的 Franka Panda 官方资源目录
@@ -62,6 +164,16 @@ def resolve_menagerie_panda_dir() -> Path:
 @lru_cache(maxsize=4)
 def _panda_assets(panda_dir_text: str) -> dict[str, bytes]:
     assets_dir = Path(panda_dir_text) / "assets"
+    return {
+        path.relative_to(assets_dir).as_posix(): path.read_bytes()
+        for path in assets_dir.rglob("*")
+        if path.is_file()
+    }
+
+
+@lru_cache(maxsize=4)
+def _robot_assets(asset_dir_text: str) -> dict[str, bytes]:
+    assets_dir = Path(asset_dir_text)
     return {
         path.relative_to(assets_dir).as_posix(): path.read_bytes()
         for path in assets_dir.rglob("*")
@@ -115,6 +227,7 @@ RIGID_MOTION_L2_ARC_LENGTH = float(np.linalg.norm(
 @dataclass
 class EnvConfig:
     # 基础参数
+    robot: str = "panda"
     seed: int = 20260804
     episode_seconds: float = 15.0       
     disturbance_strength: float = 1.5   
@@ -211,6 +324,10 @@ class EnvConfig:
 
     # 合法性检查
     def __post_init__(self) -> None:
+        self.robot = str(self.robot).lower()
+        robot_spec(self.robot)
+        if self.robot == "nero" and self.robot_motion_limit_profile == "dynamicvla_panda_v4":
+            self.robot_motion_limit_profile = "nero_v1"
         if self.target_selection not in {"random", "middle"}:
             raise ValueError(
                 "target_selection must be either 'random' or 'middle'"
@@ -391,8 +508,22 @@ class CableGraspEnv:
 
     def __init__(self, config: EnvConfig | None = None):
         self.config = config or EnvConfig()
+        self.robot_spec = robot_spec(self.config.robot)
+        self.robot = self.robot_spec.name
+        self.GRASP_CENTER_LOCAL = np.asarray(
+            self.robot_spec.grasp_center_local, dtype=float
+        )
+        self.READY_ARM_QPOS = np.asarray(
+            self.robot_spec.ready_arm_qpos, dtype=float
+        )
         self.rng = np.random.default_rng(self.config.seed)
         self.model = self._load_model(self.config)
+        # This is an environment-level guard shared by all robot backends.  Do
+        # not replace the actuator parameters compiled from a robot's XML with
+        # unverified robot-specific gains here.
+        self._arm_position_tracking_error_limit = float(
+            self.config.arm_position_tracking_error_limit
+        )
         if self.config.dynamicvla_cameras_enabled:
             self.model.vis.global_.offwidth = max(
                 int(self.model.vis.global_.offwidth),
@@ -404,21 +535,46 @@ class CableGraspEnv:
             )
 
         # 控制夹爪力度
+        self.gripper_actuator_id = id_of(
+            self.model,
+            mujoco.mjtObj.mjOBJ_ACTUATOR,
+            self.robot_spec.gripper_actuator_name,
+        )
+        if self.model.nu != 8:
+            raise RuntimeError(
+                f"{self.robot} model must expose 8 actuators (7 arm + gripper), "
+                f"found {self.model.nu}"
+            )
         grip_scale = self.config.gripper_force_scale
-        self.model.actuator_gainprm[7, 0] *= grip_scale
-        self.model.actuator_biasprm[7, 1] *= grip_scale
-        self.model.actuator_biasprm[7, 2] *= math.sqrt(grip_scale)
+        self.model.actuator_gainprm[self.gripper_actuator_id, 0] *= grip_scale
+        self.model.actuator_biasprm[self.gripper_actuator_id, 1] *= grip_scale
+        self.model.actuator_biasprm[self.gripper_actuator_id, 2] *= math.sqrt(grip_scale)
         self.data = mujoco.MjData(self.model)
 
         # 批量查找各类对象 ID、地址
         self.home_id = id_of(self.model, mujoco.mjtObj.mjOBJ_KEY, "home")
         self.arm_joint_ids = np.array([
-            id_of(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"joint{i}")
-            for i in range(1, 8)
+            id_of(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            for name in self.robot_spec.arm_joint_names
         ], dtype=int)
         self.arm_qpos_adr = self.model.jnt_qposadr[self.arm_joint_ids].copy()
         self.arm_dof_adr = self.model.jnt_dofadr[self.arm_joint_ids].copy()
-        self.hand_id = id_of(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand")
+        self.hand_id = id_of(
+            self.model, mujoco.mjtObj.mjOBJ_BODY,
+            self.robot_spec.hand_body_name,
+        )
+        self.gripper_closing_axis_local = np.asarray(
+            self.robot_spec.closing_axis_local, dtype=float
+        )
+        self.gripper_approach_axis_local = np.asarray(
+            self.robot_spec.approach_axis_local, dtype=float
+        )
+        self.gripper_longitudinal_axis_local = np.asarray(
+            self.robot_spec.longitudinal_axis_local, dtype=float
+        )
+        self.gripper_lateral_axis_local = np.asarray(
+            self.robot_spec.lateral_axis_local, dtype=float
+        )
         self.dynamicvla_opst_camera_id: int | None = None
         self.dynamicvla_wrist_camera_id: int | None = None
         if self.config.dynamicvla_cameras_enabled:
@@ -436,10 +592,12 @@ class CableGraspEnv:
         self.table_xy_min = table_center - table_half_size
         self.table_xy_max = table_center + table_half_size
         self.left_finger_id = id_of(
-            self.model, mujoco.mjtObj.mjOBJ_BODY, "left_finger"
+            self.model, mujoco.mjtObj.mjOBJ_BODY,
+            self.robot_spec.left_finger_body_name,
         )
         self.right_finger_id = id_of(
-            self.model, mujoco.mjtObj.mjOBJ_BODY, "right_finger"
+            self.model, mujoco.mjtObj.mjOBJ_BODY,
+            self.robot_spec.right_finger_body_name,
         )
         self.finger_ids = {self.left_finger_id, self.right_finger_id}
         self.finger_collision_geom_ids = {
@@ -452,19 +610,27 @@ class CableGraspEnv:
         }
 
         # 提升指垫的摩擦
-        self.pad_geom_ids = {
-            geom_id
-            for geom_id in range(self.model.ngeom)
-            if (
-                int(self.model.geom_bodyid[geom_id]) in self.finger_ids
-                and self.model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_BOX
-                and self.model.geom_contype[geom_id] != 0
-            )
-        }
-        if len(self.pad_geom_ids) != 10:
-            raise RuntimeError(
-                f"Expected 10 Panda pad collision boxes, found {len(self.pad_geom_ids)}"
-            )
+        if self.robot_spec.pad_geom_kind == "box":
+            self.pad_geom_ids = {
+                geom_id
+                for geom_id in range(self.model.ngeom)
+                if (
+                    int(self.model.geom_bodyid[geom_id]) in self.finger_ids
+                    and self.model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_BOX
+                    and self.model.geom_contype[geom_id] != 0
+                )
+            }
+            if len(self.pad_geom_ids) != 10:
+                raise RuntimeError(
+                    f"Expected 10 Panda pad collision boxes, found {len(self.pad_geom_ids)}"
+                )
+        else:
+            # NERO's official model exposes the finger mesh collision surfaces
+            # rather than Panda-style fingertip boxes.  Those meshes are the
+            # only collidable geoms below the two gripper bodies.
+            self.pad_geom_ids = set(self.finger_collision_geom_ids)
+            if not self.pad_geom_ids:
+                raise RuntimeError("NERO gripper has no collidable finger geoms")
         for geom_id in self.pad_geom_ids:
             self.model.geom_priority[geom_id] = 1
             self.model.geom_condim[geom_id] = 6
@@ -474,10 +640,11 @@ class CableGraspEnv:
 
         # 获取指关节，线缆 ID、地址
         self.finger_joint_ids = np.array([
-            id_of(self.model, mujoco.mjtObj.mjOBJ_JOINT, "finger_joint1"),
-            id_of(self.model, mujoco.mjtObj.mjOBJ_JOINT, "finger_joint2"),
+            id_of(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            for name in self.robot_spec.finger_joint_names
         ], dtype=int)
         self.finger_qpos_adr = self.model.jnt_qposadr[self.finger_joint_ids].copy()
+        self.finger_dof_adr = self.model.jnt_dofadr[self.finger_joint_ids].copy()
         self.cable_ids = self._cable_bodies()
         self.cable_set = set(self.cable_ids)
         self.cable_index = {body_id: index for index, body_id in enumerate(self.cable_ids)}
@@ -521,10 +688,12 @@ class CableGraspEnv:
 
         # 设置机器臂状态
         self.ready_qpos = self.model.key_qpos[self.home_id, :9].copy()
-        self.ready_qpos[:7] = self.READY_ARM_QPOS
+        self.ready_qpos[self.arm_qpos_adr] = self.READY_ARM_QPOS
+        if self.robot_spec.ready_finger_qpos is not None:
+            self.ready_qpos[self.finger_qpos_adr] = self.robot_spec.ready_finger_qpos
         self.ready_ctrl = self.model.key_ctrl[self.home_id, :8].copy()
         self.ready_ctrl[:7] = self.READY_ARM_QPOS
-        self.ready_ctrl[7] = 255.0
+        self.ready_ctrl[self.gripper_actuator_id] = self.gripper_open_ctrl
 
         self._arm_velocity_limits = np.asarray(
             self.config.arm_joint_velocity_limits, dtype=float
@@ -534,11 +703,19 @@ class CableGraspEnv:
         )
         self._hand_jacp = np.zeros((3, self.model.nv))
         self._hand_jacr = np.zeros((3, self.model.nv))
-        gripper_bias = -float(self.model.actuator_biasprm[7, 1])
-        self._gripper_ctrl_to_finger_position = (
-            float(self.model.actuator_gainprm[7, 0]) / gripper_bias
-            if gripper_bias > 0.0 else 0.0
-        )
+        if self.robot_spec.gripper_ctrl_to_aperture is not None:
+            self._gripper_ctrl_to_finger_position = (
+                self.robot_spec.gripper_ctrl_to_aperture
+            )
+        else:
+            gripper_bias = -float(
+                self.model.actuator_biasprm[self.gripper_actuator_id, 1]
+            )
+            self._gripper_ctrl_to_finger_position = (
+                float(self.model.actuator_gainprm[self.gripper_actuator_id, 0])
+                / gripper_bias
+                if gripper_bias > 0.0 else 0.0
+            )
         if self._gripper_ctrl_to_finger_position <= 0.0:
             raise RuntimeError("Unable to derive gripper control-to-position scale")
 
@@ -778,7 +955,10 @@ class CableGraspEnv:
         last_qualification = False
         truncated = False
         self.last_termination_reason = None
-        gripper_closed = bool(applied_action[7] < 100.0)
+        gripper_closed = bool(
+            applied_action[self.gripper_actuator_id]
+            < self.robot_spec.gripper_closed_ctrl_threshold
+        )
 
         for _ in range(max(1, self.config.frame_skip)):
             # 扰动线缆
@@ -923,20 +1103,23 @@ class CableGraspEnv:
             * control_dt
             / self._gripper_ctrl_to_finger_position
         )
-        previous_gripper_command = float(self._last_applied_action[7])
+        previous_gripper_command = float(
+            self._last_applied_action[self.gripper_actuator_id]
+        )
         gripper_command = float(np.clip(
-            requested_action[7],
+            requested_action[self.gripper_actuator_id],
             previous_gripper_command - max_gripper_delta,
             previous_gripper_command + max_gripper_delta,
         ))
         gripper_velocity_limited = not math.isclose(
-            gripper_command, float(requested_action[7]),
+            gripper_command,
+            float(requested_action[self.gripper_actuator_id]),
             rel_tol=0.0, abs_tol=1e-12,
         )
 
         applied_action = requested_action.copy()
         applied_action[:7] = position_target
-        applied_action[7] = gripper_command
+        applied_action[self.gripper_actuator_id] = gripper_command
 
         commanded_linear_velocity = (
             jacp[:, self.arm_dof_adr] @ applied_velocity
@@ -988,8 +1171,8 @@ class CableGraspEnv:
         current_qvel = self.data.qvel[self.arm_dof_adr]
         guarded_action[:7] = np.clip(
             guarded_action[:7],
-            current_qpos - self.config.arm_position_tracking_error_limit,
-            current_qpos + self.config.arm_position_tracking_error_limit,
+            current_qpos - self._arm_position_tracking_error_limit,
+            current_qpos + self._arm_position_tracking_error_limit,
         )
         guard_limits = (
             self.config.low_level_velocity_guard_fraction
@@ -1148,6 +1331,7 @@ class CableGraspEnv:
         return {
             "trial": self.trial_index,
             "episode_seed": self.episode_seed,
+            "robot": self.robot,
             "scenario_name": self.config.scenario_name,
             "scenario_id": self.config.scenario_id,
             "scenario_split": self.config.scenario_split,
@@ -1219,7 +1403,7 @@ class CableGraspEnv:
                 self.config.gripper_finger_velocity_limit
             ),
             "arm_position_tracking_error_limit": (
-                self.config.arm_position_tracking_error_limit
+                self._arm_position_tracking_error_limit
             ),
             "low_level_velocity_guard_fraction": (
                 self.config.low_level_velocity_guard_fraction
@@ -1292,7 +1476,7 @@ class CableGraspEnv:
             "bilateral_grasp": self.grasp_confirmed,
             "ever_bilateral_candidate": self.ever_bilateral_candidate,
             "ever_confirmed_grasp": self.ever_confirmed_grasp,
-            "finger_aperture": float(np.sum(self.data.qpos[self.finger_qpos_adr])),
+            "finger_aperture": self.finger_aperture,
             "finger_contact_count": self._last_contact_count,
             "left_finger_normal_force": normal_forces[self.left_finger_id],
             "right_finger_normal_force": normal_forces[self.right_finger_id],
@@ -1440,7 +1624,7 @@ class CableGraspEnv:
         self,
     ) -> int | None:
         """查找当前被两侧内指垫真实夹紧的局部线段。"""
-        aperture = float(np.sum(self.data.qpos[self.finger_qpos_adr]))
+        aperture = self.finger_aperture
         if aperture > self.config.max_grasp_aperture:
             return None
         samples = self._pad_contact_samples()
@@ -1545,8 +1729,8 @@ class CableGraspEnv:
             ),
             "no_contact_time": float(state.lost_contact_time),
             "grasp_error": float(grasp_error),
-            "finger_aperture": float(np.sum(self.data.qpos[self.finger_qpos_adr])),
-            "gripper_ctrl": float(self.data.ctrl[7]),
+            "finger_aperture": self.finger_aperture,
+            "gripper_ctrl": float(self.data.ctrl[self.gripper_actuator_id]),
             "ever_success": bool(self.ever_success),
             "success_hold": float(self.success_hold),
         }
@@ -2166,6 +2350,50 @@ class CableGraspEnv:
         return self.data.xpos[self.hand_id] + rotation @ self.GRASP_CENTER_LOCAL
 
     @property
+    def finger_aperture(self) -> float:
+        """Return the physical jaw opening in metres.
+
+        Panda exposes two positive finger positions.  NERO exposes one positive
+        and one negative slide position linked by an equality constraint, so
+        summing absolute values gives the same physical opening convention.
+        """
+
+        positions = self.data.qpos[self.finger_qpos_adr]
+        if self.robot == "nero":
+            return float(np.sum(np.abs(positions)))
+        return float(np.sum(positions))
+
+    @property
+    def gripper_open_ctrl(self) -> float:
+        """Command value corresponding to the selected robot's open jaws."""
+
+        ctrl_range = self.model.actuator_ctrlrange[self.gripper_actuator_id]
+        return float(np.clip(
+            self.robot_spec.gripper_open_ctrl, ctrl_range[0], ctrl_range[1]
+        ))
+
+    @property
+    def gripper_closed_ctrl(self) -> float:
+        """Command value corresponding to the selected robot's closed jaws."""
+
+        return float(self.model.actuator_ctrlrange[self.gripper_actuator_id, 0])
+
+    def vertical_grasp_rotation(self) -> np.ndarray:
+        """Return a rotation with the robot's jaw axes in the task convention."""
+
+        closing = self.gripper_closing_axis_local
+        approach = self.gripper_approach_axis_local
+        longitudinal = np.cross(closing, approach)
+        target_closing = np.array([0.0, 1.0, 0.0])
+        target_approach = np.array([0.0, 0.0, -1.0])
+        target_longitudinal = np.cross(target_closing, target_approach)
+        local_basis = np.column_stack((longitudinal, closing, approach))
+        target_basis = np.column_stack((
+            target_longitudinal, target_closing, target_approach,
+        ))
+        return target_basis @ local_basis.T
+
+    @property
     def pad_center_position(self) -> np.ndarray:
         """返回两块主内指垫之间的几何中心，与IK控制点完全相同。"""
         return self.hand_position
@@ -2279,20 +2507,34 @@ class CableGraspEnv:
             )
         mujoco.mj_loadAllPluginLibraries(str(plugin_dir))
 
-        panda_dir = resolve_menagerie_panda_dir()
-        if not PANDA_XML_PATH.is_file():
+        selected_robot = robot_spec(config.robot)
+        if not selected_robot.xml_path.is_file():
             raise FileNotFoundError(
-                f"Repository-owned Panda model definition is missing: {PANDA_XML_PATH}"
+                f"Repository-owned {selected_robot.name} model definition is missing: "
+                f"{selected_robot.xml_path}"
             )
+        if selected_robot.name == "panda":
+            panda_dir = resolve_menagerie_panda_dir()
+            robot_assets = _panda_assets(str(panda_dir))
+        else:
+            if selected_robot.asset_dir is None or not selected_robot.asset_dir.is_dir():
+                raise FileNotFoundError(
+                    f"{selected_robot.name} mesh assets were not found: "
+                    f"{selected_robot.asset_dir}"
+                )
+            robot_assets = _robot_assets(str(selected_robot.asset_dir))
 
         # 所有场景都从同一源模型编译，在编译阶段扩大真实碰撞桌面并删除旧的
-        # 单侧实体挡板。Panda XML由仓库固定，外部Menagerie只提供官方mesh资产，
-        # 因此服务器无需修改或复制Menagerie文件，抓取几何也不会随机器变化。
+        # 单侧实体挡板。机器人 XML 由当前配置注入，避免为每个机器人复制整套场景。
         spec = mujoco.MjSpec.from_file(
             str(XML_PATH),
-            include={"panda.xml": PANDA_XML_PATH.read_bytes()},
-            assets=_panda_assets(str(panda_dir)),
+            include={"robot.xml": selected_robot.xml_path.read_bytes()},
+            assets=robot_assets,
         )
+        base_body = next(
+            body for body in spec.bodies if body.name == selected_robot.base_body_name
+        )
+        base_body.pos[:] += selected_robot.base_offset
         table = next(geom for geom in spec.geoms if geom.name == "table")
         table.size[:2] = config.table_half_size
         for geom in list(spec.geoms):
@@ -2319,11 +2561,14 @@ class CableGraspEnv:
                 config.dynamicvla_camera_height,
             )
 
-            # DynamicVLA attaches its wrist camera directly to panda_hand.
+            # DynamicVLA attaches its wrist camera directly to the selected TCP body.
             # Isaac Lab and MuJoCo both use an OpenGL optical convention here
             # (camera looks along local -Z), so no extra axis conversion is
             # required for this body-local pose.
-            hand_spec = next(body for body in spec.bodies if body.name == "hand")
+            hand_spec = next(
+                body for body in spec.bodies
+                if body.name == selected_robot.hand_body_name
+            )
             wrist_camera = hand_spec.add_camera()
             wrist_camera.name = config.dynamicvla_wrist_camera_name
             wrist_camera.pos[:] = config.dynamicvla_wrist_camera_pos
@@ -2349,7 +2594,10 @@ class CableGraspEnv:
         # 阻尼
         for joint in spec.joints:
             if joint.name.startswith("cableJ_") and joint.name != "cableJ_first":
-                joint.damping[:] *= config.cable_damping_scale
+                # MjSpec exposes scalar joint damping in some MuJoCo releases
+                # and an array-like value in others; in-place scalar scaling
+                # works for both representations.
+                joint.damping *= config.cable_damping_scale
         # 弹性刚度
         for plugin_spec in spec.plugins:
             plugin_config = dict(plugin_spec.config)

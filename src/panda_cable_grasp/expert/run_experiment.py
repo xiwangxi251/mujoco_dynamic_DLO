@@ -16,7 +16,7 @@ import numpy as np
 
 from ..evaluation.benchmark import base_row, summarize
 from ..evaluation.defaults import DEFAULT_EVALUATION_SEED
-from ..env.environment import CableGraspEnv
+from ..env.environment import CableGraspEnv, ROBOT_SPECS
 from ..scenarios.registry import get_scenario, list_scenario_names
 from ..evaluation.motion_diagnostics import env_config_for_scenario
 from ..paths import output_path
@@ -38,12 +38,14 @@ def run_episode(
     seed: int,
     episode_seconds: float,
     expert_config: dict[str, Any] | None = None,
+    robot: str = "panda",
 ) -> dict[str, Any]:
     scenario = get_scenario(scenario_name)
     env = CableGraspEnv(env_config_for_scenario(
         scenario,
         seed=seed,
         episode_seconds=episode_seconds,
+        robot=robot,
     ))
     try:
         _, initial_info = env.reset(seed=seed)
@@ -117,6 +119,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
+    parser.add_argument(
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        help="robot model used by the MuJoCo environment",
+    )
     parser.add_argument("--workers", type=int, default=1)
     defaults = FormulaInterceptConfig()
     parser.add_argument(
@@ -187,7 +193,7 @@ def main() -> None:
         futures = {
             executor.submit(
                 run_episode, scenario, episode, seed, args.episode_seconds,
-                expert_config,
+                expert_config, args.robot,
             ): (scenario, episode)
             for scenario, episode, seed in jobs
         }
@@ -223,6 +229,7 @@ def main() -> None:
         "episodes_per_scenario": args.episodes,
         "seed": args.seed,
         "episode_seconds": args.episode_seconds,
+        "robot": args.robot,
         "workers": args.workers,
         "expert_config": expert_config,
     }

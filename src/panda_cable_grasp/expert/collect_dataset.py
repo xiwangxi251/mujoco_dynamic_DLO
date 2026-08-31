@@ -21,7 +21,7 @@ import mujoco
 import numpy as np
 
 from ..evaluation.benchmark import base_row, git_text, summarize, write_csv
-from ..env.environment import CableGraspEnv
+from ..env.environment import CableGraspEnv, ROBOT_SPECS
 from ..env.kinematics import rotation_to_quat
 from ..scenarios.registry import get_scenario, list_scenario_names
 from ..evaluation.motion_diagnostics import env_config_for_scenario
@@ -514,6 +514,7 @@ def _collect_scenario_worker(
         scenario,
         seed=args.seed,
         episode_seconds=args.episode_seconds,
+        robot=getattr(args, "robot", "panda"),
     )
     env = CableGraspEnv(replace(
         env_config,
@@ -603,6 +604,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260804)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument(
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        help="robot model used by the MuJoCo environment",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -662,6 +667,7 @@ def _run_config(args: argparse.Namespace) -> dict[str, Any]:
         "max_attempts_per_scenario": args.max_attempts_per_scenario,
         "seed": args.seed,
         "episode_seconds": args.episode_seconds,
+        "robot": args.robot,
         "instruction": args.instruction,
     }
 

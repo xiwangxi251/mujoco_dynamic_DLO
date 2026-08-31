@@ -31,6 +31,7 @@ from ..env.environment import (
     CableGraspEnv,
     EnvConfig,
     PANDA_XML_PATH,
+    ROBOT_SPECS,
     XML_PATH,
     resolve_menagerie_panda_dir,
 )
@@ -46,6 +47,7 @@ from ..paths import output_path
 def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
     scenario = get_scenario(args.scenario)
     return EnvConfig(
+        robot=getattr(args, "robot", "panda"),
         seed=args.seed,
         episode_seconds=args.episode_seconds,
         scenario_name=scenario.name,
@@ -436,9 +438,17 @@ def run_server(args: argparse.Namespace) -> None:
                 "environment": asdict(env.config),
                 "adapter": asdict(DynamicVLAAdapterConfig()),
             },
+            "robot": env.robot,
             "source_xml": {"path": str(XML_PATH.resolve()), "sha256": sha256_file(XML_PATH)},
+            "robot_xml": {
+                "path": str(env.robot_spec.xml_path.resolve()),
+                "sha256": sha256_file(env.robot_spec.xml_path),
+            },
             "panda_xml": {"path": str(PANDA_XML_PATH.resolve()), "sha256": sha256_file(PANDA_XML_PATH)},
-            "menagerie_panda_assets": str(resolve_menagerie_panda_dir()),
+            "menagerie_panda_assets": (
+                str(resolve_menagerie_panda_dir())
+                if env.robot == "panda" else None
+            ),
             "git_commit": git_text("rev-parse", "HEAD"),
             "git_dirty": bool(git_status),
             "python": platform.python_version(),
@@ -472,6 +482,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
+    parser.add_argument(
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        help="robot model used by the MuJoCo environment",
+    )
     parser.add_argument("--video-fps", type=float, default=DEFAULT_VIDEO_FPS)
     parser.add_argument(
         "--headless", action="store_true",
