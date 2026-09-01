@@ -1007,7 +1007,7 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
 
                 print_episode(episode, episode_return, steps, info)
                 print(
-                    f"  policy_outcome={failure_type} "
+                    f"  policy_outcome={policy_failure_type} "
                     f"task_outcome={task_failure_type}",
                     flush=True,
                 )

@@ -53,8 +53,14 @@ def parse_args() -> argparse.Namespace:
         help="expert run/scenario directories or episode_*.npz trajectories",
     )
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--action-source", choices=("requested", "applied"), default="applied")
-    parser.add_argument("--gripper-threshold", type=float, default=127.5)
+    parser.add_argument(
+        "--action-source", choices=("requested", "applied"), default=None,
+        help="raw .npz action source; LeRobot input uses its stored conversion source",
+    )
+    parser.add_argument(
+        "--gripper-threshold", type=float, default=None,
+        help="override the model-derived gripper threshold",
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--limit-episodes", type=int)
     parser.add_argument("--epochs", type=int)
@@ -89,7 +95,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _config_from_args(args: argparse.Namespace):
-    from .config import DiffusionPolicyConfig
+    from .config import DiffusionPolicyConfig, split_episode_indices
 
     values = asdict(DiffusionPolicyConfig(seed=args.seed))
     for key in (
@@ -154,8 +160,8 @@ def train(args: argparse.Namespace) -> Path:
             "extra with `python -m pip install -e \".[diffusion]\"`"
         ) from error
 
-    from .config import DiffusionPolicyConfig
-    from .dataset import DiffusionEpisodeDataset, split_episode_indices
+    from .config import DiffusionPolicyConfig, split_episode_indices
+    from .dataset import DiffusionEpisodeDataset
     from .model import DiffusionPolicy
 
     config = _config_from_args(args)
@@ -252,11 +258,17 @@ def train(args: argparse.Namespace) -> Path:
                 scheduler.step()
                 epoch_losses.append(float(loss.item()))
                 global_step += 1
-                if batch_index == 0 or global_step % 100 == 0:
+                if (
+                    batch_index == 0
+                    or (batch_index + 1) % 100 == 0
+                    or batch_index + 1 == len(train_loader)
+                ):
+                    progress = 100.0 * (batch_index + 1) / len(train_loader)
                     print(
                         f"progress epoch={epoch}/{config.epochs} "
                         f"batch={batch_index + 1}/{len(train_loader)} "
-                        f"step={global_step} loss={loss.item():.6f}",
+                        f"percent={progress:.1f} step={global_step} "
+                        f"loss={loss.item():.6f}",
                         flush=True,
                     )
             train_loss = sum(epoch_losses) / len(epoch_losses)
@@ -272,7 +284,7 @@ def train(args: argparse.Namespace) -> Path:
             })
             metrics_file.flush()
             checkpoint = {
-                "format": "panda_cable_diffusion_policy_v2",
+                "format": "panda_cable_diffusion_policy_v3",
                 "model": model.state_dict(),
                 "ema_model": None if ema is None else ema.state_dict(),
                 "config": asdict(config),
@@ -280,7 +292,7 @@ def train(args: argparse.Namespace) -> Path:
                 "state_high": train_dataset.state_high.tolist(),
                 "action_low": train_dataset.action_low.tolist(),
                 "action_high": train_dataset.action_high.tolist(),
-                "action_source": args.action_source,
+                "action_source": train_dataset.action_source,
                 "gripper_threshold": args.gripper_threshold,
                 "epoch": epoch,
                 "global_step": global_step,
@@ -297,7 +309,7 @@ def train(args: argparse.Namespace) -> Path:
             )
 
     manifest: dict[str, Any] = {
-        "format": "panda_cable_diffusion_policy_v2",
+        "format": "panda_cable_diffusion_policy_v3",
         "method": "diffusion_policy",
         "architecture": {
             "visual_encoder": "separate_resnet18_spatial_softmax",
@@ -319,7 +331,7 @@ def train(args: argparse.Namespace) -> Path:
             "validation_frame_count": (
                 None if validation_dataset is None else len(validation_dataset)
             ),
-            "action_source": args.action_source,
+            "action_source": train_dataset.action_source,
             "gripper_threshold": args.gripper_threshold,
             "state_format": "absolute_xyz_quaternion_wxyz",
             "action_format": "absolute_xyz_quaternion_wxyz_gripper_minus1_plus1",
