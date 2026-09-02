@@ -4,6 +4,8 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import difflib
+import hashlib
+import json
 import logging
 import pathlib
 from typing import Any, Literal, List, Protocol, TypeAlias
@@ -107,6 +109,32 @@ class DataConfig:
     dataset_root: str | None = None
     # episodes index to use for training 
     episodes_index : List[int] | None = None
+
+
+def _cable_seed_hash_split(dataset_root: str, *, dev_mod: int = 10) -> tuple[list[int], list[int]]:
+    """Return a deterministic global train/dev split grouped by source seed.
+
+    The same seed can occur in several scene conditions. Hashing only the seed
+    keeps all conditions for one rollout in the same split and prevents leakage.
+    """
+    manifest_path = pathlib.Path(dataset_root) / "cable_conversion_manifest.json"
+    episodes = json.loads(manifest_path.read_text())["episodes"]
+    train: list[int] = []
+    dev: list[int] = []
+    for episode in episodes:
+        seed = str(int(episode["seed"])).encode("ascii")
+        bucket = int.from_bytes(hashlib.sha256(seed).digest()[:8], "big") % dev_mod
+        target = dev if bucket == 0 else train
+        target.append(int(episode["episode_index"]))
+    return train, dev
+
+
+_CABLE_DATASET_ROOT = "/data/hxai/panda_cable_pi05/datasets/panda_cable_4scenes_1000_dynamicvla_parallel"
+try:
+    _CABLE_TRAIN_EPISODES, _CABLE_DEV_EPISODES = _cable_seed_hash_split(_CABLE_DATASET_ROOT)
+except FileNotFoundError:
+    # Keep importing the config module on machines that do not have the private dataset.
+    _CABLE_TRAIN_EPISODES, _CABLE_DEV_EPISODES = [], []
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -1163,6 +1191,52 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     TrainConfig(
+        name="pi05_cable_lora_g2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotCableDataConfig(
+            repo_id="local/panda_cable_4scenes_1000",
+            dataset_root=_CABLE_DATASET_ROOT,
+            episodes_index=_CABLE_TRAIN_EPISODES,
+            # Reuse the same split statistics as the formal config.
+            assets=AssetsConfig(
+                assets_dir="/data/hxai/panda_cable_pi05/assets/pi05_cable_lora_full",
+            ),
+        ),
+        assets_base_dir="/data/hxai/panda_cable_pi05/assets",
+        checkpoint_base_dir="/data/hxai/panda_cable_pi05/checkpoints",
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=250,
+            peak_lr=5e-5,
+            decay_steps=2_500,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=16,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=8,
+        num_workers=8,
+        num_train_steps=2_500,
+        log_interval=100,
+        save_interval=500,
+        keep_period=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
         name="pi05_cable_lora_full",
         model=pi0_config.Pi0Config(
             pi05=True,
@@ -1174,12 +1248,7 @@ _CONFIGS = [
         data=LeRobotCableDataConfig(
             repo_id="local/panda_cable_4scenes_1000",
             dataset_root="/data/hxai/panda_cable_pi05/datasets/panda_cable_4scenes_1000_dynamicvla_parallel",
-            episodes_index=(
-                list(range(0, 900))
-                + list(range(1000, 1900))
-                + list(range(2000, 2900))
-                + list(range(3000, 3900))
-            ),
+            episodes_index=_CABLE_TRAIN_EPISODES,
         ),
         assets_base_dir="/data/hxai/panda_cable_pi05/assets",
         checkpoint_base_dir="/data/hxai/panda_cable_pi05/checkpoints",
