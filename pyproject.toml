@@ -44,6 +44,7 @@ panda-cable-dataset-convert = "panda_cable_grasp.dynamicvla.finetune.convert_dat
 panda-cable-finetune = "panda_cable_grasp.dynamicvla.finetune.launch_finetune:main"
 panda-cable-diffusion-train = "panda_cable_grasp.diffusion_policy.train:main"
 panda-cable-diffusion-eval = "panda_cable_grasp.cli.run_diffusion_policy:main"
+panda-cable-pi05-eval = "panda_cable_grasp.cli.run_pi05:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
