@@ -25,6 +25,14 @@ PANDA_XML_PATH = ROOT / "assets" / "mujoco" / "panda.xml"
 NERO_XML_PATH = ROOT / "assets" / "mujoco" / "nero" / "nero.xml"
 MENAGERIE_ENV_VAR = "MUJOCO_MENAGERIE_PATH"
 
+DEFAULT_ARM_JOINT_VELOCITY_LIMITS = (
+    2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61,
+)
+NERO_ARM_JOINT_VELOCITY_LIMITS = (
+    math.pi, math.pi, math.pi,
+    1.25 * math.pi, 1.25 * math.pi, 1.25 * math.pi, 1.25 * math.pi,
+)
+
 
 @dataclass(frozen=True)
 class RobotSpec:
@@ -308,9 +316,7 @@ class EnvConfig:
 
     # 机器人运动能力限制
     robot_motion_limit_profile: str = "dynamicvla_panda_v4"
-    arm_joint_velocity_limits: tuple[float, ...] = (
-        2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61,
-    )
+    arm_joint_velocity_limits: tuple[float, ...] = DEFAULT_ARM_JOINT_VELOCITY_LIMITS
     arm_acceleration_limit_enabled: bool = False
     arm_joint_acceleration_limits: tuple[float, ...] = (
         15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0,
@@ -319,15 +325,17 @@ class EnvConfig:
     hand_linear_velocity_limit: float = 1.0
     hand_angular_velocity_limit: float = 2.0
     gripper_finger_velocity_limit: float = 0.20
-    arm_position_tracking_error_limit: float = 0.03
     low_level_velocity_guard_fraction: float = 1.0
 
     # 合法性检查
     def __post_init__(self) -> None:
         self.robot = str(self.robot).lower()
         robot_spec(self.robot)
-        if self.robot == "nero" and self.robot_motion_limit_profile == "dynamicvla_panda_v4":
-            self.robot_motion_limit_profile = "nero_v1"
+        if self.robot == "nero":
+            if self.robot_motion_limit_profile == "dynamicvla_panda_v4":
+                self.robot_motion_limit_profile = "nero_v1"
+            if self.arm_joint_velocity_limits == DEFAULT_ARM_JOINT_VELOCITY_LIMITS:
+                self.arm_joint_velocity_limits = NERO_ARM_JOINT_VELOCITY_LIMITS
         if self.target_selection not in {"random", "middle"}:
             raise ValueError(
                 "target_selection must be either 'random' or 'middle'"
@@ -470,7 +478,7 @@ class EnvConfig:
             )
         for name in (
             "hand_linear_velocity_limit", "hand_angular_velocity_limit",
-            "gripper_finger_velocity_limit", "arm_position_tracking_error_limit",
+            "gripper_finger_velocity_limit",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
@@ -518,12 +526,6 @@ class CableGraspEnv:
         )
         self.rng = np.random.default_rng(self.config.seed)
         self.model = self._load_model(self.config)
-        # This is an environment-level guard shared by all robot backends.  Do
-        # not replace the actuator parameters compiled from a robot's XML with
-        # unverified robot-specific gains here.
-        self._arm_position_tracking_error_limit = float(
-            self.config.arm_position_tracking_error_limit
-        )
         if self.config.dynamicvla_cameras_enabled:
             self.model.vis.global_.offwidth = max(
                 int(self.model.vis.global_.offwidth),
@@ -1169,11 +1171,6 @@ class CableGraspEnv:
         guarded_action = applied_action.copy()
         current_qpos = self.data.qpos[self.arm_qpos_adr]
         current_qvel = self.data.qvel[self.arm_dof_adr]
-        guarded_action[:7] = np.clip(
-            guarded_action[:7],
-            current_qpos - self._arm_position_tracking_error_limit,
-            current_qpos + self._arm_position_tracking_error_limit,
-        )
         guard_limits = (
             self.config.low_level_velocity_guard_fraction
             * self._arm_velocity_limits
@@ -1401,9 +1398,6 @@ class CableGraspEnv:
             ),
             "gripper_finger_velocity_limit": (
                 self.config.gripper_finger_velocity_limit
-            ),
-            "arm_position_tracking_error_limit": (
-                self._arm_position_tracking_error_limit
             ),
             "low_level_velocity_guard_fraction": (
                 self.config.low_level_velocity_guard_fraction

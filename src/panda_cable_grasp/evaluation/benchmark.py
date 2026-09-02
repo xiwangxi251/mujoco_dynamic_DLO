@@ -123,6 +123,41 @@ def _recordable_config(config: EnvConfig, enabled: bool) -> EnvConfig:
     return replace(config, dynamicvla_cameras_enabled=enabled)
 
 
+def _scripted_policy_config(options: Any) -> PolicyConfig:
+    """Build the scripted policy config, keeping horizon overrides optional."""
+
+    def option(name: str, default: Any = None) -> Any:
+        if isinstance(options, dict):
+            return options.get(name, default)
+        return getattr(options, name, default)
+
+    kwargs: dict[str, Any] = {
+        "strict_vertical_gripper": bool(option("strict_vertical_gripper", False)),
+    }
+    for name in ("prediction_horizon", "approach_prediction_horizon"):
+        value = option(name)
+        if value is not None:
+            kwargs[name] = float(value)
+    return PolicyConfig(**kwargs)
+
+
+def _apply_diagnostic_arm_gain_scale(env: CableGraspEnv, scale: float) -> None:
+    """Temporarily scale NERO arm actuator gains for causal diagnostics.
+
+    This is deliberately an evaluation-only intervention.  The XML remains the
+    source of the default gains, and the default scale is exactly 1.0.
+    """
+
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("diagnostic arm gain scale must be finite and positive")
+    if scale == 1.0:
+        return
+    arm_actuators = slice(0, 7)
+    env.model.actuator_gainprm[arm_actuators, 0] *= scale
+    env.model.actuator_biasprm[arm_actuators, 1] *= scale
+    env.model.actuator_biasprm[arm_actuators, 2] *= scale
+
+
 def _config_for_method(config: EnvConfig, method: str) -> EnvConfig:
     """Use one target node for every method in a paired benchmark.
 
@@ -241,9 +276,6 @@ def _base_row(
         )),
         "gripper_finger_velocity_limit": float(initial_info.get(
             "gripper_finger_velocity_limit", np.nan
-        )),
-        "arm_position_tracking_error_limit": float(initial_info.get(
-            "arm_position_tracking_error_limit", np.nan
         )),
         "low_level_velocity_guard_fraction": float(initial_info.get(
             "low_level_velocity_guard_fraction", np.nan
@@ -546,11 +578,13 @@ def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
         env = CableGraspEnv(config)
         base_env = env
         if method == "scripted":
+            _apply_diagnostic_arm_gain_scale(
+                env,
+                float(job.get("arm_actuator_gain_scale", 1.0)),
+            )
             policy = DynamicCableGraspPolicy(
                 env,
-                PolicyConfig(
-                    strict_vertical_gripper=bool(job["strict_vertical_gripper"])
-                ),
+                _scripted_policy_config(job),
             )
         elif method == "expert":
             from ..expert.formula_intercept_policy import (
@@ -814,6 +848,21 @@ def parse_args() -> argparse.Namespace:
     selection.add_argument("--suite", choices=SCENARIO_SUITE_NAMES)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument(
+        "--prediction-horizon", type=float, default=None,
+        help="optional scripted-policy prediction horizon in seconds",
+    )
+    parser.add_argument(
+        "--approach-prediction-horizon", type=float, default=None,
+        help="optional scripted-policy APPROACH prediction horizon in seconds",
+    )
+    parser.add_argument(
+        "--arm-actuator-gain-scale", type=float, default=1.0,
+        help=(
+            "diagnostic-only multiplicative scale for the first seven arm "
+            "actuator gains; default 1.0 preserves the XML parameters"
+        ),
+    )
+    parser.add_argument(
         "--scenario-workers", type=int, default=1,
         help="maximum number of scenario cells active at once",
     )
@@ -842,6 +891,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=output_path("benchmarks"))
     args = parser.parse_args()
     args.methods = list(dict.fromkeys(args.methods))
+    arm_actuator_gain_scale = getattr(args, "arm_actuator_gain_scale", 1.0)
     positive = (
         args.episodes >= 1
         and args.episode_seconds > 0.0
@@ -849,11 +899,19 @@ def parse_args() -> argparse.Namespace:
         and args.envs_per_scenario >= 1
         and (args.workers is None or args.workers >= 1)
         and args.video_fps > 0.0
+        and math.isfinite(arm_actuator_gain_scale)
+        and arm_actuator_gain_scale > 0.0
     )
     if not positive:
         parser.error("episode, duration, FPS, and worker counts must be positive")
     if args.disturbance < 0.0 or not math.isfinite(args.disturbance):
         parser.error("--disturbance must be finite and non-negative")
+    for name in ("prediction_horizon", "approach_prediction_horizon"):
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(value) or value < 0.0):
+            parser.error(
+                f"--{name.replace('_', '-')} must be finite and non-negative"
+            )
     if "ppo" in args.methods and args.ppo_model is None:
         parser.error("--ppo-model is required when evaluating PPO")
     if "diffusion_policy" in args.methods and args.diffusion_policy_model is None:
@@ -938,6 +996,15 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                     "diffusion_policy_model": diffusion_policy_model,
                     "device": args.device,
                     "strict_vertical_gripper": strict_vertical_gripper,
+                    "prediction_horizon": getattr(
+                        args, "prediction_horizon", None,
+                    ),
+                    "approach_prediction_horizon": getattr(
+                        args, "approach_prediction_horizon", None,
+                    ),
+                    "arm_actuator_gain_scale": getattr(
+                        args, "arm_actuator_gain_scale", 1.0,
+                    ),
                     "recording": args.recording,
                     "video_fps": args.video_fps,
                     "output_dir": output_dir,
@@ -1076,9 +1143,10 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             }.items()
         },
         "configs": {
-            "scripted_policy": asdict(PolicyConfig(
-                strict_vertical_gripper=strict_vertical_gripper
-            ))
+            "scripted_policy": asdict(_scripted_policy_config(args)),
+            "diagnostic_arm_actuator_gain_scale": getattr(
+                args, "arm_actuator_gain_scale", 1.0,
+            ),
         },
         "task_outcome_types": list(TASK_OUTCOME_TYPES),
         "paired_scene_fingerprints_verified": paired_verification,
