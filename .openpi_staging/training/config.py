@@ -1270,7 +1270,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        batch_size=8,
+        batch_size=32,
         num_workers=8,
         num_train_steps=30_000,
         log_interval=100,
