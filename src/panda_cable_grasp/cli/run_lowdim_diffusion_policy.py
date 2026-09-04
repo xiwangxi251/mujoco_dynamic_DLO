@@ -1,4 +1,4 @@
-"""Run a trained visual Diffusion Policy on the MuJoCo cable task."""
+"""Evaluate a low-dimensional Diffusion Policy, optionally recording videos."""
 
 from __future__ import annotations
 
@@ -7,41 +7,25 @@ from datetime import datetime
 import json
 from pathlib import Path
 
-from ..paths import output_path
-
 
 def parse_args() -> argparse.Namespace:
     from ..scenarios.registry import list_scenario_names
-    from ..env.environment import ROBOT_SPECS
 
-    parser = argparse.ArgumentParser(
-        description="Evaluate a visual Diffusion Policy on the cable task"
-    )
+    parser = argparse.ArgumentParser(description="Evaluate low-dimensional Diffusion Policy")
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--scenario", choices=list_scenario_names(), required=True)
-    parser.add_argument("--trials", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=20260804)
+    parser.add_argument("--trials", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=20280804)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
-    parser.add_argument(
-        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
-        help="robot model used by the MuJoCo environment",
-    )
     parser.add_argument("--video-fps", type=float, default=25.0)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument(
-        "--deterministic", action=argparse.BooleanOptionalAction, default=True,
-        help="use a seedable diffusion noise generator for repeatable evaluation",
-    )
-    parser.add_argument("--video-dir", type=Path, default=output_path("diffusion_policy", "evaluation"))
+    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--record-video", action="store_true")
+    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--run-name")
-    parser.add_argument(
-        "--headless", action="store_true",
-        help="accepted for CLI compatibility; evaluation is always offscreen",
-    )
-    parser.add_argument("--no-recording", action="store_true")
     args = parser.parse_args()
     if not args.model.is_file():
-        parser.error(f"Diffusion Policy checkpoint not found: {args.model}")
+        parser.error(f"checkpoint not found: {args.model}")
     if args.trials < 1 or args.episode_seconds <= 0.0 or args.video_fps <= 0.0:
         parser.error("trials, episode duration, and video FPS must be positive")
     return args
@@ -49,15 +33,10 @@ def parse_args() -> argparse.Namespace:
 
 def run(args: argparse.Namespace) -> Path:
     import numpy as np
-    import mujoco
 
-    from ..diffusion_policy.runner import DiffusionPolicyRunner
-    from ..env.environment import (
-        CableGraspEnv, EnvConfig, PANDA_XML_PATH, XML_PATH,
-        resolve_menagerie_panda_dir,
-    )
+    from ..diffusion_policy.lowdim import LowDimPolicyRunner
+    from ..env.environment import CableGraspEnv, EnvConfig
     from ..evaluation.benchmark import base_row, sha256_file, summarize, write_csv
-    from ..evaluation.defaults import DEFAULT_VIDEO_FPS
     from ..evaluation.motion_diagnostics import env_config_for_scenario
     from ..evaluation.recording import EpisodeRecorder
     from ..scenarios.registry import get_scenario
@@ -70,28 +49,18 @@ def run(args: argparse.Namespace) -> Path:
         **{
             **vars(config),
             "frame_skip": 20,
-            "dynamicvla_cameras_enabled": True,
-            "robot": args.robot,
+            "dynamicvla_cameras_enabled": bool(args.record_video),
         }
     )
     env = CableGraspEnv(config)
     run_name = args.run_name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
-    run_dir = args.video_dir.expanduser().resolve() / run_name
-    suffix = 1
-    while run_dir.exists():
-        if args.run_name:
-            raise FileExistsError(f"refusing to overwrite {run_dir}")
-        run_dir = args.video_dir.expanduser().resolve() / f"{run_name}_{suffix:02d}"
-        suffix += 1
+    run_dir = args.output_dir.expanduser().resolve() / run_name
+    if run_dir.exists():
+        raise FileExistsError(f"refusing to overwrite {run_dir}")
     run_dir.mkdir(parents=True)
-    model_dir = run_dir / "models"
-    model_dir.mkdir()
-    compiled_model = model_dir / f"{scenario.name}.mjb"
-    mujoco.mj_saveModel(env.model, str(compiled_model), None)
     rows: list[dict] = []
-    recording = not args.no_recording
     try:
-        policy = DiffusionPolicyRunner(
+        policy = LowDimPolicyRunner(
             env, args.model, device=args.device, deterministic=args.deterministic
         )
         for trial_offset in range(args.trials):
@@ -99,11 +68,11 @@ def run(args: argparse.Namespace) -> Path:
             _, initial_info = env.reset(seed=seed)
             policy.reset(seed=seed)
             recorder = None
-            if recording:
+            if args.record_video:
                 recorder = EpisodeRecorder(
                     env,
                     run_dir / "episodes" / scenario.name / f"seed_{seed}",
-                    video_fps=args.video_fps or DEFAULT_VIDEO_FPS,
+                    video_fps=args.video_fps,
                 )
                 recorder.capture_initial()
             terminated = False
@@ -137,7 +106,7 @@ def run(args: argparse.Namespace) -> Path:
                 else "failed_timeout"
             )
             row = base_row(
-                "diffusion_policy", trial_offset + 1, seed, scenario,
+                "diffusion_policy_lowdim", trial_offset + 1, seed, scenario,
                 initial_info, info, env.grasp_break_history,
             )
             row.update({
@@ -152,8 +121,7 @@ def run(args: argparse.Namespace) -> Path:
                 **policy.policy_info(),
             })
             if recorder is not None:
-                artifacts = recorder.finish(row)
-                row.update(artifacts.relative_to(run_dir))
+                row.update(recorder.finish(row).relative_to(run_dir))
             else:
                 row.update({
                     "episode_dir": None, "trajectory": None, "metadata": None,
@@ -161,7 +129,7 @@ def run(args: argparse.Namespace) -> Path:
                 })
             rows.append(row)
             print(
-                f"trial={trial_offset + 1} seed={seed} result={policy.result} "
+                f"trial={trial_offset + 1}/{args.trials} seed={seed} result={policy.result} "
                 f"steps={steps} diffusion_inferences={policy.policy_info()['diffusion_inference_count']}",
                 flush=True,
             )
@@ -175,37 +143,26 @@ def run(args: argparse.Namespace) -> Path:
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest = {
         "schema_version": 1,
-        "method": "diffusion_policy",
+        "method": "diffusion_policy_lowdim",
         "checkpoint": str(args.model.expanduser().resolve()),
         "checkpoint_sha256": sha256_file(args.model),
         "scenario": scenario.asdict(),
         "seeds": [args.seed + index for index in range(args.trials)],
-        "recording": recording,
+        "recording": bool(args.record_video),
         "camera_input": {
-            "keys": ["observation.images.opst_cam", "observation.images.wrist_cam"],
+            "keys": ["opst_cam", "wrist_cam"],
             "resolution": [480, 360],
-            "state": "observation.state.end_effector.pos + euler_xyz",
-        },
+            "fps": args.video_fps,
+        } if args.record_video else None,
+        "state_input": "ee_xyz_euler_gripper + 16 DLO keypoints relative to EE + relative target",
         "action": "absolute_xyz_euler_xyz_gripper_through_dynamicvla_ik",
-        "robot": env.robot,
-        "compiled_model": str(compiled_model.resolve()),
-        "compiled_model_sha256": sha256_file(compiled_model),
-        "source_xml": str(XML_PATH.resolve()),
-        "source_xml_sha256": sha256_file(XML_PATH),
-        "robot_xml": str(env.robot_spec.xml_path.resolve()),
-        "robot_xml_sha256": sha256_file(env.robot_spec.xml_path),
-        "panda_xml": str(PANDA_XML_PATH.resolve()),
-        "panda_xml_sha256": sha256_file(PANDA_XML_PATH),
-        "menagerie_panda_assets": (
-            str(resolve_menagerie_panda_dir())
-            if env.robot == "panda" else None
-        ),
-        "summary": summary,
+        "episodes_csv": str(episodes_path.relative_to(run_dir)),
+        "summary": str(summary_path.relative_to(run_dir)),
     }
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print(f"diffusion_policy_output={run_dir}", flush=True)
+    print(f"lowdim_eval_output={run_dir}", flush=True)
     return run_dir
 
 

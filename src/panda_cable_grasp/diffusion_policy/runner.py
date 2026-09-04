@@ -21,7 +21,9 @@ from .config import (
     STATE_HIGH,
     STATE_LOW,
     denormalize_array,
+    euler_xyz_to_wxyz,
     normalize_array,
+    wxyz_to_euler_xyz,
 )
 from .model import DiffusionPolicy
 
@@ -63,10 +65,10 @@ class DiffusionPolicyRunner:
             payload = torch.load(self.checkpoint_path, map_location=self.device)
         if not isinstance(payload, dict) or "model" not in payload:
             raise ValueError(f"invalid Diffusion Policy checkpoint: {checkpoint}")
-        if payload.get("format") != "panda_cable_diffusion_policy_v2":
+        if payload.get("format") != "panda_cable_diffusion_policy_v3":
             raise ValueError(
                 "unsupported Diffusion Policy checkpoint format; retrain with "
-                "the DynaMimicGen-style v2 implementation"
+                "the DynaMimicGen-style v3 implementation"
             )
         config_values = dict(payload.get("config", {}))
         from .config import DiffusionPolicyConfig
@@ -124,7 +126,8 @@ class DiffusionPolicyRunner:
             quaternion = quaternion[0]
         if position.shape != (3,) or quaternion.shape != (4,):
             raise ValueError("DynamicVLA end-effector state must be shapes (1,3)/(1,4)")
-        return np.concatenate((position, quaternion)).astype(np.float32)
+        euler = wxyz_to_euler_xyz(quaternion)
+        return np.concatenate((position, euler)).astype(np.float32)
 
     def _append_observation(self, observation: dict[str, Any]) -> None:
         state = self._state_from_observation(observation)
@@ -168,8 +171,18 @@ class DiffusionPolicyRunner:
         model_chunk = denormalize_array(
             normalized_chunk, self.action_low, self.action_high
         )
-        execute_count = min(self.config.action_horizon, len(model_chunk))
-        self._action_queue.extend(np.asarray(model_chunk[:execute_count], dtype=np.float32))
+        task_space_chunk = np.concatenate(
+            (
+                model_chunk[:, :3],
+                euler_xyz_to_wxyz(model_chunk[:, 3:6]),
+                model_chunk[:, 6:7],
+            ),
+            axis=-1,
+        )
+        execute_count = min(self.config.action_horizon, len(task_space_chunk))
+        self._action_queue.extend(
+            np.asarray(task_space_chunk[:execute_count], dtype=np.float32)
+        )
         self._inference_count += 1
 
     def action(self, observation: dict[str, Any] | None = None) -> np.ndarray:

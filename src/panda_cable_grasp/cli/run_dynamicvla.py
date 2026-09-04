@@ -94,32 +94,39 @@ def _wait_for_message(socket, key: str, timeout_seconds: float) -> dict | None:
     return None
 
 
-def _wait_for_sync_action(socket, sync_index: int, timeout_seconds: float) -> dict | None:
-    """Wait for exactly the action belonging to one published observation."""
+def _wait_for_sync_action(
+    socket, sync_index: int, timeout_seconds: float
+) -> dict | None:
+    """Wait for the action corresponding to exactly one observation."""
+
     import zmq
 
     poller = zmq.Poller()
     poller.register(socket, zmq.POLLIN)
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
-    while time.monotonic() < deadline:
-        wait_ms = max(1, min(1000, int(1000 * (deadline - time.monotonic()))))
-        if not poller.poll(wait_ms):
-            continue
-        while True:
-            try:
-                message = socket.recv_pyobj(flags=zmq.NOBLOCK)
-            except zmq.Again:
-                break
-            if not isinstance(message, dict) or "action" not in message:
-                continue
-            if message.get("sync_index") != sync_index:
-                print(
-                    "ignored_stale_sync_action="
-                    f"expected_{sync_index}_received_{message.get('sync_index')}",
-                    flush=True,
-                )
-                continue
-            return message
+    deadline = (
+        None
+        if timeout_seconds <= 0.0
+        else time.monotonic() + timeout_seconds
+    )
+    while deadline is None or time.monotonic() < deadline:
+        wait_ms = 1000
+        if deadline is not None:
+            wait_ms = max(1, min(wait_ms, int(1000 * (deadline - time.monotonic()))))
+        if poller.poll(wait_ms):
+            while True:
+                try:
+                    message = socket.recv_pyobj(flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                if isinstance(message, dict) and "action" in message:
+                    if message.get("sync_index") != sync_index:
+                        print(
+                            "ignored_stale_sync_action="
+                            f"expected_{sync_index}_received_{message.get('sync_index')}",
+                            flush=True,
+                        )
+                        continue
+                    return message
     return None
 
 
@@ -397,6 +404,8 @@ def run_server(args: argparse.Namespace) -> None:
                 result = "failed_sync_invalid_action"
             elif model_action_messages == 0:
                 result = "failed_no_model_action"
+            elif termination_reason == "dynamicvla_action_timeout":
+                result = "failed_action_timeout"
             elif termination_reason == "rigid_motion_boundary_crossed":
                 result = "failed_motion_boundary"
             else:
@@ -490,8 +499,9 @@ def run_server(args: argparse.Namespace) -> None:
                 "execute_steps": args.execute_steps if sync_mode else None,
                 "predicted_chunk_size": handshake.get("chunk_size"),
                 "rotation": "euler_in_model_quaternion_on_wire_wxyz",
-                "delta_action": handshake.get("delta_action", True),
+                "delta_action": bool(handshake.get("delta_action", True)),
                 "control_hz": 1.0 / control_dt,
+                "execute_steps": execute_steps if sync_mode else None,
             },
             "output": {
                 "run_dir": str(run_dir.resolve()),
