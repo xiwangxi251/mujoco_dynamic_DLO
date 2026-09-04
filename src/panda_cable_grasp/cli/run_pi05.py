@@ -98,6 +98,40 @@ def _model_action_to_wire(action: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return value, wire
 
 
+def _model_actions_to_wire(
+    actions: np.ndarray,
+    execute_steps: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert one predicted action chunk and keep its executable prefix.
+
+    The cable checkpoint predicts a sequence of absolute xyz/Euler/gripper
+    actions.  The evaluator executes only the requested prefix before asking
+    the policy for a fresh observation, while preserving the full per-step
+    action stream in the recording.
+    """
+
+    value = np.asarray(actions, dtype=np.float64)
+    if value.ndim == 3 and value.shape[0] == 1:
+        value = value[0]
+    if value.ndim == 1:
+        value = value[None, :]
+    if value.ndim != 2 or value.shape[1] != 7:
+        raise ValueError(
+            f"Expected pi0.5 action chunk shape (T, 7), got {value.shape}"
+        )
+    if value.shape[0] == 0:
+        raise ValueError("pi0.5 returned an empty action chunk")
+    if not np.all(np.isfinite(value)):
+        raise ValueError("pi0.5 action chunk contains non-finite values")
+
+    value = value[:execute_steps]
+    quaternions = Rotation.from_euler("xyz", value[:, 3:6], degrees=False).as_quat(
+        scalar_first=True
+    )
+    wire = np.concatenate((value[:, :3], quaternions, value[:, 6:7]), axis=1)
+    return value, wire
+
+
 def _run_episode(
     *,
     policy,
@@ -140,42 +174,51 @@ def _run_episode(
             response = policy.infer(_observation(env, args.instruction))
             elapsed_ms = 1000.0 * (time.perf_counter() - start)
             inference_ms.append(elapsed_ms)
-            model_action, wire_action = _model_action_to_wire(
-                np.asarray(response["actions"])[0]
+            model_action_chunk, wire_action_chunk = _model_actions_to_wire(
+                np.asarray(response["actions"]),
+                args.execute_steps,
             )
-            adapter.set_model_action(wire_action)
-            actuator_action = adapter.action()
-            _, reward, terminated, truncated, step_info = env.step(actuator_action)
-            diagnostics = adapter.diagnostics()
             model_actions += 1
-            step_count += 1
-            position_clipped.append(bool(diagnostics["position_clipped"]))
-            quaternion_repaired.append(bool(diagnostics["quaternion_repaired"]))
-            recorder.record_step(
-                model_action,
-                reward,
-                terminated,
-                truncated,
-                step_info,
-                extras={
-                    "pose_command": diagnostics["pose_command"],
-                    "wire_action": wire_action,
-                    "inference_ms": np.asarray(elapsed_ms, dtype=np.float64),
-                },
-            )
-            min_target_distance = min(
-                min_target_distance,
-                float(np.linalg.norm(env.target_position() - env.hand_position)),
-            )
-            if previous_model_action is not None:
-                # The metric is kept in the manifest through the recorded action
-                # stream; retaining this variable documents the intended pairing.
-                _ = float(np.linalg.norm(model_action - previous_model_action))
-            previous_model_action = model_action
-            termination_reason = step_info.get("termination_reason")
-            if step_count > int(args.max_steps):
-                truncated = True
-                termination_reason = "pi05_eval_step_guard"
+            for chunk_index, (model_action, wire_action) in enumerate(
+                zip(model_action_chunk, wire_action_chunk, strict=True)
+            ):
+                adapter.set_model_action(wire_action)
+                actuator_action = adapter.action()
+                _, reward, terminated, truncated, step_info = env.step(actuator_action)
+                diagnostics = adapter.diagnostics()
+                step_count += 1
+                position_clipped.append(bool(diagnostics["position_clipped"]))
+                quaternion_repaired.append(bool(diagnostics["quaternion_repaired"]))
+                recorder.record_step(
+                    model_action,
+                    reward,
+                    terminated,
+                    truncated,
+                    step_info,
+                    extras={
+                        "pose_command": diagnostics["pose_command"],
+                        "wire_action": wire_action,
+                        "inference_ms": np.asarray(
+                            elapsed_ms if chunk_index == 0 else np.nan,
+                            dtype=np.float64,
+                        ),
+                    },
+                )
+                min_target_distance = min(
+                    min_target_distance,
+                    float(np.linalg.norm(env.target_position() - env.hand_position)),
+                )
+                if previous_model_action is not None:
+                    # The metric is kept in the manifest through the recorded action
+                    # stream; retaining this variable documents the intended pairing.
+                    _ = float(np.linalg.norm(model_action - previous_model_action))
+                previous_model_action = model_action
+                termination_reason = step_info.get("termination_reason")
+                if step_count > int(args.max_steps):
+                    truncated = True
+                    termination_reason = "pi05_eval_step_guard"
+                if terminated or truncated:
+                    break
 
         info = env.info()
         info["base_success"] = bool(env.ever_success)
@@ -285,6 +328,7 @@ def run(args: argparse.Namespace) -> Path:
             "metadata": metadata,
             "action_format": "absolute_xyz_euler_xyz_gripper_to_xyz_quaternion_wxyz_gripper",
             "delta_action_training_dims": 6,
+            "execute_steps": args.execute_steps,
         },
         "scenarios": [scenario.asdict() for scenario in scenarios],
         "seeds": [args.seed + index for index in range(args.trials)],
@@ -343,6 +387,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument(
+        "--execute-steps",
+        type=int,
+        default=8,
+        help="number of predicted actions to execute before replanning",
+    )
     parser.add_argument("--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda")
     parser.add_argument("--video-fps", type=float, default=DEFAULT_VIDEO_FPS)
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
@@ -354,8 +404,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name")
     args = parser.parse_args()
     args.robot_xml = ROBOT_SPECS[args.robot].xml_path
-    if args.trials < 1 or args.episode_seconds <= 0.0 or args.video_fps <= 0.0 or args.max_steps < 1:
-        parser.error("trials, episode-seconds, video-fps and max-steps must be positive")
+    if (
+        args.trials < 1
+        or args.episode_seconds <= 0.0
+        or args.video_fps <= 0.0
+        or args.max_steps < 1
+        or args.execute_steps < 1
+    ):
+        parser.error(
+            "trials, episode-seconds, video-fps, max-steps and execute-steps "
+            "must be positive"
+        )
     if not args.instruction.strip():
         parser.error("instruction must be non-empty")
     return args
