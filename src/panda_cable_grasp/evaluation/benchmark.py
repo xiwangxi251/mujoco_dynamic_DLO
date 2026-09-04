@@ -369,11 +369,29 @@ def _base_row(
         "max_abs_actual_arm_velocity": json.dumps(
             np.asarray(info.get("max_abs_actual_arm_velocity", [])).tolist()
         ),
+        "max_abs_pre_limit_arm_velocity": json.dumps(
+            np.asarray(info.get("max_abs_pre_limit_arm_velocity", [])).tolist()
+        ),
         "max_actual_hand_linear_speed": float(info.get(
             "max_actual_hand_linear_speed", 0.0
         )),
         "max_actual_hand_angular_speed": float(info.get(
             "max_actual_hand_angular_speed", 0.0
+        )),
+        "max_pre_limit_hand_linear_speed": float(info.get(
+            "max_pre_limit_hand_linear_speed", 0.0
+        )),
+        "max_pre_limit_hand_angular_speed": float(info.get(
+            "max_pre_limit_hand_angular_speed", 0.0
+        )),
+        "physics_velocity_limiter_ratio": float(info.get(
+            "physics_velocity_limiter_ratio", 0.0
+        )),
+        "physics_velocity_fence_ratio": float(info.get(
+            "physics_velocity_fence_ratio", 0.0
+        )),
+        "physics_velocity_fence_dof_steps": int(info.get(
+            "physics_velocity_fence_dof_steps", 0
         )),
     }
     row["task_failure_type"] = classify_task_outcome(

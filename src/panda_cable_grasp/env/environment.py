@@ -703,8 +703,24 @@ class CableGraspEnv:
         self._arm_acceleration_limits = np.asarray(
             self.config.arm_joint_acceleration_limits, dtype=float
         )
+        # The XML position actuators generate the PD force internally.  Keep
+        # their configured force range available so the physics-layer velocity
+        # limiter cannot inject a braking force beyond the robot model's own
+        # actuator capability.
+        actuator_force_limited = np.asarray(
+            self.model.actuator_forcelimited[:7], dtype=bool
+        )
+        actuator_force_range = np.asarray(
+            self.model.actuator_forcerange[:7], dtype=float
+        )
+        actuator_force_max = np.max(np.abs(actuator_force_range), axis=1)
+        self._arm_actuator_force_limits = np.where(
+            actuator_force_limited, actuator_force_max, np.inf
+        )
         self._hand_jacp = np.zeros((3, self.model.nv))
         self._hand_jacr = np.zeros((3, self.model.nv))
+        self._velocity_limit_delta_acceleration = np.zeros(self.model.nv)
+        self._velocity_limit_delta_force = np.zeros(self.model.nv)
         if self.robot_spec.gripper_ctrl_to_aperture is not None:
             self._gripper_ctrl_to_finger_position = (
                 self.robot_spec.gripper_ctrl_to_aperture
@@ -783,9 +799,15 @@ class CableGraspEnv:
         self._physics_steps = 0
         self._velocity_guard_steps = 0
         self._actual_velocity_exceedance_steps = 0
+        self._physics_velocity_limit_steps = 0
+        self._physics_velocity_fence_steps = 0
+        self._physics_velocity_fence_dof_steps = 0
         self._max_abs_actual_arm_velocity = np.zeros(7)
+        self._max_abs_pre_limit_arm_velocity = np.zeros(7)
         self._max_actual_hand_linear_speed = 0.0
         self._max_actual_hand_angular_speed = 0.0
+        self._max_pre_limit_hand_linear_speed = 0.0
+        self._max_pre_limit_hand_angular_speed = 0.0
         self._dynamicvla_camera_renderer: mujoco.Renderer | None = None
         self._dynamicvla_camera_frame_time: float | None = None
         self._dynamicvla_camera_frames: dict[str, np.ndarray] = {}
@@ -931,9 +953,15 @@ class CableGraspEnv:
         self._physics_steps = 0
         self._velocity_guard_steps = 0
         self._actual_velocity_exceedance_steps = 0
+        self._physics_velocity_limit_steps = 0
+        self._physics_velocity_fence_steps = 0
+        self._physics_velocity_fence_dof_steps = 0
         self._max_abs_actual_arm_velocity[:] = 0.0
+        self._max_abs_pre_limit_arm_velocity[:] = 0.0
         self._max_actual_hand_linear_speed = 0.0
         self._max_actual_hand_angular_speed = 0.0
+        self._max_pre_limit_hand_linear_speed = 0.0
+        self._max_pre_limit_hand_angular_speed = 0.0
         self._dynamicvla_camera_frame_time = None
         self._dynamicvla_camera_frames.clear()
         self.trial_index += 1
@@ -971,8 +999,10 @@ class CableGraspEnv:
                 self._velocity_guarded_action(applied_action)
             )
             self.data.ctrl[:] = guarded_action
-            mujoco.mj_step(self.model, self.data)
-            self._record_actual_robot_velocity(velocity_guard_active)
+            pre_limit_qvel = self._physics_step_with_velocity_limit()
+            self._record_actual_robot_velocity(
+                velocity_guard_active, pre_limit_qvel
+            )
 
             # 更新抓取候选
             self._last_contact_count = len(self._finger_contact_pairs())
@@ -1023,55 +1053,45 @@ class CableGraspEnv:
         reward = float(last_qualification) + 5.0 * float(success)
         return self.observation(), reward, success, truncated, info
 
+    def _arm_motion_start_time(self) -> float:
+        """Release arm joint targets one control cycle after rigid motion starts."""
+        if self.config.motion_mode not in {"rigid", "combined"}:
+            return 0.0
+        control_dt = float(
+            self.model.opt.timestep * max(1, self.config.frame_skip)
+        )
+        return RIGID_MOTION_START_TIME + control_dt
+
     def _limit_robot_action(self, requested_action: np.ndarray) -> np.ndarray:
-        """在进入执行器前，按统一的50 Hz周期限制机器人运动命令。"""
+        """Prepare actuator targets; arm speed is limited in the physics step.
+
+        Arm position targets are intentionally not slew-limited here.  A
+        position-target slew rate is only a command-side approximation of the
+        resulting joint speed because the XML position actuator still produces
+        PD force and the dynamics may overshoot.  The actual arm velocity limit
+        is enforced by ``_physics_step_with_velocity_limit`` below.
+        """
 
         control_dt = float(
             self.model.opt.timestep * max(1, self.config.frame_skip)
+        )
+        arm_motion_start_time = self._arm_motion_start_time()
+        arm_motion_delayed = self.data.time < arm_motion_start_time
+        arm_command = (
+            self.ready_ctrl[:7]
+            if arm_motion_delayed
+            else requested_action[:7]
         )
         previous_position_target = self._last_applied_action[:7]
         requested_velocity = (
             requested_action[:7] - previous_position_target
         ) / control_dt
-
-        if self.config.arm_acceleration_limit_enabled:
-            velocity_delta = (
-                requested_velocity - self._previous_arm_command_velocity
-            )
-            allowed_delta = self._arm_acceleration_limits * control_dt
-            acceleration_scale = min(
-                1.0,
-                float(np.min(
-                    allowed_delta / np.maximum(np.abs(velocity_delta), 1e-12)
-                )),
-            )
-            acceleration_limited_velocity = (
-                self._previous_arm_command_velocity
-                + acceleration_scale * velocity_delta
-            )
-            acceleration_limited = not np.allclose(
-                acceleration_limited_velocity, requested_velocity,
-                rtol=0.0, atol=1e-12,
-            )
-        else:
-            acceleration_limited_velocity = requested_velocity
-            acceleration_limited = False
-
-        joint_velocity_scale = min(
-            1.0,
-            float(np.min(
-                self._arm_velocity_limits
-                / np.maximum(np.abs(acceleration_limited_velocity), 1e-12)
-            )),
-        )
-        joint_limited_velocity = (
-            acceleration_limited_velocity * joint_velocity_scale
-        )
-        joint_velocity_limited = joint_velocity_scale < 1.0 - 1e-12
+        acceleration_limited = False
+        joint_velocity_limited = False
 
         joint_range = self.model.jnt_range[self.arm_joint_ids]
         position_target = np.clip(
-            previous_position_target + joint_limited_velocity * control_dt,
+            arm_command,
             joint_range[:, 0], joint_range[:, 1],
         )
         bounded_velocity = (
@@ -1130,8 +1150,10 @@ class CableGraspEnv:
             jacr[:, self.arm_dof_adr] @ applied_velocity
         )
         flags = {
-            "acceleration": acceleration_limited,
-            "joint_velocity": joint_velocity_limited,
+            # Arm speed and acceleration are no longer command-side flags.
+            # Their actual physics-layer diagnostics are recorded per substep.
+            "acceleration": False,
+            "joint_velocity": False,
             "cartesian_velocity": cartesian_velocity_limited,
             "gripper_velocity": gripper_velocity_limited,
         }
@@ -1162,27 +1184,16 @@ class CableGraspEnv:
     def _velocity_guarded_action(
         self, applied_action: np.ndarray,
     ) -> tuple[np.ndarray, bool]:
-        """关节接近速度上限后停止同向驱动。
+        """Apply the optional Cartesian command guard.
 
-        这里只改变执行器目标，由原有PD阻尼和力矩上限制动；不直接裁剪
-        ``data.qvel``或其他物理状态。
+        Arm joint speed protection is handled after the XML PD actuator has
+        produced its force, in ``_physics_step_with_velocity_limit``.  This
+        method only keeps the older Cartesian command guard, which is a
+        conservative target hold and not the joint-speed safety mechanism.
         """
 
         guarded_action = applied_action.copy()
         current_qpos = self.data.qpos[self.arm_qpos_adr]
-        current_qvel = self.data.qvel[self.arm_dof_adr]
-        guard_limits = (
-            self.config.low_level_velocity_guard_fraction
-            * self._arm_velocity_limits
-        )
-        positive = (
-            current_qvel >= guard_limits
-        ) & (guarded_action[:7] > current_qpos)
-        negative = (
-            current_qvel <= -guard_limits
-        ) & (guarded_action[:7] < current_qpos)
-        active = positive | negative
-        guarded_action[:7][active] = current_qpos[active]
 
         # Joint-wise limits do not guarantee a Cartesian angular-speed limit:
         # several sub-limit joint velocities can add constructively through the
@@ -1205,27 +1216,135 @@ class CableGraspEnv:
         )
         if cartesian_guard_active:
             guarded_action[:7] = current_qpos
-        return guarded_action, bool(np.any(active) or cartesian_guard_active)
+        return guarded_action, cartesian_guard_active
 
-    def _record_actual_robot_velocity(self, velocity_guard_active: bool) -> None:
+    def _physics_step_with_velocity_limit(self) -> np.ndarray:
+        """Advance one physics step with an actuator-level arm speed guard.
+
+        ``data.ctrl`` is a position target for the XML PD actuator.  We first
+        run a forward dynamics pass to obtain the PD actuator force and the
+        unconstrained acceleration.  If a one-physics-step velocity prediction
+        crosses a configured joint limit, a compensating generalized force is
+        applied before ``mj_step`` integrates the state.  The correction is
+        bounded by the actuator force range.  A post-step fence remains as a
+        last-resort numerical safety measure for residual solver/integration
+        overshoot; its pre-fence velocity is retained for diagnostics.
+        """
+
+        physics_dt = float(self.model.opt.timestep)
+        arm_dof = self.arm_dof_adr
+        base_qfrc_applied = self.data.qfrc_applied[arm_dof].copy()
+
+        # Compute the PD actuator force and the current constrained dynamics
+        # without advancing time.  Unlike target slew limiting, this observes
+        # the actual qvel and the force that will enter the physics step.
+        mujoco.mj_forward(self.model, self.data)
+        current_qvel = self.data.qvel.copy()
+        current_qacc = self.data.qacc.copy()
+        predicted_qvel = (
+            current_qvel[arm_dof] + physics_dt * current_qacc[arm_dof]
+        )
+        current_arm_qvel = current_qvel[arm_dof]
+        velocity_limit = self._arm_velocity_limits
+        needs_physics_limit = (
+            (np.abs(current_arm_qvel) > velocity_limit + 1e-12)
+            | (np.abs(predicted_qvel) > velocity_limit + 1e-12)
+        )
+
+        correction = np.zeros(self.model.nv)
+        if np.any(needs_physics_limit):
+            desired_qacc = current_qacc.copy()
+            desired_next_qvel = np.clip(
+                predicted_qvel, -velocity_limit, velocity_limit
+            )
+            desired_qacc[arm_dof[needs_physics_limit]] = (
+                desired_next_qvel[needs_physics_limit]
+                - current_arm_qvel[needs_physics_limit]
+            ) / physics_dt
+            self._velocity_limit_delta_acceleration[:] = (
+                desired_qacc - current_qacc
+            )
+            mujoco.mj_mulM(
+                self.model,
+                self.data,
+                self._velocity_limit_delta_force,
+                self._velocity_limit_delta_acceleration,
+            )
+            pd_force = self.data.qfrc_actuator[arm_dof].copy()
+            raw_correction = self._velocity_limit_delta_force[arm_dof]
+            # NERO's XML uses one unit gear for its arm joints.  Limiting the
+            # resulting generalized force to the actuator range prevents the
+            # guard from adding a stronger-than-modelled brake.
+            correction[arm_dof] = np.clip(
+                raw_correction,
+                -self._arm_actuator_force_limits - pd_force,
+                self._arm_actuator_force_limits - pd_force,
+            )
+            self._physics_velocity_limit_steps += 1
+
+        self.data.qfrc_applied[arm_dof] = (
+            base_qfrc_applied + correction[arm_dof]
+        )
+        try:
+            mujoco.mj_step(self.model, self.data)
+        finally:
+            self.data.qfrc_applied[arm_dof] = base_qfrc_applied
+
+        pre_limit_qvel = self.data.qvel.copy()
+        pre_limit_arm_qvel = pre_limit_qvel[arm_dof]
+        over_limit = np.abs(pre_limit_arm_qvel) > velocity_limit + 1e-12
+        if np.any(over_limit):
+            self.data.qvel[arm_dof] = np.clip(
+                pre_limit_arm_qvel, -velocity_limit, velocity_limit
+            )
+            self._physics_velocity_fence_steps += 1
+            self._physics_velocity_fence_dof_steps += int(
+                np.count_nonzero(over_limit)
+            )
+            # Refresh derived kinematics after the safety fence so the next
+            # substep starts from a self-consistent qpos/qvel state.
+            mujoco.mj_forward(self.model, self.data)
+        return pre_limit_qvel
+
+    def _record_actual_robot_velocity(
+        self,
+        velocity_guard_active: bool,
+        pre_limit_qvel: np.ndarray | None = None,
+    ) -> None:
+        pre_limit_qvel = (
+            self.data.qvel.copy() if pre_limit_qvel is None else pre_limit_qvel
+        )
+        pre_limit_arm_velocity = pre_limit_qvel[self.arm_dof_adr]
         actual_arm_velocity = self.data.qvel[self.arm_dof_adr]
         jacp, jacr = self._hand_jacobian()
+        pre_limit_linear_speed = float(np.linalg.norm(jacp @ pre_limit_qvel))
+        pre_limit_angular_speed = float(np.linalg.norm(jacr @ pre_limit_qvel))
         actual_linear_speed = float(np.linalg.norm(jacp @ self.data.qvel))
         actual_angular_speed = float(np.linalg.norm(jacr @ self.data.qvel))
         self._physics_steps += 1
         self._velocity_guard_steps += int(velocity_guard_active)
         self._actual_velocity_exceedance_steps += int(np.any(
-            np.abs(actual_arm_velocity) > 1.05 * self._arm_velocity_limits
+            np.abs(pre_limit_arm_velocity) > self._arm_velocity_limits + 1e-12
         ))
         self._max_abs_actual_arm_velocity[:] = np.maximum(
             self._max_abs_actual_arm_velocity,
             np.abs(actual_arm_velocity),
+        )
+        self._max_abs_pre_limit_arm_velocity[:] = np.maximum(
+            self._max_abs_pre_limit_arm_velocity,
+            np.abs(pre_limit_arm_velocity),
         )
         self._max_actual_hand_linear_speed = max(
             self._max_actual_hand_linear_speed, actual_linear_speed
         )
         self._max_actual_hand_angular_speed = max(
             self._max_actual_hand_angular_speed, actual_angular_speed
+        )
+        self._max_pre_limit_hand_linear_speed = max(
+            self._max_pre_limit_hand_linear_speed, pre_limit_linear_speed
+        )
+        self._max_pre_limit_hand_angular_speed = max(
+            self._max_pre_limit_hand_angular_speed, pre_limit_angular_speed
         )
 
     # -------------------------------------------------------------------------
@@ -1325,6 +1444,7 @@ class CableGraspEnv:
         physics_step_denominator = max(1, self._physics_steps)
         rms = lambda values: float(np.sqrt(np.mean(np.square(values))))
         uses_rigid_motion = self.config.motion_profile_version in RIGID_MOTION_PROFILES
+        arm_motion_start_time = self._arm_motion_start_time()
         return {
             "trial": self.trial_index,
             "episode_seed": self.episode_seed,
@@ -1350,6 +1470,10 @@ class CableGraspEnv:
             ),
             "rigid_motion_control": (
                 "actual_progress_velocity_v1" if uses_rigid_motion else None
+            ),
+            "arm_motion_start_time": arm_motion_start_time,
+            "arm_motion_delayed": bool(
+                self.data.time < arm_motion_start_time
             ),
             "rigid_path_position_gain": self.config.rigid_path_position_gain,
             "rigid_velocity_gain": self.config.rigid_velocity_gain,
@@ -1420,11 +1544,20 @@ class CableGraspEnv:
             "max_abs_actual_arm_velocity": (
                 self._max_abs_actual_arm_velocity.copy()
             ),
+            "max_abs_pre_limit_arm_velocity": (
+                self._max_abs_pre_limit_arm_velocity.copy()
+            ),
             "max_actual_hand_linear_speed": (
                 self._max_actual_hand_linear_speed
             ),
             "max_actual_hand_angular_speed": (
                 self._max_actual_hand_angular_speed
+            ),
+            "max_pre_limit_hand_linear_speed": (
+                self._max_pre_limit_hand_linear_speed
+            ),
+            "max_pre_limit_hand_angular_speed": (
+                self._max_pre_limit_hand_angular_speed
             ),
             "motion_limit_active": any(self._last_motion_limit_flags.values()),
             "motion_limit_flags": self._last_motion_limit_flags.copy(),
@@ -1449,6 +1582,17 @@ class CableGraspEnv:
             "actual_joint_velocity_exceedance_ratio": (
                 self._actual_velocity_exceedance_steps
                 / physics_step_denominator
+            ),
+            "physics_velocity_limiter_ratio": (
+                self._physics_velocity_limit_steps
+                / physics_step_denominator
+            ),
+            "physics_velocity_fence_ratio": (
+                self._physics_velocity_fence_steps
+                / physics_step_denominator
+            ),
+            "physics_velocity_fence_dof_steps": (
+                self._physics_velocity_fence_dof_steps
             ),
             "shape_acceleration_rms": rms(self._last_shape_acceleration),
             "rigid_translation_acceleration_rms": rms(

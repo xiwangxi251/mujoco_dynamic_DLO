@@ -233,20 +233,19 @@ class EnvironmentScenarioTests(unittest.TestCase):
             requested[7] = 0.0
             _, _, _, _, info = env.step(requested)
 
-            control_dt = env.model.opt.timestep * env.config.frame_skip
-            applied_velocity = info["applied_arm_velocity"]
+            actual_velocity = np.asarray(info["max_abs_actual_arm_velocity"])
             self.assertTrue(np.all(
-                np.abs(applied_velocity)
+                actual_velocity
                 <= np.asarray(env.config.arm_joint_velocity_limits) + 1e-12
             ))
             self.assertFalse(env.config.arm_acceleration_limit_enabled)
             self.assertTrue(np.allclose(
-                info["applied_action"][:7],
-                observation["arm_qpos"] + applied_velocity * control_dt,
+                info["applied_action"][:7], requested[:7],
                 rtol=0.0,
                 atol=1e-12,
             ))
             self.assertFalse(env.config.hand_cartesian_velocity_limit_enabled)
+            control_dt = env.model.opt.timestep * env.config.frame_skip
             finger_target_change = (
                 255.0 - info["applied_action"][7]
             ) * env._gripper_ctrl_to_finger_position
@@ -256,7 +255,41 @@ class EnvironmentScenarioTests(unittest.TestCase):
             )
             self.assertTrue(info["motion_limit_active"])
             self.assertFalse(info["motion_limit_flags"]["acceleration"])
+            self.assertFalse(info["motion_limit_flags"]["joint_velocity"])
             self.assertTrue(info["motion_limit_flags"]["gripper_velocity"])
+        finally:
+            del env
+
+    def test_rigid_motion_releases_arm_after_one_control_cycle(self) -> None:
+        scenario = get_scenario("id_combined_l1_nominal")
+        env = CableGraspEnv(EnvConfig(
+            robot="nero",
+            seed=1005,
+            episode_seconds=0.1,
+            **scenario.to_env_overrides(),
+        ))
+        try:
+            env.reset(randomize=False, seed=1005)
+            requested = env.ready_ctrl.copy()
+            requested[0] += 0.20
+            control_dt = env.model.opt.timestep * env.config.frame_skip
+
+            held = env._limit_robot_action(requested)
+            self.assertTrue(np.allclose(
+                held[:7], env.ready_ctrl[:7], rtol=0.0, atol=1e-12
+            ))
+            self.assertTrue(env.info()["arm_motion_delayed"])
+
+            env.data.time = RIGID_MOTION_START_TIME + 0.5 * control_dt
+            held = env._limit_robot_action(requested)
+            self.assertTrue(np.allclose(
+                held[:7], env.ready_ctrl[:7], rtol=0.0, atol=1e-12
+            ))
+
+            env.data.time = RIGID_MOTION_START_TIME + control_dt
+            released = env._limit_robot_action(requested)
+            self.assertGreater(released[0], env.ready_ctrl[0])
+            self.assertFalse(env.info()["arm_motion_delayed"])
         finally:
             del env
 
@@ -312,22 +345,28 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_low_level_guard_brakes_without_clipping_state_velocity(self) -> None:
-        env = self.make("id_static")
+    def test_physics_velocity_limit_fences_actual_state(self) -> None:
+        scenario = get_scenario("id_static")
+        env = CableGraspEnv(EnvConfig(
+            robot="nero",
+            seed=1006,
+            episode_seconds=0.1,
+            **scenario.to_env_overrides(),
+        ))
         try:
             env.reset(randomize=False, seed=1006)
-            action = env.ready_ctrl.copy()
-            action[0] += 0.2
-            original_velocity = 1.1 * env._arm_velocity_limits[0]
-            env.data.qvel[env.arm_dof_adr[0]] = original_velocity
-            guarded, active = env._velocity_guarded_action(action)
-            self.assertTrue(active)
-            self.assertEqual(
-                guarded[0], env.data.qpos[env.arm_qpos_adr[0]]
-            )
-            self.assertEqual(
-                env.data.qvel[env.arm_dof_adr[0]], original_velocity
-            )
+            action = env.model.actuator_ctrlrange[:, 1].copy()
+            _, _, _, _, info = env.step(action)
+            self.assertTrue(np.all(
+                np.asarray(info["max_abs_actual_arm_velocity"])
+                <= np.asarray(env.config.arm_joint_velocity_limits) + 1e-12
+            ))
+            self.assertGreater(info["physics_velocity_limiter_ratio"], 0.0)
+            self.assertGreater(info["physics_velocity_fence_ratio"], 0.0)
+            self.assertTrue(np.any(
+                np.asarray(info["max_abs_pre_limit_arm_velocity"])
+                > np.asarray(info["max_abs_actual_arm_velocity"]) + 1e-12
+            ))
         finally:
             del env
 
