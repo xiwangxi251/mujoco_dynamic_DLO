@@ -234,7 +234,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         # The wrapper converts task-space actions to joint targets, while the
         # shared environment remains the final authority on robot capability.
-        self.base_env.config.hand_cartesian_velocity_limit_enabled = True
+        # Keep the historical joint-speed command limit as the only arm speed
+        # guard for this configuration; do not add the newer Cartesian cap.
+        self.base_env.config.hand_cartesian_velocity_limit_enabled = False
         self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(5,), dtype=np.float32)
         self.observation_space = gym.spaces.Box(
             -10.0, 10.0, shape=(len(self.OBSERVATION_NAMES),), dtype=np.float32

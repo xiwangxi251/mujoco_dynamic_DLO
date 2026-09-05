@@ -100,7 +100,9 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         if os.environ.get("PANDA_CABLE_GRASP_DISABLE_SHADOW", "").lower() \
                 in {"1", "true", "yes", "on"}:
             self.expert_config = replace(
-                self.expert_config, shadow_rollout_enabled=False,
+                self.expert_config,
+                shadow_rollout_enabled=False,
+                dynamic_portfolio_enabled=False,
             )
         self.expert_segment_index = 0
         self.expert_segment_alpha = 0.5
