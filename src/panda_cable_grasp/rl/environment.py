@@ -278,6 +278,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._secured_rewarded = False
         self._lift_credit_high_water = 0.0
         self._cable_lift_credit_high_water = 0.0
+        # Reversible shaping state: upward motion is positive, downward motion
+        # is negative. The high-water values remain diagnostics only.
+        self._lift_credit_previous = 0.0
+        self._cable_lift_credit_previous = 0.0
         self._secured_session_active = False
         self._last_grasp_break_key: tuple[float, str] | None = None
         self._active_open_after_secured_event = False
@@ -1037,19 +1041,21 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._pinch_rewarded = self._pinch_rewarded or pinch_confirmed
         self._secured_rewarded = self._secured_rewarded or secured_grasp
 
-        # 两种抬升奖励都只发放整回合首次达到的新高度，并在安全任务范围封顶。
-        # 因而掉落、重抓、再次抬到旧高度不会重复获得正奖励。
+        # 抬升塑形使用可逆势能：上升给正奖励，下降给对称负奖励。
+        # high-water 仍保留为诊断指标，不能单独作为奖励基准。
         capped_lift = float(np.clip(
             float(grasp_status["grasp_lift_delta"]),
             0.0,
             self.rl_config.lift_credit_cap,
         ))
-        previous_lift_high_water = self._lift_credit_high_water
+        previous_lift_credit = self._lift_credit_previous
+        current_lift_credit = capped_lift if pinch_confirmed else 0.0
+        lift_progress = current_lift_credit - previous_lift_credit
+        self._lift_credit_previous = current_lift_credit
         if pinch_confirmed:
             self._lift_credit_high_water = max(
                 self._lift_credit_high_water, capped_lift
             )
-        lift_progress = self._lift_credit_high_water - previous_lift_high_water
 
         lifted_fraction = float(info["lifted_fraction"])
         capped_lifted_fraction = float(np.clip(
@@ -1057,16 +1063,17 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             0.0,
             self.rl_config.cable_lift_credit_cap,
         ))
-        previous_cable_high_water = self._cable_lift_credit_high_water
+        previous_cable_credit = self._cable_lift_credit_previous
         # 未夹持时也推进基准但不发奖励，防止把扰动造成的自然抬升归功于策略。
         self._cable_lift_credit_high_water = max(
             self._cable_lift_credit_high_water, capped_lifted_fraction
         )
         cable_lift_progress = (
-            self._cable_lift_credit_high_water - previous_cable_high_water
+            capped_lifted_fraction - previous_cable_credit
             if pinch_confirmed
             else 0.0
         )
+        self._cable_lift_credit_previous = capped_lifted_fraction
 
         active_open, physical_slip, _ = (
             self._classify_secured_grasp_break()
@@ -1218,6 +1225,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             0.0,
             self.rl_config.cable_lift_credit_cap,
         ))
+        self._lift_credit_previous = 0.0
+        self._cable_lift_credit_previous = self._cable_lift_credit_high_water
         self._secured_session_active = False
         self._last_grasp_break_key = None
         self._active_open_after_secured_event = False

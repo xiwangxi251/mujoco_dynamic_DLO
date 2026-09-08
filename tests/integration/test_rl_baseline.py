@@ -210,6 +210,37 @@ class RLBaselineContractTests(unittest.TestCase):
         self.assertEqual(components["reward_reach_progress"], 0.0)
         self.assertEqual(components["reward_alignment_progress"], 0.0)
 
+    def test_lift_shaping_penalizes_downward_motion_and_cannot_be_farmed(self) -> None:
+        self.env.reset(seed=31)
+        grasp_status = {
+            "pinch_confirmed": True,
+            "secured_grasp": False,
+            "grasp_lift_delta": 0.04,
+            "strict_success_hold": 0.0,
+        }
+        _, rising = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+
+        grasp_status["grasp_lift_delta"] = 0.01
+        _, falling = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+
+        grasp_status["grasp_lift_delta"] = 0.04
+        _, rising_again = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+
+        self.assertGreater(rising["reward_lift_progress"], 0.0)
+        self.assertLess(falling["reward_lift_progress"], 0.0)
+        self.assertAlmostEqual(
+            rising["reward_lift_progress"]
+            + falling["reward_lift_progress"]
+            + rising_again["reward_lift_progress"],
+            rising["reward_lift_progress"],
+        )
+
     def test_aligned_pinch_reward_only_fires_on_pinch_transition(self) -> None:
         self.env.reset(seed=27)
         self.env._alignment_terms = lambda distance, tangent: (1.0, 1.0)
