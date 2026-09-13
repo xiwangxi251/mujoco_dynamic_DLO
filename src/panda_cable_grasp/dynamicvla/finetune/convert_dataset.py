@@ -1,9 +1,9 @@
 """Convert privileged-expert trajectories to DynamicVLA's LeRobot v2.1 format.
 
-The collector stores joint-space commands because that is the native MuJoCo
-environment interface.  DynamicVLA is trained in task space, so this converter
-uses the saved ``scenario.mjb`` model to run forward kinematics for every
-command and produces ``xyz + Euler(xyz) + gripper(-1/+1)`` labels.
+Schema-v3 trajectories contain the expert's original task-space target before
+the expert's hierarchical velocity IK.  Those targets are the labels for a
+task-space learner.  Schema-v2 trajectories remain readable through the FK
+fallback for backwards compatibility, but are explicitly marked as such.
 """
 
 from __future__ import annotations
@@ -340,9 +340,53 @@ def _episode_arrays(
         model_path = source.trajectory.parent / _scalar_string(data["model_file"])
         opst_path = source.trajectory.parent / _scalar_string(data["opst_video_file"])
         wrist_path = source.trajectory.parent / _scalar_string(data["wrist_video_file"])
+        taskspace_keys = {
+            "expert_desired_positions",
+            "expert_desired_quaternions",
+        }
+        taskspace_present = taskspace_keys.intersection(data.files)
+        if taskspace_present and taskspace_present != taskspace_keys:
+            raise ValueError(
+                f"incomplete expert task-space labels in {source.trajectory}: "
+                f"found {sorted(taskspace_present)}"
+            )
+        if taskspace_present == taskspace_keys:
+            expert_positions = np.asarray(
+                data["expert_desired_positions"], dtype=np.float64
+            )
+            expert_quaternions = np.asarray(
+                data["expert_desired_quaternions"], dtype=np.float64
+            )
+            if expert_positions.shape != (len(times), 3):
+                raise ValueError(
+                    f"expert_desired_positions has invalid shape "
+                    f"{expert_positions.shape} in {source.trajectory}"
+                )
+            if expert_quaternions.shape != (len(times), 4):
+                raise ValueError(
+                    f"expert_desired_quaternions has invalid shape "
+                    f"{expert_quaternions.shape} in {source.trajectory}"
+                )
+            if not (
+                np.all(np.isfinite(expert_positions))
+                and np.all(np.isfinite(expert_quaternions))
+            ):
+                raise ValueError(
+                    f"expert task-space labels contain non-finite values in "
+                    f"{source.trajectory}"
+                )
+        else:
+            expert_positions = None
+            expert_quaternions = None
 
     fk = JointTargetForwardKinematics(model_path)
-    action_position, action_quaternion = fk.poses(command[selected, :7])
+    if expert_positions is not None and expert_quaternions is not None:
+        action_position = expert_positions[selected].astype(np.float32)
+        action_quaternion = expert_quaternions[selected].astype(np.float32)
+        action_target_source = "expert_internal_taskspace"
+    else:
+        action_position, action_quaternion = fk.poses(command[selected, :7])
+        action_target_source = "fk_joint_target_fallback"
     action_rotation = _wxyz_to_euler_xyz(action_quaternion)
     threshold = (
         float(gripper_threshold)
@@ -372,6 +416,7 @@ def _episode_arrays(
         "converted_frames": int(len(selected)),
         "source_fps": float(1.0 / np.median(np.diff(times))) if len(times) > 1 else None,
         "robot": fk.robot,
+        "action_target_source": action_target_source,
         "gripper_threshold": threshold,
     }
     return arrays, opst, wrist, metadata
@@ -507,13 +552,22 @@ def main() -> None:
             flush=True,
         )
 
+    action_target_sources = sorted({
+        str(row["action_target_source"]) for row in conversion_rows
+    })
+    if len(action_target_sources) != 1:
+        raise ValueError(
+            "mixed action target sources are not allowed in one converted dataset: "
+            f"{action_target_sources}"
+        )
     manifest = {
         "schema_version": 1,
-        "source_format": "privileged_expert_schema_v2",
+        "source_format": "privileged_expert_schema_v3",
         "dataset_format": "lerobot_v2.1",
         "repo_id": args.repo_id,
         "target_fps": args.target_fps,
         "joint_target_source": args.joint_target_source,
+        "action_target_source": action_target_sources[0],
         "action_format": "absolute_xyz_euler_xyz_gripper_minus1_plus1",
         "state_format": "absolute_xyz_euler_xyz",
         "task_metadata": TASK_METADATA,

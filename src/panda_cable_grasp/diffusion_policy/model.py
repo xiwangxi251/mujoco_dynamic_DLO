@@ -15,8 +15,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import models as vision_models
-
 from .config import DiffusionPolicyConfig
 
 
@@ -79,6 +77,10 @@ class ResNet18SpatialSoftmaxEncoder(nn.Module):
 
     def __init__(self, config: DiffusionPolicyConfig) -> None:
         super().__init__()
+        # Keep low-dimensional DP usable in the lightweight training venv;
+        # torchvision is only required when constructing the visual encoder.
+        from torchvision import models as vision_models
+
         network = vision_models.resnet18(weights=None)
         _replace_batchnorm_with_groupnorm(network)
         self.backbone = nn.Sequential(*list(network.children())[:-2])
@@ -347,17 +349,84 @@ class ConditionalUnet1D(nn.Module):
         return self.final_conv(value).moveaxis(-1, -2)
 
 
+class _FallbackDDPMScheduler:
+    """Small torch-only subset of diffusers' DDPM scheduler.
+
+    The low-dimensional policy only needs the squared-cosine training noise
+    schedule and epsilon-prediction step.  Keeping this fallback here avoids
+    installing the visual-policy dependency in the existing training venv.
+    """
+
+    def __init__(self, *, num_train_timesteps: int, beta_schedule: str,
+                 clip_sample: bool, prediction_type: str) -> None:
+        if beta_schedule != "squaredcos_cap_v2" or prediction_type != "epsilon":
+            raise ValueError("fallback scheduler only supports squaredcos_cap_v2 epsilon DDPM")
+        self.num_train_timesteps = int(num_train_timesteps)
+        self.clip_sample = bool(clip_sample)
+        steps = self.num_train_timesteps
+        alpha_bar = lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
+        betas = [
+            min(1.0 - alpha_bar((index + 1) / steps) / alpha_bar(index / steps), 0.999)
+            for index in range(steps)
+        ]
+        self.betas = torch.tensor(betas, dtype=torch.float32)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.timesteps = torch.arange(steps - 1, -1, -1, dtype=torch.long)
+
+    def add_noise(self, clean: torch.Tensor, noise: torch.Tensor,
+                  timestep: torch.Tensor) -> torch.Tensor:
+        alpha = self.alphas_cumprod.to(clean.device)[timestep.long()]
+        shape = (alpha.shape[0],) + (1,) * (clean.ndim - 1)
+        return alpha.reshape(shape).sqrt() * clean + (1.0 - alpha).reshape(shape).sqrt() * noise
+
+    def set_timesteps(self, steps: int, device=None) -> None:
+        if steps < 1 or steps > self.num_train_timesteps:
+            raise ValueError("invalid inference step count")
+        values = torch.linspace(
+            self.num_train_timesteps - 1, 0, int(steps), dtype=torch.float32
+        ).round().long()
+        self.timesteps = values.to(device=device) if device is not None else values
+
+    def step(self, *, model_output: torch.Tensor, timestep: torch.Tensor | int,
+             sample: torch.Tensor, generator: torch.Generator | None = None):
+        t = int(timestep.item()) if torch.is_tensor(timestep) else int(timestep)
+        index = int((self.timesteps == t).nonzero(as_tuple=False)[0].item())
+        previous_t = int(self.timesteps[index + 1].item()) if index + 1 < len(self.timesteps) else -1
+        alpha_t = self.alphas_cumprod[t].to(sample.device)
+        alpha_previous = (
+            self.alphas_cumprod[previous_t].to(sample.device)
+            if previous_t >= 0 else torch.ones((), device=sample.device)
+        )
+        beta_t = 1.0 - alpha_t
+        beta_previous = 1.0 - alpha_previous
+        predicted = (sample - beta_t.sqrt() * model_output) / alpha_t.sqrt()
+        if self.clip_sample:
+            predicted = predicted.clamp(-1.0, 1.0)
+        current_beta = 1.0 - alpha_t / alpha_previous
+        coeff_original = alpha_previous.sqrt() * current_beta / beta_t
+        coeff_sample = alpha_t.sqrt() * beta_previous / beta_t
+        variance = (beta_previous / beta_t * current_beta).clamp(min=0.0)
+        previous = coeff_original * predicted + coeff_sample * sample
+        if t > 0 and float(variance) > 0.0:
+            noise = torch.randn(sample.shape, device=sample.device, generator=generator)
+            previous = previous + variance.sqrt() * noise
+
+        class Result:
+            pass
+        result = Result()
+        result.prev_sample = previous
+        return result
+
+
 class DDPMSchedule:
-    """Diffusers DDPM schedule used for both training and sampling."""
+    """Diffusers-compatible DDPM schedule with a local torch fallback."""
 
     def __init__(self, config: DiffusionPolicyConfig) -> None:
         try:
             from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-        except ImportError as error:
-            raise RuntimeError(
-                "Diffusion Policy requires diffusers; install with "
-                "`python -m pip install -e \".[diffusion]\"`"
-            ) from error
+        except ImportError:
+            DDPMScheduler = _FallbackDDPMScheduler
         kwargs = {
             "num_train_timesteps": config.diffusion_steps,
             "beta_schedule": config.beta_schedule,

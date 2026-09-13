@@ -14,11 +14,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate low-dimensional Diffusion Policy")
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--scenario", choices=list_scenario_names(), required=True)
+    parser.add_argument("--robot", choices=("panda", "nero"), default="nero")
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument("--seed", type=int, default=20280804)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument("--video-fps", type=float, default=25.0)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--inference-steps",
+        type=int,
+        help="Override checkpoint inference steps for evaluation only",
+    )
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -28,6 +34,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"checkpoint not found: {args.model}")
     if args.trials < 1 or args.episode_seconds <= 0.0 or args.video_fps <= 0.0:
         parser.error("trials, episode duration, and video FPS must be positive")
+    if args.inference_steps is not None and args.inference_steps < 1:
+        parser.error("--inference-steps must be positive")
     return args
 
 
@@ -43,11 +51,13 @@ def run(args: argparse.Namespace) -> Path:
 
     scenario = get_scenario(args.scenario)
     config = env_config_for_scenario(
-        scenario, seed=args.seed, episode_seconds=args.episode_seconds
+        scenario, seed=args.seed, episode_seconds=args.episode_seconds,
+        robot=args.robot,
     )
     config = EnvConfig(
         **{
             **vars(config),
+            "target_selection": "middle",
             "frame_skip": 20,
             "dynamicvla_cameras_enabled": bool(args.record_video),
         }
@@ -61,7 +71,11 @@ def run(args: argparse.Namespace) -> Path:
     rows: list[dict] = []
     try:
         policy = LowDimPolicyRunner(
-            env, args.model, device=args.device, deterministic=args.deterministic
+            env,
+            args.model,
+            device=args.device,
+            deterministic=args.deterministic,
+            inference_steps=args.inference_steps,
         )
         for trial_offset in range(args.trials):
             seed = args.seed + trial_offset
@@ -118,6 +132,7 @@ def run(args: argparse.Namespace) -> Path:
                 "terminated": bool(terminated),
                 "truncated": bool(truncated),
                 "diffusion_policy_model": str(args.model.expanduser().resolve()),
+                "diffusion_inference_steps": policy.config.inference_steps,
                 **policy.policy_info(),
             })
             if recorder is not None:
@@ -154,8 +169,16 @@ def run(args: argparse.Namespace) -> Path:
             "resolution": [480, 360],
             "fps": args.video_fps,
         } if args.record_video else None,
-        "state_input": "ee_xyz_euler_gripper + 16 DLO keypoints relative to EE + relative target",
-        "action": "absolute_xyz_euler_xyz_gripper_through_dynamicvla_ik",
+        "state_input": (
+            "ee_xyz_euler (6D DynamicVLA state)"
+            if policy.config.observation_dim == 6
+            else "ee_xyz_euler_gripper + 16 DLO keypoints relative to EE + relative target"
+        ),
+        "action": "pi05_delta_xyz_euler_plus_absolute_gripper_then_dynamicvla_ik",
+        "action_target": policy.policy_info()["action_target"],
+        "action_normalization": policy.policy_info()["action_normalization"],
+        "observation_pose_normalization": policy.policy_info()["observation_pose_normalization"],
+        "inference_steps": policy.config.inference_steps,
         "episodes_csv": str(episodes_path.relative_to(run_dir)),
         "summary": str(summary_path.relative_to(run_dir)),
     }

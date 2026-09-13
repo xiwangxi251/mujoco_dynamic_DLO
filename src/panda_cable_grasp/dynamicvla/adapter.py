@@ -33,6 +33,15 @@ class DynamicVLAAdapterConfig:
     orientation_damping_max: float = 0.16
     ik_target_horizon: float = 0.11
     nullspace_gain: float = 0.8
+    # The NERO expert labels are the task-space target before its own
+    # hierarchical velocity IK.  Use the same velocity-style adapter when
+    # replaying or evaluating a policy trained on those labels.  The pose-IK
+    # path remains available for older FK-derived checkpoints.
+    nero_pose_ik_enabled: bool = True
+    pose_ik_iterations: int = 20
+    pose_ik_damping: float = 0.025
+    pose_ik_orientation_weight: float = 1.0
+    pose_ik_max_joint_step: float = 0.25
     gripper_threshold: float = 0.0
     # ``None`` means use the selected robot's native actuator range.  Explicit
     # values remain available for reproducing older Panda experiments.

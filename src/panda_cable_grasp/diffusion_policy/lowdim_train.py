@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 import random
 import shutil
@@ -39,9 +40,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--action-cache", type=Path, required=True)
+    parser.add_argument(
+        "--action-cache", type=Path,
+        help="LeRobot action cache for raw privileged NPZ input; not needed for NERO success-prefix input",
+    )
     parser.add_argument("--action-source", choices=("requested", "applied"), default="requested")
+    parser.add_argument(
+        "--feature-cache", type=Path,
+        help="Optional cache of replayed NERO privileged features (*.npz, keyed by episode_index)",
+    )
+    parser.add_argument("--rotation-format", choices=("euler", "rotvec"), default="euler")
     parser.add_argument("--variant", choices=("p0", "h2", "h7"), default="h2")
+    parser.add_argument(
+        "--state-input", choices=("dlo58", "ee6"), default="dlo58",
+        help="NERO success-prefix input: replayed DLO state (default) or legacy 6D EE pose",
+    )
     parser.add_argument("--num-keypoints", type=int, default=16)
     parser.add_argument("--observation-horizon", type=int)
     parser.add_argument("--prediction-horizon", type=int, default=16)
@@ -144,11 +157,6 @@ def train(args: argparse.Namespace) -> Path:
         shutil.rmtree(output)
     output.mkdir(parents=True)
 
-    all_paths = _discover_trajectories(args.inputs)
-    if args.limit_episodes is not None:
-        if args.limit_episodes > len(all_paths):
-            raise ValueError(f"requested {args.limit_episodes} episodes but found {len(all_paths)}")
-        all_paths = all_paths[: args.limit_episodes]
     config = LowDimPolicyConfig(
         observation_horizon=args.observation_horizon,
         prediction_horizon=args.prediction_horizon,
@@ -160,23 +168,63 @@ def train(args: argparse.Namespace) -> Path:
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
         seed=args.seed,
+        rotation_format=args.rotation_format,
     )
+    prefix_root = (
+        args.inputs[0].expanduser().resolve()
+        if len(args.inputs) == 1
+        else None
+    )
+    is_nero_success_prefix = bool(
+        prefix_root is not None
+        and (prefix_root / "cable_conversion_manifest.json").is_file()
+        and (prefix_root / "meta" / "info.json").is_file()
+    )
+    if is_nero_success_prefix:
+        if args.state_input == "ee6":
+            config = replace(config, observation_dim=6)
+        all_paths = [prefix_root]
+        all_dataset = LowDimEpisodeDataset.from_nero_success_prefix(
+            prefix_root,
+            config=config,
+            action_source=args.action_source,
+            limit_episodes=args.limit_episodes,
+            feature_cache=args.feature_cache,
+        )
+    else:
+        if args.action_cache is None:
+            raise ValueError("--action-cache is required for raw NPZ low-dimensional input")
+        all_paths = _discover_trajectories(args.inputs)
+        if args.limit_episodes is not None:
+            if args.limit_episodes > len(all_paths):
+                raise ValueError(f"requested {args.limit_episodes} episodes but found {len(all_paths)}")
+            all_paths = all_paths[: args.limit_episodes]
+        all_dataset = LowDimEpisodeDataset(
+            all_paths,
+            config=config,
+            action_source=args.action_source,
+            action_cache=args.action_cache,
+        )
     started = time.monotonic()
-    all_dataset = LowDimEpisodeDataset(
-        all_paths,
-        config=config,
-        action_source=args.action_source,
-        action_cache=args.action_cache,
-    )
     train_indices, validation_indices = split_episode_indices(
         all_dataset.total_episode_count, args.validation_fraction, args.seed
     )
     train_dataset = all_dataset.subset(train_indices)
     validation_dataset = all_dataset.subset(validation_indices) if validation_indices else None
     obs_mean, obs_std = all_dataset.fit_observation_stats(train_indices)
+    obs_pose_norm_low, obs_pose_norm_high = all_dataset.fit_observation_pose_quantiles(
+        train_indices
+    )
+    action_norm_low, action_norm_high = all_dataset.fit_action_quantiles(train_indices)
     train_dataset.set_observation_stats(obs_mean, obs_std)
+    train_dataset.set_observation_pose_norm_bounds(obs_pose_norm_low, obs_pose_norm_high)
+    train_dataset.set_action_norm_bounds(action_norm_low, action_norm_high)
     if validation_dataset is not None:
         validation_dataset.set_observation_stats(obs_mean, obs_std)
+        validation_dataset.set_observation_pose_norm_bounds(
+            obs_pose_norm_low, obs_pose_norm_high
+        )
+        validation_dataset.set_action_norm_bounds(action_norm_low, action_norm_high)
     train_loader = _loader(train_dataset, args, shuffle=True)
     validation_loader = None if validation_dataset is None else _loader(validation_dataset, args, shuffle=False)
     print(
@@ -184,7 +232,10 @@ def train(args: argparse.Namespace) -> Path:
         f"validation={0 if validation_dataset is None else validation_dataset.episode_count} "
         f"train_frames={len(train_dataset)} validation_frames={None if validation_dataset is None else len(validation_dataset)} "
         f"state_dim={config.state_dim} action_dim=7 variant={args.variant} include_velocity={config.include_velocity} "
-        f"action_source={args.action_source} preprocess_seconds={time.monotonic() - started:.1f}",
+        f"action_source={args.action_source} action_target=pi05_delta_xyz_euler_gripper "
+        f"state_input={args.state_input} "
+        f"normalization=pi05_q01_q99_clip rotation_format={args.rotation_format} "
+        f"preprocess_seconds={time.monotonic() - started:.1f}",
         flush=True,
     )
 
@@ -256,9 +307,17 @@ def train(args: argparse.Namespace) -> Path:
                         "config": config.asdict(),
                         "obs_mean": obs_mean.tolist(),
                         "obs_std": obs_std.tolist(),
-                        "action_low": np.asarray(ACTION_LOW, dtype=np.float32).tolist(),
-                        "action_high": np.asarray(ACTION_HIGH, dtype=np.float32).tolist(),
+                        "obs_pose_norm_low": obs_pose_norm_low.tolist(),
+                        "obs_pose_norm_high": obs_pose_norm_high.tolist(),
+                        "action_norm_low": action_norm_low.tolist(),
+                        "action_norm_high": action_norm_high.tolist(),
+                        # Keep the old field names readable by older tooling.
+                        "action_low": action_norm_low.tolist(),
+                        "action_high": action_norm_high.tolist(),
                         "action_source": args.action_source,
+                        "action_target": "pi05_delta_xyz_euler_gripper",
+                        "observation_normalization": "pi05_q01_q99_pose_plus_train_mean_std_privileged",
+                        "action_normalization": "pi05_q01_q99_clip",
                         "variant": args.variant,
                         "epoch": epoch,
                         "global_step": global_step,
@@ -282,7 +341,11 @@ def train(args: argparse.Namespace) -> Path:
         "method": "diffusion_policy_lowdim",
         "variant": args.variant,
         "architecture": {
-            "observation": "ee_xyz_euler_gripper + 16 DLO keypoints relative to EE + relative target",
+            "observation": (
+                "ee_xyz_euler (6D DynamicVLA state)"
+                if config.observation_dim == 6
+                else "ee_xyz_euler_gripper + 16 DLO keypoints relative to EE + relative target"
+            ),
             "include_velocity": config.include_velocity,
             "state_dim": config.state_dim,
             "action_dim": 7,
@@ -294,14 +357,23 @@ def train(args: argparse.Namespace) -> Path:
         "config": config.asdict(),
         "data": {
             "inputs": [str(path) for path in all_paths],
-            "action_cache": str(args.action_cache.expanduser().resolve()),
+            "action_cache": (
+                None
+                if args.action_cache is None
+                else str(args.action_cache.expanduser().resolve())
+            ),
             "train_episode_indices": train_indices,
             "validation_episode_indices": validation_indices,
             "train_frame_count": len(train_dataset),
             "validation_frame_count": None if validation_dataset is None else len(validation_dataset),
             "action_source": args.action_source,
-            "observation_normalization": "train_split_mean_std",
-            "action_normalization": "DynamicVLA_fixed_xyz_euler_gripper_bounds",
+            "action_target": "pi05_delta_xyz_euler_gripper",
+            "observation_normalization": "pi05_q01_q99_pose_plus_train_mean_std_privileged",
+            "observation_pose_q01": obs_pose_norm_low.tolist(),
+            "observation_pose_q99": obs_pose_norm_high.tolist(),
+            "action_normalization": "pi05_q01_q99_clip",
+            "action_q01": action_norm_low.tolist(),
+            "action_q99": action_norm_high.tolist(),
             "frame_rate_hz": 25,
         },
         "checkpoints": ["checkpoint_latest.pt", "checkpoint_best.pt"],
