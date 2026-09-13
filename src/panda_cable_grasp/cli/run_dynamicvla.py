@@ -69,7 +69,6 @@ def adapter_for_env(env: CableGraspEnv) -> DynamicVLATaskSpaceAdapter:
     )
     return DynamicVLATaskSpaceAdapter(env, config)
 
-
 def _recv_latest(socket) -> dict | None:
     import zmq
 
@@ -102,6 +101,42 @@ def _wait_for_message(socket, key: str, timeout_seconds: float) -> dict | None:
                     matched = message
             if matched is not None:
                 return matched
+    return None
+
+
+def _wait_for_sync_action(
+    socket, sync_index: int, timeout_seconds: float
+) -> dict | None:
+    """Wait for the action corresponding to exactly one observation."""
+
+    import zmq
+
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)
+    deadline = (
+        None
+        if timeout_seconds <= 0.0
+        else time.monotonic() + timeout_seconds
+    )
+    while deadline is None or time.monotonic() < deadline:
+        wait_ms = 1000
+        if deadline is not None:
+            wait_ms = max(1, min(wait_ms, int(1000 * (deadline - time.monotonic()))))
+        if poller.poll(wait_ms):
+            while True:
+                try:
+                    message = socket.recv_pyobj(flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                if isinstance(message, dict) and "action" in message:
+                    if message.get("sync_index") != sync_index:
+                        print(
+                            "ignored_stale_sync_action="
+                            f"expected_{sync_index}_received_{message.get('sync_index')}",
+                            flush=True,
+                        )
+                        continue
+                    return message
     return None
 
 
@@ -173,6 +208,7 @@ def run_server(args: argparse.Namespace) -> None:
     import zmq
 
     scenario = get_scenario(args.scenario)
+    sync_mode = bool(args.sync)
     env = CableGraspEnv(env_config_from_args(args))
     adapter = adapter_for_env(env)
     context = zmq.Context()
@@ -198,7 +234,33 @@ def run_server(args: argparse.Namespace) -> None:
         raise TimeoutError("Timed out waiting for the DynamicVLA inference client")
     vla_name = str(handshake["vla"])
     vla_epoch = int(handshake.get("epoch", 0))
+    if sync_mode:
+        if handshake.get("protocol") != "dynamicvla_sync_v1":
+            env.close()
+            obs_socket.close(linger=0)
+            act_socket.close(linger=0)
+            context.term()
+            raise RuntimeError(
+                "Synchronous server requires a DynamicVLA client started with --sync"
+            )
+        client_execute_steps = handshake.get("execute_steps")
+        if int(client_execute_steps) != args.execute_steps:
+            env.close()
+            obs_socket.close(linger=0)
+            act_socket.close(linger=0)
+            context.term()
+            raise RuntimeError(
+                "Client/server execute_steps mismatch: "
+                f"server={args.execute_steps}, client={client_execute_steps}"
+            )
     print(f"dynamicvla_client={vla_name} epoch={vla_epoch}", flush=True)
+    if sync_mode:
+        print(
+            "dynamicvla_sync=true "
+            f"execute_steps={args.execute_steps} "
+            f"client_chunk_size={handshake.get('chunk_size', 'unknown')}",
+            flush=True,
+        )
     # The PUSH handshake is sent only after the official SUB socket connects;
     # a short propagation window removes PUB/SUB's initial slow-joiner race.
     time.sleep(0.25)
@@ -256,23 +318,59 @@ def run_server(args: argparse.Namespace) -> None:
             try:
                 while not success and not truncated:
                     tick = time.perf_counter()
-                    message = _recv_latest(act_socket)
-                    received_now = bool(message is not None and "action" in message)
-                    if received_now:
+                    received_now = False
+                    if sync_mode:
+                        observation = make_dynamicvla_observation(
+                            env,
+                            args.instruction if observation_index == 0 else None,
+                            index=observation_index,
+                            dt_scale=1.0,
+                        )
+                        observation["sync_mode"] = True
+                        observation["sync_index"] = observation_index
+                        observation["execute_steps"] = args.execute_steps
+                        obs_socket.send_pyobj(observation)
+                        message = _wait_for_sync_action(
+                            act_socket, observation_index, args.action_timeout
+                        )
+                        if message is None:
+                            termination_reason = "sync_action_timeout"
+                            truncated = True
+                            print(
+                                "sync_action_timeout="
+                                f"index_{observation_index}_after_{args.action_timeout:.1f}s",
+                                flush=True,
+                            )
+                            break
                         try:
                             adapter.set_model_action(message["action"])
                             model_action_messages += 1
+                            received_now = True
                         except ValueError as error:
-                            print(f"ignored_invalid_model_action={error}", flush=True)
-                            received_now = False
+                            termination_reason = "sync_invalid_model_action"
+                            truncated = True
+                            print(
+                                f"invalid_sync_model_action={error}", flush=True
+                            )
+                            break
+                    else:
+                        message = _recv_latest(act_socket)
+                        received_now = bool(message is not None and "action" in message)
+                        if received_now:
+                            try:
+                                adapter.set_model_action(message["action"])
+                                model_action_messages += 1
+                            except ValueError as error:
+                                print(f"ignored_invalid_model_action={error}", flush=True)
+                                received_now = False
 
-                    observation = make_dynamicvla_observation(
-                        env,
-                        args.instruction if observation_index == 0 else None,
-                        index=observation_index,
-                        dt_scale=max(1.0, previous_wall_step / control_dt),
-                    )
-                    obs_socket.send_pyobj(observation)
+                        observation = make_dynamicvla_observation(
+                            env,
+                            args.instruction if observation_index == 0 else None,
+                            index=observation_index,
+                            dt_scale=max(1.0, previous_wall_step / control_dt),
+                        )
+                        obs_socket.send_pyobj(observation)
                     diagnostics = adapter.diagnostics()
                     position_clipped.append(diagnostics["position_clipped"])
                     quaternion_repaired.append(diagnostics["quaternion_repaired"])
@@ -298,19 +396,26 @@ def run_server(args: argparse.Namespace) -> None:
                     termination_reason = step_info.get("termination_reason")
                     observation_index += 1
 
-                    elapsed = time.perf_counter() - tick
-                    remaining = control_dt - elapsed
-                    if remaining > 0.0:
-                        time.sleep(remaining)
-                    previous_wall_step = time.perf_counter() - tick
+                    if not sync_mode:
+                        elapsed = time.perf_counter() - tick
+                        remaining = control_dt - elapsed
+                        if remaining > 0.0:
+                            time.sleep(remaining)
+                        previous_wall_step = time.perf_counter() - tick
             except BaseException:
                 recorder.close()
                 raise
 
             if success:
                 result = "success"
+            elif termination_reason == "sync_action_timeout":
+                result = "failed_sync_action_timeout"
+            elif termination_reason == "sync_invalid_model_action":
+                result = "failed_sync_invalid_action"
             elif model_action_messages == 0:
                 result = "failed_no_model_action"
+            elif termination_reason == "dynamicvla_action_timeout":
+                result = "failed_action_timeout"
             elif termination_reason == "rigid_motion_boundary_crossed":
                 result = "failed_motion_boundary"
             else:
@@ -333,6 +438,8 @@ def run_server(args: argparse.Namespace) -> None:
                 "truncated": truncated,
                 "model_action_messages": model_action_messages,
                 "model_action_received": model_action_messages > 0,
+                "sync_mode": sync_mode,
+                "execute_steps": args.execute_steps if sync_mode else None,
                 "position_clip_frames": int(np.count_nonzero(position_clipped)),
                 "quaternion_repair_frames": int(np.count_nonzero(quaternion_repaired)),
                 "instruction": args.instruction,
@@ -395,9 +502,14 @@ def run_server(args: argparse.Namespace) -> None:
                 "client_name": vla_name,
                 "epoch": vla_epoch,
                 "instruction": args.instruction,
-                "protocol": "official_zmq_schema",
+                "protocol": (
+                    "dynamicvla_sync_v1" if sync_mode else "official_zmq_schema"
+                ),
+                "synchronous": sync_mode,
+                "execute_steps": args.execute_steps if sync_mode else None,
+                "predicted_chunk_size": handshake.get("chunk_size"),
                 "rotation": "euler_in_model_quaternion_on_wire_wxyz",
-                "delta_action": True,
+                "delta_action": bool(handshake.get("delta_action", True)),
                 "control_hz": 1.0 / control_dt,
             },
             "output": {
@@ -510,6 +622,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img-port", type=int, default=3186)
     parser.add_argument("--act-port", type=int, default=3188)
     parser.add_argument(
+        "--sync",
+        "--synchronous",
+        action="store_true",
+        help="Wait for the matching action before every simulation step",
+    )
+    parser.add_argument(
+        "--execute-steps",
+        "--execute_steps",
+        type=int,
+        default=20,
+        help="Actions consumed from each predicted chunk before the next prediction",
+    )
+    parser.add_argument(
+        "--action-timeout",
+        "--action_timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for the action matching one observation in sync mode",
+    )
+    parser.add_argument(
         "--client-timeout", type=float, default=0.0,
         help="seconds to wait for the model client; 0 waits indefinitely",
     )
@@ -527,6 +659,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--episode-seconds must be positive")
     if args.video_fps <= 0.0:
         parser.error("--video-fps must be positive")
+    if args.execute_steps < 1:
+        parser.error("--execute-steps must be positive")
+    if args.action_timeout <= 0.0:
+        parser.error("--action-timeout must be positive")
     if not args.instruction.strip():
         parser.error("--instruction must be non-empty")
     return args
