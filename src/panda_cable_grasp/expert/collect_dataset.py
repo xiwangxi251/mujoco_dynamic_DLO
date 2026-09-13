@@ -31,7 +31,7 @@ from .formula_intercept_policy import FormulaInterceptExpert
 from .run_experiment import DEFAULT_SCENARIOS
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 COLLECTOR_VERSION = 3
 POLICY_NAME = "privileged_shadow_expert"
 
@@ -140,6 +140,11 @@ class EpisodeBuffer:
         self.states: list[np.ndarray] = []
         self.requested_actions: list[np.ndarray] = []
         self.applied_actions: list[np.ndarray] = []
+        # The expert first chooses an absolute task-space target and then uses
+        # its hierarchical velocity IK to produce the native joint target.  A
+        # task-space learner must see the former, not FK(q_target).
+        self.expert_desired_positions: list[np.ndarray] = []
+        self.expert_desired_quaternions: list[np.ndarray] = []
         self.arm_qpos: list[np.ndarray] = []
         self.arm_qvel: list[np.ndarray] = []
         self.hand_position: list[np.ndarray] = []
@@ -165,6 +170,20 @@ class EpisodeBuffer:
         self.times.append(float(self.env.data.time))
         self.states.append(state)
         self.requested_actions.append(np.asarray(requested_action).copy())
+        desired_position = np.asarray(policy.last_desired, dtype=np.float64)
+        desired_quaternion = np.asarray(policy.desired_quat, dtype=np.float64)
+        if desired_position.shape != (3,) or desired_quaternion.shape != (4,):
+            raise RuntimeError(
+                "expert task-space target has unexpected shape: "
+                f"position={desired_position.shape} quaternion={desired_quaternion.shape}"
+            )
+        if not (
+            np.all(np.isfinite(desired_position))
+            and np.all(np.isfinite(desired_quaternion))
+        ):
+            raise RuntimeError("expert task-space target contains non-finite values")
+        self.expert_desired_positions.append(desired_position.copy())
+        self.expert_desired_quaternions.append(desired_quaternion.copy())
         self.arm_qpos.append(self.env.data.qpos[self.env.arm_qpos_adr].copy())
         self.arm_qvel.append(self.env.data.qvel[self.env.arm_dof_adr].copy())
         self.hand_position.append(self.env.hand_position.copy())
@@ -201,6 +220,12 @@ class EpisodeBuffer:
     ) -> None:
         if not self.states or len(self.states) != len(self.applied_actions):
             raise RuntimeError("episode buffer is empty or action alignment failed")
+        if not (
+            len(self.states)
+            == len(self.expert_desired_positions)
+            == len(self.expert_desired_quaternions)
+        ):
+            raise RuntimeError("expert task-space target alignment failed")
         np.savez_compressed(
             path,
             schema_version=np.int64(SCHEMA_VERSION),
@@ -209,6 +234,8 @@ class EpisodeBuffer:
             states=np.stack(self.states),
             requested_actions=np.stack(self.requested_actions),
             applied_actions=np.stack(self.applied_actions),
+            expert_desired_positions=np.stack(self.expert_desired_positions),
+            expert_desired_quaternions=np.stack(self.expert_desired_quaternions),
             arm_qpos=np.stack(self.arm_qpos),
             arm_qvel=np.stack(self.arm_qvel),
             hand_position=np.stack(self.hand_position),

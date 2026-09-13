@@ -11,7 +11,6 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 import math
-import os
 
 import numpy as np
 
@@ -36,7 +35,6 @@ class FormulaInterceptConfig(PolicyConfig):
     combined_close_capture_distance: float = 0.018
     intercept_prediction_horizon: float = 0.30
     shadow_rollout_extra_time: float = 0.35
-    shadow_rollout_enabled: bool = True
     candidate_height_limit: float = 0.10
     candidate_table_margin: float = 0.06
     reach_lateness_weight: float = 5.0
@@ -82,7 +80,6 @@ class FormulaInterceptConfig(PolicyConfig):
             "align_gripper_to_tangent", "search_shape_all_segments",
             "record_intercept_failures",
             "shape_use_scripted_fallback", "dynamic_portfolio_enabled",
-            "shadow_rollout_enabled",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean")
@@ -97,13 +94,6 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         config: FormulaInterceptConfig | None = None,
     ) -> None:
         self.expert_config = config or FormulaInterceptConfig()
-        if os.environ.get("PANDA_CABLE_GRASP_DISABLE_SHADOW", "").lower() \
-                in {"1", "true", "yes", "on"}:
-            self.expert_config = replace(
-                self.expert_config,
-                shadow_rollout_enabled=False,
-                dynamic_portfolio_enabled=False,
-            )
         self.expert_segment_index = 0
         self.expert_segment_alpha = 0.5
         self.expert_horizon = self.expert_config.candidate_horizons[0]
@@ -260,10 +250,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         positions = self.env.data.xpos[self.env.cable_ids].copy()
         if horizon == 0.0:
             return positions
-        if (
-            self.expert_config.shadow_rollout_enabled
-            and self.env.config.motion_mode in {"shape", "combined"}
-        ):
+        if self.env.config.motion_mode in {"shape", "combined"}:
             return self._shadow_node_states(horizon)[0]
         velocities = np.asarray([
             self.env.body_linear_velocity(body_id)
@@ -285,10 +272,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         return predicted
 
     def _predicted_node_velocities(self, horizon: float) -> np.ndarray:
-        if (
-            self.expert_config.shadow_rollout_enabled
-            and self.env.config.motion_mode in {"shape", "combined"}
-        ):
+        if self.env.config.motion_mode in {"shape", "combined"}:
             return self._shadow_node_states(horizon)[1]
         dt = 0.03
         before_horizon = max(0.0, horizon - dt)
@@ -365,10 +349,7 @@ class FormulaInterceptExpert(DynamicCableGraspPolicy):
         )
 
     def _replan_intercept(self) -> None:
-        if (
-            self.expert_config.shadow_rollout_enabled
-            and self.env.config.motion_mode in {"shape", "combined"}
-        ):
+        if self.env.config.motion_mode in {"shape", "combined"}:
             self._refresh_shadow_trajectory(
                 max(self.expert_config.candidate_horizons)
                 + self.expert_config.shadow_rollout_extra_time
