@@ -101,10 +101,10 @@ ROBOT_SPECS = {
         xml_path=NERO_XML_PATH,
         asset_dir=NERO_XML_PATH.parent / "assets",
         base_body_name="base_link",
-        # NERO's downward-facing workspace is closer to the table center than
-        # Panda's.  Keep the task geometry unchanged and place the robot base
-        # 20 cm toward the table instead.
-        base_offset=(0.20, 0.0, 0.0),
+        # The expert trajectories were collected with base_x=0.35. The NERO
+        # XML has base_link at the world origin, so the default evaluation
+        # environment must apply the same single 0.35 m task-frame offset.
+        base_offset=(0.35, 0.0, 0.0),
         arm_joint_names=tuple(f"joint{i}" for i in range(1, 8)),
         hand_body_name="link7",
         left_finger_body_name="gripper_link1",
@@ -338,6 +338,25 @@ class EnvConfig:
     gripper_finger_velocity_limit: float = 0.20
     low_level_velocity_guard_fraction: float = 1.0
 
+    # Generic geometric safety layer.  The default remains disabled so older
+    # checkpoints keep their historical environment semantics until an
+    # experiment opts in explicitly.
+    geometric_safety_enabled: bool = False
+    # The mesh AABB is a broad-phase envelope.  For the NERO finger meshes,
+    # AABB clearance 0 is still separated from the actual MuJoCo contact by
+    # roughly 4 mm, so use zero as the geometric hard boundary and retain a
+    # small integrator cushion in ``fence``.
+    geometric_safety_hard_margin: float = 0.0
+    geometric_safety_soft_margin: float = 0.003
+    geometric_safety_skip_distance: float = 0.08
+    geometric_safety_path_samples: int = 8
+    geometric_safety_projection_steps: int = 4
+    # The fence is checked at every physics substep.  A 20 ms envelope starts
+    # normal-direction braking before a full control period of inertia can
+    # carry the gripper through the tabletop.
+    geometric_safety_braking_time: float = 0.02
+    geometric_safety_recovery_lift: float = 0.002
+
     # 合法性检查
     def __post_init__(self) -> None:
         self.robot = str(self.robot).lower()
@@ -351,7 +370,7 @@ class EnvConfig:
             # the gripper's lateral axis and look down its approach axis.
             # NERO's housing occupies the +Y side, so use the clear -Y side;
             # place the camera just 2 cm along the approach direction so only
-            # the finger tips enter the lower corners of the view.  Keep an
+            # the finger tips enter the lower corners of the view. Keep an
             # explicit user override.
             if self.dynamicvla_wrist_camera_pos == DEFAULT_DYNAMICVLA_WRIST_CAMERA_POS:
                 self.dynamicvla_wrist_camera_pos = NERO_DYNAMICVLA_WRIST_CAMERA_POS
@@ -371,6 +390,7 @@ class EnvConfig:
             )
         if self.motion_profile_version not in {
             "legacy_v1", "factorized_v1", "factorized_v2",
+            "factorized_hidden_velocity_v1",
             "rigid_level1_single_pass_v2", "rigid_level2_single_pass_v2",
         }:
             raise ValueError(
@@ -508,6 +528,29 @@ class EnvConfig:
             raise ValueError(
                 "low_level_velocity_guard_fraction must be in (0, 1]"
             )
+        if not isinstance(self.geometric_safety_enabled, bool):
+            raise ValueError("geometric_safety_enabled must be boolean")
+        for name in (
+            "geometric_safety_hard_margin",
+            "geometric_safety_soft_margin",
+            "geometric_safety_skip_distance",
+            "geometric_safety_braking_time",
+            "geometric_safety_recovery_lift",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.geometric_safety_soft_margin < self.geometric_safety_hard_margin:
+            raise ValueError(
+                "geometric_safety_soft_margin must be >= hard_margin"
+            )
+        for name in (
+            "geometric_safety_path_samples",
+            "geometric_safety_projection_steps",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
 
 
 @dataclass
@@ -526,6 +569,351 @@ def id_of(model: mujoco.MjModel, obj: int, name: str) -> int:
     if result < 0:
         raise RuntimeError(f"Missing {name!r} in model")
     return result
+
+
+class GeometricSafetyFilter:
+    """Fast tabletop clearance filter shared by all controller interfaces.
+
+    The runtime path uses conservative world-aligned AABBs for robot geoms
+    and the static table box.  A cloned MuJoCo forward pass is only used when
+    the current pose is near the table or a target needs projection.
+    """
+
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        *,
+        table_geom_id: int,
+        robot_geom_ids: tuple[int, ...],
+        hard_margin: float,
+        soft_margin: float,
+        skip_distance: float,
+        path_samples: int,
+        projection_steps: int,
+        braking_time: float,
+        recovery_lift: float,
+    ) -> None:
+        self.model = model
+        self.table_geom_id = int(table_geom_id)
+        self.robot_geom_ids = tuple(int(value) for value in robot_geom_ids)
+        self.robot_geom_id_set = frozenset(self.robot_geom_ids)
+        self.hard_margin = float(hard_margin)
+        self.soft_margin = float(soft_margin)
+        self.skip_distance = float(skip_distance)
+        self.path_samples = int(path_samples)
+        self.projection_steps = int(projection_steps)
+        self.braking_time = float(braking_time)
+        self.recovery_lift = float(recovery_lift)
+        self.probe_data = mujoco.MjData(model)
+        self.total_probe_count = 0
+        self.last_probe_count = 0
+        self.last_predicted_step_safe = False
+        self.last = {
+            "active": False,
+            "alpha": 1.0,
+            "current_distance": float("inf"),
+            "predicted_distance": float("inf"),
+            "candidate_distance": float("inf"),
+        }
+        self._mesh_bounds: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for geom_id in self.robot_geom_ids:
+            if model.geom_type[geom_id] != mujoco.mjtGeom.mjGEOM_MESH:
+                continue
+            mesh_id = int(model.geom_dataid[geom_id])
+            if mesh_id < 0:
+                continue
+            start = int(model.mesh_vertadr[mesh_id])
+            count = int(model.mesh_vertnum[mesh_id])
+            vertices = np.asarray(model.mesh_vert[start:start + count])
+            if vertices.size == 0:
+                continue
+            self._mesh_bounds[geom_id] = (
+                vertices.min(axis=0).astype(float),
+                vertices.max(axis=0).astype(float),
+            )
+
+    def _local_box(self, geom_id: int) -> tuple[np.ndarray, np.ndarray]:
+        geom_type = self.model.geom_type[geom_id]
+        size = np.asarray(self.model.geom_size[geom_id], dtype=float)
+        if geom_type == mujoco.mjtGeom.mjGEOM_MESH and geom_id in self._mesh_bounds:
+            lower, upper = self._mesh_bounds[geom_id]
+            return 0.5 * (lower + upper), 0.5 * (upper - lower)
+        if geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+            return np.zeros(3), size[:3]
+        if geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+            return np.zeros(3), np.array([size[0], size[0], size[0] + size[1]])
+        if geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
+            return np.zeros(3), np.array([size[0], size[0], size[1]])
+        if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+            return np.zeros(3), np.repeat(size[0], 3)
+        if geom_type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
+            return np.zeros(3), size[:3]
+        radius = float(max(size[0], 1e-6))
+        return np.zeros(3), np.repeat(radius, 3)
+
+    def _world_aabb(
+        self, data: mujoco.MjData, geom_id: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        center_local, half_local = self._local_box(geom_id)
+        rotation = np.asarray(data.geom_xmat[geom_id], dtype=float).reshape(3, 3)
+        center = np.asarray(data.geom_xpos[geom_id], dtype=float) + rotation @ center_local
+        half = np.abs(rotation) @ half_local
+        return center, half
+
+    def closest_clearance(
+        self, data: mujoco.MjData,
+    ) -> tuple[float, int | None]:
+        table_center, table_half = self._world_aabb(data, self.table_geom_id)
+        minimum = float("inf")
+        closest_geom: int | None = None
+        for geom_id in self.robot_geom_ids:
+            center, half = self._world_aabb(data, geom_id)
+            if (
+                abs(center[0] - table_center[0]) > half[0] + table_half[0]
+                or abs(center[1] - table_center[1]) > half[1] + table_half[1]
+            ):
+                continue
+            distance = float(
+                center[2] - half[2] - (table_center[2] + table_half[2])
+            )
+            if distance < minimum:
+                minimum = distance
+                closest_geom = geom_id
+        return minimum, closest_geom
+
+    def minimum_clearance(self, data: mujoco.MjData) -> float:
+        return self.closest_clearance(data)[0]
+
+    def has_robot_table_contact(self, data: mujoco.MjData) -> bool:
+        """Return whether MuJoCo reports a contact for a guarded robot geom."""
+        for index in range(int(data.ncon)):
+            contact = data.contact[index]
+            pair = {int(contact.geom1), int(contact.geom2)}
+            if self.table_geom_id in pair and pair & self.robot_geom_id_set:
+                return True
+        return False
+
+    def emergency_target(
+        self,
+        data: mujoco.MjData,
+        arm_qpos_adr: np.ndarray,
+        arm_dof_adr: np.ndarray,
+    ) -> tuple[np.ndarray, bool]:
+        """Return a small geometry-gradient recovery target when braking."""
+        current_qpos = np.asarray(data.qpos[arm_qpos_adr], dtype=float).copy()
+        distance, geom_id = self.closest_clearance(data)
+        if geom_id is None:
+            return current_qpos, False
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+        mujoco.mj_jacGeom(self.model, data, jacp, jacr, int(geom_id))
+        gradient = np.asarray(jacp[2, arm_dof_adr], dtype=float)
+        gradient_norm_sq = float(gradient @ gradient)
+        if gradient_norm_sq <= 1e-10:
+            return current_qpos, False
+        requested_lift = max(
+            self.hard_margin + self.recovery_lift - distance,
+            self.recovery_lift,
+        )
+        q_delta = gradient * requested_lift / gradient_norm_sq
+        q_delta = np.clip(q_delta, -0.02, 0.02)
+        return current_qpos + q_delta, True
+
+    def fence(
+        self,
+        data: mujoco.MjData,
+        arm_qpos_adr: np.ndarray,
+        arm_dof_adr: np.ndarray,
+        guarded_action: np.ndarray,
+        *,
+        enabled: bool,
+        timestep: float,
+    ) -> tuple[np.ndarray, bool, bool]:
+        """Cheap 500 Hz braking fence using cached geometry transforms."""
+        self.last_predicted_step_safe = False
+        if not enabled or not self.robot_geom_ids:
+            return guarded_action, False, False
+        distance, geom_id = self.closest_clearance(data)
+        if geom_id is None:
+            return guarded_action, False, False
+        if self.has_robot_table_contact(data):
+            return guarded_action, True, True
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+        mujoco.mj_jacGeom(self.model, data, jacp, jacr, int(geom_id))
+        downward_speed = max(
+            0.0, -float(jacp[2, :] @ data.qvel)
+        )
+        arm_gradient = np.asarray(jacp[2, arm_dof_adr], dtype=float)
+        braking_buffer = downward_speed * self.braking_time
+        if distance > self.hard_margin + braking_buffer:
+            return guarded_action, False, False
+        # Position actuators alone cannot remove momentum in one substep.  In
+        # the near-table band, project only the arm's generalized velocity so
+        # the closest robot geom has no remaining downward normal velocity.
+        # This is a local safety intervention; cable and non-arm velocities
+        # remain untouched.
+        arm_gradient_norm_sq = float(arm_gradient @ arm_gradient)
+        if downward_speed > 0.0 and arm_gradient_norm_sq > 1e-10:
+            data.qvel[arm_dof_adr] += (
+                arm_gradient * downward_speed / arm_gradient_norm_sq
+            )
+        # A target-only check can still miss dynamic overshoot within the next
+        # 2 ms MuJoCo step.  Use the full trial step only when the current
+        # normal velocity can cross the boundary in that one step; slower
+        # near-table motion stays on the cheap Jacobian path.
+        one_step_buffer = downward_speed * max(float(timestep), 0.0)
+        if distance > self.hard_margin + one_step_buffer:
+            return guarded_action, True, False
+        # If the trial would create a contact, hold the current arm pose for
+        # this substep and let the next control decision try again; do not
+        # execute the unsafe real step.
+        mujoco.mj_copyData(self.probe_data, self.model, data)
+        self.probe_data.ctrl[:] = guarded_action
+        mujoco.mj_step(self.model, self.probe_data)
+        self.total_probe_count += 1
+        self.last_probe_count += 1
+        if self.has_robot_table_contact(self.probe_data):
+            held_action = guarded_action.copy()
+            held_action[:7] = np.asarray(data.qpos[arm_qpos_adr], dtype=float)
+            mujoco.mj_copyData(self.probe_data, self.model, data)
+            self.probe_data.ctrl[:] = held_action
+            mujoco.mj_step(self.model, self.probe_data)
+            self.total_probe_count += 1
+            self.last_probe_count += 1
+            if self.has_robot_table_contact(self.probe_data):
+                return held_action, True, True
+            guarded_action = held_action
+        self.last_predicted_step_safe = True
+        # Predictive fence: the target has already been projected along the
+        # requested path by ``project``.  Keep its tangential component intact
+        # and use the velocity projection above to remove only the downward
+        # normal component.  Replacing the whole target by an upward recovery
+        # pose would also destroy horizontal approach to a cable on the table.
+        # Keep an integrator cushion so the subsequent physics step cannot
+        # jump from the recovery band to just below the hard margin.
+        return guarded_action, True, self.has_robot_table_contact(data)
+
+    def _probe_clearance(
+        self,
+        data: mujoco.MjData,
+        arm_qpos_adr: np.ndarray,
+        target_qpos: np.ndarray,
+    ) -> float:
+        self.probe_data.qpos[:] = data.qpos
+        self.probe_data.qpos[np.asarray(arm_qpos_adr, dtype=int)] = target_qpos
+        mujoco.mj_forward(self.model, self.probe_data)
+        self.total_probe_count += 1
+        self.last_probe_count += 1
+        return self.minimum_clearance(self.probe_data)
+
+    def _path_clear(
+        self,
+        data: mujoco.MjData,
+        arm_qpos_adr: np.ndarray,
+        start_qpos: np.ndarray,
+        target_qpos: np.ndarray,
+    ) -> tuple[bool, float]:
+        minimum = float("inf")
+        fractions = np.linspace(
+            1.0 / self.path_samples,
+            1.0,
+            self.path_samples,
+        )
+        for fraction in fractions:
+            probe_qpos = start_qpos + float(fraction) * (target_qpos - start_qpos)
+            distance = self._probe_clearance(data, arm_qpos_adr, probe_qpos)
+            minimum = min(minimum, distance)
+            if distance < self.hard_margin:
+                return False, minimum
+        return True, minimum
+
+    def project(
+        self,
+        data: mujoco.MjData,
+        arm_qpos_adr: np.ndarray,
+        candidate_qpos: np.ndarray,
+        *,
+        start_qpos: np.ndarray | None = None,
+        arm_dof_adr: np.ndarray | None = None,
+        control_dt: float = 0.0,
+        enabled: bool,
+    ) -> tuple[np.ndarray, dict[str, float | bool]]:
+        self.last_probe_count = 0
+        current_qpos = np.asarray(data.qpos[arm_qpos_adr], dtype=float).copy()
+        planning_start_qpos = (
+            current_qpos
+            if start_qpos is None
+            else np.asarray(start_qpos, dtype=float).copy()
+        )
+        candidate_qpos = np.asarray(candidate_qpos, dtype=float).copy()
+        current_distance = self.minimum_clearance(data)
+        diagnostics: dict[str, float | bool] = {
+            "active": False,
+            "alpha": 1.0,
+            "current_distance": current_distance,
+            "predicted_distance": current_distance,
+            "candidate_distance": float("inf"),
+        }
+        if not enabled or not self.robot_geom_ids:
+            self.last = diagnostics
+            return candidate_qpos, diagnostics
+        # ``inf`` means the robot is currently outside the table footprint;
+        # the next target can still enter that footprint, so probe that case
+        # instead of taking the far-field fast path.
+        if math.isfinite(current_distance) and current_distance > self.skip_distance:
+            self.last = diagnostics
+            return candidate_qpos, diagnostics
+
+        candidate_distance = self._probe_clearance(
+            data, arm_qpos_adr, candidate_qpos
+        )
+        diagnostics["candidate_distance"] = candidate_distance
+        if candidate_distance >= self.hard_margin:
+            if min(current_distance, candidate_distance) <= self.soft_margin:
+                clear, path_minimum = self._path_clear(
+                    data, arm_qpos_adr, planning_start_qpos, candidate_qpos,
+                )
+                diagnostics["predicted_distance"] = path_minimum
+                if clear:
+                    self.last = diagnostics
+                    return candidate_qpos, diagnostics
+            else:
+                diagnostics["predicted_distance"] = candidate_distance
+                self.last = diagnostics
+                return candidate_qpos, diagnostics
+
+        if current_distance < self.hard_margin:
+            diagnostics["active"] = True
+            diagnostics["alpha"] = 0.0
+            diagnostics["predicted_distance"] = current_distance
+            self.last = diagnostics
+            return planning_start_qpos, diagnostics
+
+        low = 0.0
+        high = 1.0
+        safe_qpos = planning_start_qpos.copy()
+        safe_distance = current_distance
+        for _ in range(self.projection_steps):
+            alpha = 0.5 * (low + high)
+            probe_qpos = (
+                planning_start_qpos
+                + alpha * (candidate_qpos - planning_start_qpos)
+            )
+            probe_distance = self._probe_clearance(
+                data, arm_qpos_adr, probe_qpos
+            )
+            if probe_distance >= self.hard_margin:
+                low = alpha
+                safe_qpos = probe_qpos
+                safe_distance = probe_distance
+            else:
+                high = alpha
+        diagnostics["active"] = True
+        diagnostics["alpha"] = low
+        diagnostics["predicted_distance"] = safe_distance
+        self.last = diagnostics
+        return safe_qpos, diagnostics
 
 # -------------------------------------------------------------------------
 # 环境
@@ -671,6 +1059,37 @@ class CableGraspEnv:
         self.cable_ids = self._cable_bodies()
         self.cable_set = set(self.cable_ids)
         self.cable_index = {body_id: index for index, body_id in enumerate(self.cable_ids)}
+        robot_root_id = id_of(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, self.robot_spec.base_body_name
+        )
+        robot_body_ids: set[int] = set()
+        for body_id in range(self.model.nbody):
+            parent_id = body_id
+            while parent_id != 0 and parent_id != robot_root_id:
+                parent_id = int(self.model.body_parentid[parent_id])
+            if parent_id == robot_root_id:
+                robot_body_ids.add(body_id)
+        robot_geom_ids = tuple(
+            int(geom_id)
+            for geom_id in range(self.model.ngeom)
+            if (
+                int(self.model.geom_bodyid[geom_id]) in robot_body_ids
+                and int(self.model.geom_contype[geom_id]) != 0
+            )
+        )
+        self.geometric_safety_geom_ids = robot_geom_ids
+        self._geometric_safety_filter = GeometricSafetyFilter(
+            self.model,
+            table_geom_id=self.table_geom_id,
+            robot_geom_ids=robot_geom_ids,
+            hard_margin=self.config.geometric_safety_hard_margin,
+            soft_margin=self.config.geometric_safety_soft_margin,
+            skip_distance=self.config.geometric_safety_skip_distance,
+            path_samples=self.config.geometric_safety_path_samples,
+            projection_steps=self.config.geometric_safety_projection_steps,
+            braking_time=self.config.geometric_safety_braking_time,
+            recovery_lift=self.config.geometric_safety_recovery_lift,
+        )
         self.cable_geom_ids = np.array([
             geom_id
             for geom_id in range(self.model.ngeom)
@@ -747,6 +1166,7 @@ class CableGraspEnv:
 
         self.phase_offset = 0.0
         self.spatial_phase = 0.0
+        self._hidden_velocity_direction = 1.0
         self._stochastic_shape_frequency = np.ones(8)
         self._stochastic_shape_direction = np.ones(8)
         self._stochastic_shape_phase = np.zeros(8)
@@ -789,6 +1209,9 @@ class CableGraspEnv:
         self._last_requested_arm_velocity = np.zeros(7)
         self._last_applied_arm_velocity = np.zeros(7)
         self._last_commanded_hand_velocity = np.zeros(6)
+        self._geometric_safety_filter_count = 0
+        self._geometric_safety_fence_steps = 0
+        self._last_geometric_safety = self._geometric_safety_filter.last.copy()
         self._last_motion_limit_flags = {
             "acceleration": False,
             "joint_velocity": False,
@@ -845,6 +1268,7 @@ class CableGraspEnv:
         uses_rigid_motion = self.config.motion_profile_version in RIGID_MOTION_PROFILES
         uses_curved_initial_shape = (
             self.config.motion_profile_version == "factorized_v2"
+            or self.config.motion_profile_version == "factorized_hidden_velocity_v1"
             or uses_rigid_motion
         )
         base_cable_xy = self.data.xpos[self.cable_ids, :2].copy()
@@ -899,6 +1323,15 @@ class CableGraspEnv:
             self._rigid_motion_rotation_sign = 1.0
 
         self._reset_stochastic_motion(randomize=randomize)
+        if self.config.motion_profile_version == "factorized_hidden_velocity_v1":
+            self._hidden_velocity_direction = (
+                -1.0 if int(self.rng.integers(0, 2)) == 0 else 1.0
+            ) if randomize else 1.0
+            self.data.qvel[
+                self.cable_free_dadr:self.cable_free_dadr + 3
+            ] = [0.0, 0.08 * self._hidden_velocity_direction, 0.0]
+        else:
+            self._hidden_velocity_direction = 1.0
         profile_header = (
             f"{self.config.motion_profile_version}|{self.config.motion_mode}|"
             f"{self.config.motion_regularity}|"
@@ -917,6 +1350,7 @@ class CableGraspEnv:
             self._stochastic_shape_frequency.tobytes(),
             self._stochastic_shape_direction.tobytes(),
             self._stochastic_shape_phase.tobytes(),
+            np.asarray([self._hidden_velocity_direction]).tobytes(),
             self._rigid_reference_xy.tobytes(),
             self._rigid_initial_shape_family.encode("ascii"),
             np.asarray([self._rigid_motion_rotation_sign]).tobytes(),
@@ -961,6 +1395,11 @@ class CableGraspEnv:
         self._physics_velocity_limit_steps = 0
         self._physics_velocity_fence_steps = 0
         self._physics_velocity_fence_dof_steps = 0
+        self._geometric_safety_filter_count = 0
+        self._geometric_safety_fence_steps = 0
+        self._geometric_safety_filter.total_probe_count = 0
+        self._geometric_safety_filter.last_probe_count = 0
+        self._last_geometric_safety = self._geometric_safety_filter.last.copy()
         self._max_abs_actual_arm_velocity[:] = 0.0
         self._max_abs_pre_limit_arm_velocity[:] = 0.0
         self._max_actual_hand_linear_speed = 0.0
@@ -1003,8 +1442,39 @@ class CableGraspEnv:
             guarded_action, velocity_guard_active = (
                 self._velocity_guarded_action(applied_action)
             )
+            (
+                guarded_action,
+                geometric_safety_fence_active,
+                geometric_safety_abort,
+            ) = (
+                self._geometric_safety_filter.fence(
+                    self.data,
+                    self.arm_qpos_adr,
+                    self.arm_dof_adr,
+                    guarded_action,
+                    enabled=self.config.geometric_safety_enabled,
+                    timestep=self.model.opt.timestep,
+                )
+            )
+            self._geometric_safety_fence_steps += int(
+                geometric_safety_fence_active
+            )
+            if geometric_safety_abort:
+                self.last_termination_reason = "geometric_safety_violation"
+                truncated = True
+                break
             self.data.ctrl[:] = guarded_action
-            pre_limit_qvel = self._physics_step()
+            if self._geometric_safety_filter.last_predicted_step_safe:
+                # The near-table trial step was already advanced on the
+                # reusable probe data; commit that exact state instead of
+                # integrating the real data a second, slightly different way.
+                mujoco.mj_copyData(
+                    self.data, self.model, self._geometric_safety_filter.probe_data
+                )
+                self._geometric_safety_filter.last_predicted_step_safe = False
+                pre_limit_qvel = self.data.qvel.copy()
+            else:
+                pre_limit_qvel = self._physics_step()
             self._record_actual_robot_velocity(
                 velocity_guard_active, pre_limit_qvel
             )
@@ -1173,6 +1643,22 @@ class CableGraspEnv:
         applied_action = requested_action.copy()
         applied_action[:7] = position_target
         applied_action[self.gripper_actuator_id] = gripper_command
+
+        # The geometric safety layer is the final common authority for all
+        # controller interfaces.  It operates on the already velocity-limited
+        # target, so projection cannot reintroduce a joint-speed violation.
+        safe_arm_target, safety_info = self._geometric_safety_filter.project(
+            self.data,
+            self.arm_qpos_adr,
+            applied_action[:7],
+            start_qpos=self._last_applied_action[:7],
+            arm_dof_adr=self.arm_dof_adr,
+            control_dt=control_dt,
+            enabled=self.config.geometric_safety_enabled,
+        )
+        applied_action[:7] = safe_arm_target
+        self._last_geometric_safety = safety_info
+        self._geometric_safety_filter_count += int(safety_info["active"])
 
         commanded_linear_velocity = (
             jacp[:, self.arm_dof_adr] @ applied_velocity
@@ -1407,6 +1893,7 @@ class CableGraspEnv:
             "motion_profile_version": self.config.motion_profile_version,
             "motion_regularity": self.config.motion_regularity,
             "motion_frequency_scale": self.config.motion_frequency_scale,
+            "hidden_velocity_direction": self._hidden_velocity_direction,
             "disturbance_strength": self.config.disturbance_strength,
             "shape_motion_scale": self.config.shape_motion_scale,
             "rigid_translation_scale": self.config.rigid_translation_scale,
@@ -1544,6 +2031,25 @@ class CableGraspEnv:
             ),
             "physics_velocity_fence_dof_steps": (
                 self._physics_velocity_fence_dof_steps
+            ),
+            "geometric_safety_enabled": self.config.geometric_safety_enabled,
+            "geometric_safety_geom_count": len(self.geometric_safety_geom_ids),
+            "geometric_safety_filter_count": self._geometric_safety_filter_count,
+            "geometric_safety_fence_steps": self._geometric_safety_fence_steps,
+            "geometric_safety_probe_count": (
+                self._geometric_safety_filter.total_probe_count
+            ),
+            "geometric_safety_filter_active": bool(
+                self._last_geometric_safety["active"]
+            ),
+            "geometric_safety_projection_alpha": float(
+                self._last_geometric_safety["alpha"]
+            ),
+            "geometric_safety_min_distance": float(
+                self._geometric_safety_filter.minimum_clearance(self.data)
+            ),
+            "geometric_safety_predicted_distance": float(
+                self._last_geometric_safety["predicted_distance"]
             ),
             "shape_acceleration_rms": rms(self._last_shape_acceleration),
             "rigid_translation_acceleration_rms": rms(
@@ -1950,9 +2456,14 @@ class CableGraspEnv:
         """按场景组合静止、整体运动和局部形变三个可审计分量。"""
 
         elapsed_time = float(self.data.time)
+        temporal_direction = (
+            self._hidden_velocity_direction
+            if self.config.motion_profile_version == "factorized_hidden_velocity_v1"
+            else 1.0
+        )
         t = (
             self.phase_offset
-            + self.config.motion_frequency_scale * elapsed_time
+            + temporal_direction * self.config.motion_frequency_scale * elapsed_time
         )
         p = self.spatial_phase
 

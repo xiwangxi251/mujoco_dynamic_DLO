@@ -77,6 +77,7 @@ class RLConfig:
     reward_time_step: float = -0.0005
     reward_action_magnitude: float = -0.0005
     reward_action_rate: float = -0.01
+    reward_geometric_safety_violation: float = -5.0
 
     def __post_init__(self) -> None:
         if self.cable_sample_count != 14:
@@ -115,6 +116,7 @@ class RLConfig:
         for name in (
             "reward_capture_ready_open_step", "reward_premature_close_event",
             "reward_premature_close_step",
+            "reward_geometric_safety_violation",
         ):
             if float(getattr(self, name)) > 0.0:
                 raise ValueError(f"{name} must be non-positive")
@@ -125,6 +127,27 @@ class RLConfig:
         ):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be non-negative")
+
+
+TASK_SPACE_ACTION_MODE = "task_space"
+VERTICAL_DOWN_TASK_SPACE_ACTION_MODE = "task_space_vertical_down"
+JOINT_TARGET_ACTION_MODE = "joint_target"
+ACTION_MODES = (
+    TASK_SPACE_ACTION_MODE,
+    VERTICAL_DOWN_TASK_SPACE_ACTION_MODE,
+    JOINT_TARGET_ACTION_MODE,
+)
+
+
+def action_interface_version(action_mode: str) -> str:
+    """Return the checkpoint interface marker for an action parameterization."""
+    if action_mode == TASK_SPACE_ACTION_MODE:
+        return "baseline_v4"
+    if action_mode == VERTICAL_DOWN_TASK_SPACE_ACTION_MODE:
+        return "baseline_v6_task_space_vertical_down"
+    if action_mode == JOINT_TARGET_ACTION_MODE:
+        return "baseline_v5_joint_target"
+    raise ValueError(f"unsupported RL action mode: {action_mode!r}")
 
 
 class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
@@ -165,6 +188,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         env_config: EnvConfig | None = None,
         scenario_names: Sequence[str] | None = None,
         rl_config: RLConfig | None = None,
+        geometric_safety_enabled: bool | None = None,
+        table_finger_collision_filter_enabled: bool = True,
     ):
         super().__init__()
         self.rl_config = rl_config or RLConfig()
@@ -232,11 +257,22 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 dynamicvla_cameras_enabled=dynamicvla_cameras_enabled,
             )
         )
+        if geometric_safety_enabled is not None:
+            self.base_env.config.geometric_safety_enabled = bool(
+                geometric_safety_enabled
+            )
+        self.table_finger_collision_filter_enabled = bool(
+            table_finger_collision_filter_enabled
+        )
+        # The PPO training/evaluation interface uses the shared target limiter
+        # plus the configured joint acceleration limiter.
+        self.base_env.config.arm_acceleration_limit_enabled = True
         # The wrapper converts task-space actions to joint targets, while the
         # shared environment remains the final authority on robot capability.
         # Keep the historical joint-speed command limit as the only arm speed
         # guard for this configuration; do not add the newer Cartesian cap.
         self.base_env.config.hand_cartesian_velocity_limit_enabled = False
+        self.action_mode = TASK_SPACE_ACTION_MODE
         self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(5,), dtype=np.float32)
         self.observation_space = gym.spaces.Box(
             -10.0, 10.0, shape=(len(self.OBSERVATION_NAMES),), dtype=np.float32
@@ -587,6 +623,21 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         return local_offset, insertion_depth, inside
 
+    def _limit_ik_joint_velocity(self, q_velocity: np.ndarray) -> np.ndarray:
+        """Apply the legacy task-space decoder joint-velocity scaling."""
+        velocity_limits = np.asarray(
+            self.base_env.config.arm_joint_velocity_limits, dtype=float
+        )
+        velocity_scale = min(
+            1.0,
+            float(np.min(
+                velocity_limits / np.maximum(np.abs(q_velocity), 1e-12)
+            )),
+        )
+        q_velocity = q_velocity * velocity_scale
+        self._last_ik_velocity_scale = velocity_scale
+        return q_velocity
+
     def _convert_action(self, action: np.ndarray) -> np.ndarray:
         """Map a 5-D base-frame delta action to a velocity-safe joint target."""
         normalized = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
@@ -628,17 +679,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             jacobian @ jacobian.T + damping**2 * np.eye(6),
             twist,
         )
-        velocity_limits = np.asarray(
-            self.base_env.config.arm_joint_velocity_limits, dtype=float
-        )
-        velocity_scale = min(
-            1.0,
-            float(np.min(
-                velocity_limits / np.maximum(np.abs(q_velocity), 1e-12)
-            )),
-        )
-        q_velocity *= velocity_scale
-        self._last_ik_velocity_scale = velocity_scale
+        q_velocity = self._limit_ik_joint_velocity(q_velocity)
 
         previous_target = self.base_env._last_applied_action[:7]
         target_qpos = previous_target + control_dt * q_velocity
@@ -880,8 +921,12 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 or self._pinch_session_lift_high_water
                 >= self.rl_config.pinch_minimum_lift
             )
-            self._post_pinch_world_z_action_sum += float(action[2])
-            self._post_pinch_world_z_action_count += 1
+            if self.action_mode in (
+                TASK_SPACE_ACTION_MODE,
+                VERTICAL_DOWN_TASK_SPACE_ACTION_MODE,
+            ):
+                self._post_pinch_world_z_action_sum += float(action[2])
+                self._post_pinch_world_z_action_count += 1
             if self._pinch_session_start_hand_z is not None:
                 self._lift_attempt = bool(
                     self._lift_attempt
@@ -1167,6 +1212,13 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 * float(np.mean(np.square(action)))
             ),
             "reward_action_rate": self.rl_config.reward_action_rate * action_rate,
+            "reward_geometric_safety_violation": (
+                self.rl_config.reward_geometric_safety_violation
+                * float(
+                    info.get("termination_reason")
+                    == "geometric_safety_violation"
+                )
+            ),
         }
         return float(sum(components.values())), components
 
@@ -1478,3 +1530,311 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
     def close(self) -> None:
         # 原生MuJoCo数据没有额外线程或窗口；保留Gymnasium标准接口。
         return None
+
+
+class VerticalDownRLCableGraspEnv(RLCableGraspEnv):
+    """5D task-space IK with a world-vertical-down tool approach axis.
+
+    The common action limiter and guarded execution path remain active.  Only
+    the original task-space decoder's per-joint velocity rescaling is removed.
+    The gripper's yaw is retained around world Z.
+    """
+
+    # A small positive margin prevents the predicted finger meshes from
+    # entering the tabletop while leaving the cable-table contact untouched.
+    TABLE_FINGER_COLLISION_SAFETY_MARGIN = 0.0002
+    TABLE_FINGER_COLLISION_SEARCH_STEPS = 8
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.action_mode = VERTICAL_DOWN_TASK_SPACE_ACTION_MODE
+        self._table_finger_probe_data = mujoco.MjData(self.model)
+        self._table_finger_geom_ids = tuple(
+            int(geom_id) for geom_id in self.base_env.finger_collision_geom_ids
+        )
+        self._table_geom_id = int(self.base_env.table_geom_id)
+        self._table_finger_filter_count = 0
+        self._table_finger_filter_active = False
+        self._table_finger_filter_alpha = 1.0
+        self._table_finger_actual_min_distance = float("inf")
+        self._table_finger_predicted_min_distance = float("inf")
+
+    def _table_finger_min_distance(self, data: mujoco.MjData) -> float:
+        minimum = float("inf")
+        for contact in data.contact[:data.ncon]:
+            geom1 = int(contact.geom1)
+            geom2 = int(contact.geom2)
+            is_pair = (
+                geom1 == self._table_geom_id
+                and geom2 in self._table_finger_geom_ids
+            ) or (
+                geom2 == self._table_geom_id
+                and geom1 in self._table_finger_geom_ids
+            )
+            if is_pair:
+                minimum = min(minimum, float(contact.dist))
+        return minimum
+
+    def _probe_table_finger_distance(self, target_qpos: np.ndarray) -> float:
+        probe = self._table_finger_probe_data
+        probe.qpos[:] = self.data.qpos
+        probe.qpos[self.base_env.arm_qpos_adr] = np.asarray(
+            target_qpos, dtype=float
+        )
+        mujoco.mj_forward(self.model, probe)
+        return self._table_finger_min_distance(probe)
+
+    def _table_finger_recovery_target(self) -> np.ndarray:
+        """Generate a small upward escape target when contact already exists."""
+        jacp, _ = self.base_env._hand_jacobian()
+        jacobian = jacp[:, self.base_env.arm_dof_adr]
+        upward_delta = np.array([0.0, 0.0, 0.01], dtype=float)
+        damping = float(self.rl_config.ik_damping)
+        q_delta = jacobian.T @ np.linalg.solve(
+            jacobian @ jacobian.T + damping**2 * np.eye(3),
+            upward_delta,
+        )
+        joint_range = self.model.jnt_range[self.base_env.arm_joint_ids]
+        return np.clip(
+            self.data.qpos[self.base_env.arm_qpos_adr] + q_delta,
+            joint_range[:, 0],
+            joint_range[:, 1],
+        )
+
+    def _project_table_safe_target(self, candidate_qpos: np.ndarray) -> np.ndarray:
+        margin = float(self.TABLE_FINGER_COLLISION_SAFETY_MARGIN)
+        self._table_finger_filter_active = False
+        self._table_finger_filter_alpha = 1.0
+        self._table_finger_actual_min_distance = self._table_finger_min_distance(
+            self.data
+        )
+        candidate_qpos = np.asarray(candidate_qpos, dtype=float)
+        candidate_distance = self._probe_table_finger_distance(candidate_qpos)
+        self._table_finger_predicted_min_distance = candidate_distance
+        if candidate_distance >= margin:
+            return candidate_qpos
+
+        # A target-only projection cannot undo contact already accumulated by
+        # PD tracking and inertia.  In that case issue a small upward escape
+        # target first; cable-table contacts are not part of this filter.
+        if self._table_finger_actual_min_distance < margin:
+            recovery_qpos = self._table_finger_recovery_target()
+            recovery_distance = self._probe_table_finger_distance(recovery_qpos)
+            if recovery_distance > self._table_finger_actual_min_distance + 1e-8:
+                self._table_finger_filter_active = True
+                self._table_finger_filter_count += 1
+                self._table_finger_filter_alpha = 0.0
+                self._table_finger_predicted_min_distance = recovery_distance
+                return recovery_qpos
+
+        joint_range = self.model.jnt_range[self.base_env.arm_joint_ids]
+        start_qpos = np.clip(
+            np.asarray(self.base_env._last_applied_action[:7], dtype=float),
+            joint_range[:, 0],
+            joint_range[:, 1],
+        )
+        start_distance = self._probe_table_finger_distance(start_qpos)
+
+        # If the current target is already in contact, prioritize a target that
+        # increases clearance so the filter cannot trap the arm against the
+        # tabletop.  Otherwise hold the last safe target.
+        if start_distance < margin:
+            if candidate_distance > start_distance + 1e-8:
+                self._table_finger_filter_active = True
+                self._table_finger_filter_count += 1
+                self._table_finger_filter_alpha = 1.0
+                return candidate_qpos
+            self._table_finger_filter_active = True
+            self._table_finger_filter_count += 1
+            self._table_finger_filter_alpha = 0.0
+            self._table_finger_predicted_min_distance = start_distance
+            return start_qpos
+
+        # Binary-search the largest fraction of the original target motion
+        # that stays outside the small tabletop clearance margin.
+        low = 0.0
+        high = 1.0
+        safe_qpos = start_qpos
+        for _ in range(self.TABLE_FINGER_COLLISION_SEARCH_STEPS):
+            alpha = 0.5 * (low + high)
+            probe_qpos = start_qpos + alpha * (candidate_qpos - start_qpos)
+            probe_distance = self._probe_table_finger_distance(probe_qpos)
+            if probe_distance >= margin:
+                low = alpha
+                safe_qpos = probe_qpos
+            else:
+                high = alpha
+        self._table_finger_filter_active = True
+        self._table_finger_filter_count += 1
+        self._table_finger_filter_alpha = low
+        self._table_finger_predicted_min_distance = (
+            self._probe_table_finger_distance(safe_qpos)
+        )
+        return safe_qpos
+
+    def _convert_action(self, action: np.ndarray) -> np.ndarray:
+        mujoco_action = super()._convert_action(action)
+        if (
+            not self.table_finger_collision_filter_enabled
+            or self.base_env.config.geometric_safety_enabled
+        ):
+            return mujoco_action
+        mujoco_action[:7] = self._project_table_safe_target(mujoco_action[:7])
+        return mujoco_action
+
+    def _augment_info(self, info: dict, *, base_success: bool | None = None) -> dict:
+        result = super()._augment_info(info, base_success=base_success)
+        result["table_finger_collision_avoidance_enabled"] = (
+            self.table_finger_collision_filter_enabled
+        )
+        result["table_finger_collision_filter_active"] = (
+            self._table_finger_filter_active
+        )
+        result["table_finger_collision_filter_count"] = (
+            self._table_finger_filter_count
+        )
+        result["table_finger_collision_filter_alpha"] = (
+            self._table_finger_filter_alpha
+        )
+        result["table_finger_actual_min_distance"] = (
+            float(self._table_finger_actual_min_distance)
+            if np.isfinite(self._table_finger_actual_min_distance)
+            else None
+        )
+        result["table_finger_predicted_min_distance"] = (
+            float(self._table_finger_predicted_min_distance)
+            if np.isfinite(self._table_finger_predicted_min_distance)
+            else None
+        )
+        result["table_finger_collision_safety_margin"] = (
+            self.TABLE_FINGER_COLLISION_SAFETY_MARGIN
+        )
+        return result
+
+    def _vertical_down_rotation(self) -> np.ndarray:
+        current = self.data.xmat[self.base_env.hand_id].reshape(3, 3)
+        approach_world = np.array([0.0, 0.0, -1.0], dtype=float)
+        closing_world = current @ np.asarray(
+            self.base_env.gripper_closing_axis_local, dtype=float
+        )
+        closing_world[2] = 0.0
+        closing_norm = float(np.linalg.norm(closing_world))
+        if closing_norm < 1e-8:
+            closing_world = np.array([1.0, 0.0, 0.0], dtype=float)
+        else:
+            closing_world /= closing_norm
+        # Local axes are x=approach, y=lateral, z=closing, so y=z cross x.
+        lateral_world = np.cross(closing_world, approach_world)
+        lateral_world /= max(float(np.linalg.norm(lateral_world)), 1e-8)
+        return np.column_stack((approach_world, lateral_world, closing_world))
+
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict | None = None,
+    ) -> tuple[np.ndarray, dict]:
+        observation, info = super().reset(seed=seed, options=options)
+        self._desired_hand_rotation = self._vertical_down_rotation()
+        self._table_finger_filter_count = 0
+        self._table_finger_filter_active = False
+        self._table_finger_filter_alpha = 1.0
+        self._table_finger_actual_min_distance = float("inf")
+        self._table_finger_predicted_min_distance = float("inf")
+        return observation, info
+
+    def _limit_ik_joint_velocity(self, q_velocity: np.ndarray) -> np.ndarray:
+        # Keep the shared action limiter and velocity guard; remove only the
+        # original task-space decoder's per-joint velocity scaling.
+        self._last_ik_velocity_scale = 1.0
+        return np.asarray(q_velocity, dtype=float)
+
+
+class JointTargetRLCableGraspEnv(RLCableGraspEnv):
+    """RL environment with direct seven-joint target deltas plus gripper.
+
+    The seven arm outputs are normalized per-control-cycle target deltas.  They
+    are mapped directly to the arm joint position targets and then passed
+    through the shared target-velocity limiter and PD controller.  No task-
+    space IK is used in this mode.
+    """
+
+    ACTION_NAMES = (
+        *(f"joint_target_delta_{i}" for i in range(1, 8)),
+        "gripper_hysteresis",
+    )
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.action_mode = JOINT_TARGET_ACTION_MODE
+        self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(8,), dtype=np.float32)
+        self._previous_action = np.zeros(8, dtype=float)
+
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict | None = None,
+    ) -> tuple[np.ndarray, dict]:
+        observation, info = super().reset(seed=seed, options=options)
+        self._previous_action = np.zeros(8, dtype=float)
+        return observation, info
+
+    def _convert_action(self, action: np.ndarray) -> np.ndarray:
+        normalized = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
+        if normalized.shape != (8,):
+            raise ValueError(
+                f"Expected joint-target RL action shape (8,), got {normalized.shape}"
+            )
+
+        control_dt = float(
+            self.model.opt.timestep * max(1, self.base_env.config.frame_skip)
+        )
+        previous_target = self.base_env._last_applied_action[:7]
+        velocity_limits = np.asarray(
+            self.base_env.config.arm_joint_velocity_limits, dtype=float
+        )
+        target_delta = normalized[:7] * velocity_limits * control_dt
+        joint_range = self.model.jnt_range[self.base_env.arm_joint_ids]
+        target_qpos = np.clip(
+            previous_target + target_delta,
+            joint_range[:, 0],
+            joint_range[:, 1],
+        )
+        mujoco_action = np.empty(8, dtype=float)
+        mujoco_action[:7] = target_qpos
+
+        previous_gripper_closed = self._gripper_closed
+        if normalized[7] <= self.rl_config.gripper_close_threshold:
+            self._gripper_closed = True
+        elif normalized[7] >= self.rl_config.gripper_open_threshold:
+            self._gripper_closed = False
+        self._gripper_switch_event = bool(
+            self._gripper_closed != previous_gripper_closed
+        )
+        self._gripper_switch_count += int(self._gripper_switch_event)
+        gripper_range = self.model.actuator_ctrlrange[
+            self.base_env.gripper_actuator_id
+        ]
+        closed_ctrl = float(np.clip(
+            self.rl_config.gripper_closed_ctrl,
+            gripper_range[0],
+            gripper_range[1],
+        ))
+        mujoco_action[self.base_env.gripper_actuator_id] = (
+            closed_ctrl if self._gripper_closed else float(gripper_range[1])
+        )
+        self._last_ik_velocity_scale = 1.0
+        self._last_commanded_world_translation[:] = 0.0
+        return mujoco_action
+
+
+def make_rl_env(*, action_mode: str = TASK_SPACE_ACTION_MODE, **kwargs):
+    """Construct the requested RL action interface without mixing checkpoints."""
+    if action_mode == TASK_SPACE_ACTION_MODE:
+        return RLCableGraspEnv(**kwargs)
+    if action_mode == VERTICAL_DOWN_TASK_SPACE_ACTION_MODE:
+        return VerticalDownRLCableGraspEnv(**kwargs)
+    if action_mode == JOINT_TARGET_ACTION_MODE:
+        return JointTargetRLCableGraspEnv(**kwargs)
+    raise ValueError(f"unsupported RL action mode: {action_mode!r}")

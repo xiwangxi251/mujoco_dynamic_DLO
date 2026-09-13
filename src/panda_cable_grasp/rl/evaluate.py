@@ -39,7 +39,11 @@ from ..evaluation.failure_taxonomy import (
 from ..evaluation.defaults import DEFAULT_EVALUATION_SEED
 from ..scenarios.registry import list_scenario_names
 from ..paths import output_path
-from .environment import RLCableGraspEnv
+from .environment import (
+    RLCableGraspEnv,
+    action_interface_version,
+    make_rl_env,
+)
 from .train import RL_L1_SCENARIOS
 
 
@@ -128,6 +132,17 @@ EPISODE_FIELDS = (
     "action_rms",
     "action_rate_rms",
     "action_saturation_fraction",
+    "table_finger_collision_filter_count",
+    "table_finger_collision_filter_alpha_final",
+    "table_finger_actual_min_distance_m",
+    "table_finger_predicted_min_distance_m",
+    "geometric_safety_enabled",
+    "geometric_safety_filter_count",
+    "geometric_safety_fence_steps",
+    "geometric_safety_probe_count",
+    "geometric_safety_min_distance_final_m",
+    "geometric_safety_min_distance_min_m",
+    "geometric_safety_termination",
     "policy_inference_mean_ms",
     "policy_inference_p95_ms",
 )
@@ -143,6 +158,18 @@ def checkpoint_interface_version(checkpoint: Path) -> str | None:
         with config_path.open("r", encoding="utf-8") as source:
             return str(json.load(source).get("rl_interface_version", "")) or None
     return None
+
+
+def checkpoint_action_mode(checkpoint: Path) -> str:
+    """Read the action mode saved beside a checkpoint; old runs are task-space."""
+    checkpoint = Path(checkpoint).resolve()
+    for directory in (checkpoint.parent, *checkpoint.parents):
+        config_path = directory / "training_config.json"
+        if not config_path.is_file():
+            continue
+        with config_path.open("r", encoding="utf-8") as source:
+            return str(json.load(source).get("action_mode", "task_space"))
+    return "task_space"
 
 
 def resolve_scenario_names(
@@ -276,6 +303,7 @@ class EpisodeDiagnostics:
     last_grasp_break_reason: str | None = None
     last_grasp_break_causal_class: str | None = None
     min_target_distance: float = math.inf
+    min_geometric_safety_distance: float = math.inf
     peak_grasp_lift_delta: float = 0.0
     peak_strict_success_hold: float = 0.0
     peak_lifted_fraction: float = 0.0
@@ -315,6 +343,13 @@ class EpisodeDiagnostics:
         target_distance = _finite_or_none(info.get("target_distance"))
         if isinstance(target_distance, (int, float)):
             self.min_target_distance = min(self.min_target_distance, float(target_distance))
+        safety_distance = _finite_or_none(
+            info.get("geometric_safety_min_distance")
+        )
+        if isinstance(safety_distance, (int, float)):
+            self.min_geometric_safety_distance = min(
+                self.min_geometric_safety_distance, float(safety_distance)
+            )
         self.peak_grasp_lift_delta = max(
             self.peak_grasp_lift_delta,
             float(_finite_or_none(info.get("grasp_lift_delta")) or 0.0),
@@ -484,7 +519,8 @@ def _manifest(
         "failure_taxonomy_source": _file_record(taxonomy_source),
         "checkpoint": _file_record(args.model),
         "environment": {
-            "rl_interface_version": RL_INTERFACE_VERSION,
+            "rl_interface_version": action_interface_version(args.action_mode),
+            "action_mode": args.action_mode,
             "robot": env.base_env.robot,
             "source_xml": _file_record(XML_PATH),
             "panda_xml": _file_record(PANDA_XML_PATH),
@@ -569,7 +605,8 @@ def print_episode(episode: int, episode_return: float, steps: int, info: dict) -
         f"aperture={1000.0 * info['finger_aperture']:.1f}mm "
         f"lift_delta={1000.0 * info['grasp_lift_delta']:.1f}mm "
         f"strict_hold={info['strict_success_hold']:.2f}s "
-        f"lifted_fraction={info['lifted_fraction']:.2f} max_z={info['max_z']:.3f}m",
+        f"lifted_fraction={info['lifted_fraction']:.2f} max_z={info['max_z']:.3f}m "
+        f"table_finger_filter={info.get('table_finger_collision_filter_count', 0)}",
         flush=True,
     )
 
@@ -736,6 +773,39 @@ def _episode_row(
             if diagnostics.action_elements
             else None
         ),
+        "table_finger_collision_filter_count": int(
+            final_info.get("table_finger_collision_filter_count", 0)
+        ),
+        "table_finger_collision_filter_alpha_final": _finite_or_none(
+            final_info.get("table_finger_collision_filter_alpha")
+        ),
+        "table_finger_actual_min_distance_m": _finite_or_none(
+            final_info.get("table_finger_actual_min_distance")
+        ),
+        "table_finger_predicted_min_distance_m": _finite_or_none(
+            final_info.get("table_finger_predicted_min_distance")
+        ),
+        "geometric_safety_enabled": bool(
+            final_info.get("geometric_safety_enabled", False)
+        ),
+        "geometric_safety_filter_count": int(
+            final_info.get("geometric_safety_filter_count", 0)
+        ),
+        "geometric_safety_fence_steps": int(
+            final_info.get("geometric_safety_fence_steps", 0)
+        ),
+        "geometric_safety_probe_count": int(
+            final_info.get("geometric_safety_probe_count", 0)
+        ),
+        "geometric_safety_min_distance_final_m": _finite_or_none(
+            final_info.get("geometric_safety_min_distance")
+        ),
+        "geometric_safety_min_distance_min_m": _finite_or_none(
+            diagnostics.min_geometric_safety_distance
+        ),
+        "geometric_safety_termination": (
+            final_info.get("termination_reason") == "geometric_safety_violation"
+        ),
         "policy_inference_mean_ms": (
             float(np.mean(inference_ms)) if inference_ms.size else None
         ),
@@ -754,13 +824,15 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
     episodes_with_physical_slip = 0
     successful_episodes_with_physical_slip = 0
     task_success_without_confirmed_grasp = 0
-    env = RLCableGraspEnv(
+    env = make_rl_env(
+        action_mode=args.action_mode,
         robot=getattr(args, "robot", "panda"),
         seed=args.seed,
         disturbance_strength=args.disturbance,
         episode_seconds=args.episode_seconds,
         scenario_names=args.scenario_names,
         dynamicvla_cameras_enabled=True,
+        geometric_safety_enabled=args.geometric_safety,
     )
 
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
@@ -1181,13 +1253,15 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
 def run_viewer(args: argparse.Namespace, model: PPO) -> None:
     from mujoco import viewer
 
-    env = RLCableGraspEnv(
+    env = make_rl_env(
+        action_mode=args.action_mode,
         robot=getattr(args, "robot", "panda"),
         seed=args.seed,
         disturbance_strength=args.disturbance,
         episode_seconds=args.episode_seconds,
         scenario_names=args.scenario_names,
         dynamicvla_cameras_enabled=True,
+        geometric_safety_enabled=args.geometric_safety,
     )
     observation, info = env.reset(seed=args.seed)
     episode = 1
@@ -1268,6 +1342,20 @@ def parse_args() -> argparse.Namespace:
         "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
         help="robot model used by the MuJoCo environment",
     )
+    parser.add_argument(
+        "--action-mode",
+        choices=("task_space", "task_space_vertical_down", "joint_target"),
+        default=None,
+        help=(
+            "action interface; omitted means infer it from the checkpoint "
+            "training manifest"
+        ),
+    )
+    parser.add_argument(
+        "--geometric-safety",
+        action="store_true",
+        help="enable the shared geometric robot-obstacle safety layer",
+    )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument(
         "--scenario",
@@ -1322,14 +1410,17 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     arguments = parse_args()
     arguments.model = _resolve_model_file(arguments.model)
+    if arguments.action_mode is None:
+        arguments.action_mode = checkpoint_action_mode(arguments.model)
     interface_version = checkpoint_interface_version(arguments.model)
     if (
-        interface_version != RL_INTERFACE_VERSION
+        interface_version != action_interface_version(arguments.action_mode)
         and not arguments.allow_incompatible_interface
     ):
         raise SystemExit(
-            "checkpoint is not marked baseline_v4; use its saved historical videos "
-            "or pass --allow-incompatible-interface only for deliberate diagnostics"
+            "checkpoint action interface does not match the requested action mode; "
+            "use the checkpoint's saved action mode or pass "
+            "--allow-incompatible-interface only for deliberate diagnostics"
         )
     set_random_seed(arguments.seed)
     # Only the learned parameters are needed for evaluation.  SB3 also stores

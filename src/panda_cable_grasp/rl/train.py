@@ -25,7 +25,12 @@ from stable_baselines3.common.vec_env import (
 from ..scenarios.registry import list_scenario_names
 from ..env.environment import ROBOT_SPECS
 from ..paths import output_path
-from .environment import RLCableGraspEnv, RLConfig
+from .environment import (
+    RLCableGraspEnv,
+    RLConfig,
+    action_interface_version,
+    make_rl_env,
+)
 from .metrics import TrainingMetricsCallback, plot_training_curves
 
 
@@ -139,12 +144,17 @@ def linear_schedule(
 def make_worker(rank: int, args: argparse.Namespace):
     """返回可由Windows spawn进程安全构造的独立环境工厂。"""
     def initialize():
-        env = RLCableGraspEnv(
+        env = make_rl_env(
+            action_mode=args.action_mode,
             robot=getattr(args, "robot", "panda"),
             seed=args.seed + rank,
             disturbance_strength=args.disturbance,
             episode_seconds=args.episode_seconds,
             scenario_names=args.training_scenario_names,
+            geometric_safety_enabled=args.geometric_safety,
+            table_finger_collision_filter_enabled=(
+                not args.disable_table_finger_collision_filter
+            ),
         )
         if (
             args.training_distribution == "l1"
@@ -163,12 +173,17 @@ def make_worker(rank: int, args: argparse.Namespace):
 def make_eval_worker(rank: int, args: argparse.Namespace):
     """Build one deterministic strict-evaluation environment."""
     def initialize():
-        return RLCableGraspEnv(
+        return make_rl_env(
+            action_mode=args.action_mode,
             robot=getattr(args, "robot", "panda"),
             seed=args.eval_seed + rank,
             disturbance_strength=args.disturbance,
             episode_seconds=args.episode_seconds,
             scenario_names=args.eval_scenario_names,
+            geometric_safety_enabled=args.geometric_safety,
+            table_finger_collision_filter_enabled=(
+                not args.disable_table_finger_collision_filter
+            ),
         )
     return initialize
 
@@ -662,6 +677,27 @@ def parse_args() -> argparse.Namespace:
         help="robot model used by the MuJoCo environment",
     )
     parser.add_argument(
+        "--action-mode",
+        choices=("task_space", "task_space_vertical_down", "joint_target"),
+        default="task_space",
+        help=(
+            "RL action interface: task_space is the historical 5D IK action; "
+            "task_space_vertical_down is 5D ordinary IK with the gripper "
+            "approach axis fixed vertically downward; "
+            "joint_target is 7 joint target deltas plus gripper"
+        ),
+    )
+    parser.add_argument(
+        "--geometric-safety",
+        action="store_true",
+        help="enable the shared geometric robot-obstacle safety layer",
+    )
+    parser.add_argument(
+        "--disable-table-finger-collision-filter",
+        action="store_true",
+        help="disable the vertical-down gripper/table target filter",
+    )
+    parser.add_argument(
         "--training-distribution", choices=("legacy", "l1", "id"), default="l1",
         help=(
             "l1 uses the four nominal L1 curriculum scenes; id samples the "
@@ -861,10 +897,10 @@ def parse_args() -> argparse.Namespace:
         version = checkpoint_interface_version(
             args.resume if args.resume.is_file() else resume_with_zip
         )
-        if version != RL_INTERFACE_VERSION:
+        if version != action_interface_version(args.action_mode):
             parser.error(
-                "--resume checkpoint predates the baseline_v4 action/reward "
-                "interface and cannot be continued safely"
+                "--resume checkpoint uses a different RL action interface and "
+                "cannot be continued safely"
             )
     return args
 
@@ -877,12 +913,17 @@ def main() -> None:
     target_kl = args.target_kl if args.target_kl > 0.0 else None
 
     # 启动大批量训练前先检查一次Gymnasium API、shape和数据类型。
-    check_candidate = RLCableGraspEnv(
+    check_candidate = make_rl_env(
+        action_mode=args.action_mode,
         robot=getattr(args, "robot", "panda"),
         seed=args.seed,
         disturbance_strength=args.disturbance,
         episode_seconds=args.episode_seconds,
         scenario_names=args.training_scenario_names,
+        geometric_safety_enabled=args.geometric_safety,
+        table_finger_collision_filter_enabled=(
+            not args.disable_table_finger_collision_filter
+        ),
     )
     check_env(check_candidate, warn=True)
     check_candidate.close()
@@ -1032,7 +1073,13 @@ def main() -> None:
     callbacks = CallbackList(callback_items)
     configuration = {
         "algorithm": "PPO",
-        "rl_interface_version": RL_INTERFACE_VERSION,
+        "rl_interface_version": action_interface_version(args.action_mode),
+        "action_mode": args.action_mode,
+        "arm_acceleration_limit_enabled": True,
+        "geometric_safety_enabled": args.geometric_safety,
+        "table_finger_collision_filter_enabled": (
+            not args.disable_table_finger_collision_filter
+        ),
         "grasp_model": "physical_friction_v1",
         "output": str(args.output.resolve()),
         "timesteps": args.timesteps,
@@ -1119,7 +1166,7 @@ def main() -> None:
         ),
         "observation_names": list(RLCableGraspEnv.OBSERVATION_NAMES),
         "observation_dimension": len(RLCableGraspEnv.OBSERVATION_NAMES),
-        "action_names": list(RLCableGraspEnv.ACTION_NAMES),
+        "action_names": list(check_candidate.ACTION_NAMES),
         "rl_config": asdict(RLConfig()),
         "reward": (
             "pre-pinch nearest-segment reach progress + planar perpendicular "
