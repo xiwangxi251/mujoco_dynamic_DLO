@@ -33,6 +33,15 @@ NERO_ARM_JOINT_VELOCITY_LIMITS = (
     1.25 * math.pi, 1.25 * math.pi, 1.25 * math.pi, 1.25 * math.pi,
 )
 
+DEFAULT_DYNAMICVLA_WRIST_CAMERA_POS = (0.065, 0.0, 0.0)
+DEFAULT_DYNAMICVLA_WRIST_CAMERA_QUAT = (
+    0.0, 0.7071067812, 0.7071067812, 0.0,
+)
+NERO_DYNAMICVLA_WRIST_CAMERA_POS = (0.020, -0.100, 0.0)
+NERO_DYNAMICVLA_WRIST_CAMERA_QUAT = (
+    0.0, -0.7071067812, 0.0, 0.7071067812,
+)
+
 
 @dataclass(frozen=True)
 class RobotSpec:
@@ -309,9 +318,11 @@ class EnvConfig:
     dynamicvla_opst_camera_quat: tuple[float, float, float, float] = (
         0.6123724357, 0.3535533906, 0.3535533906, 0.6123724357,
     )
-    dynamicvla_wrist_camera_pos: tuple[float, float, float] = (0.065, 0.0, 0.0)
+    dynamicvla_wrist_camera_pos: tuple[float, float, float] = (
+        DEFAULT_DYNAMICVLA_WRIST_CAMERA_POS
+    )
     dynamicvla_wrist_camera_quat: tuple[float, float, float, float] = (
-        0.0, 0.7071067812, 0.7071067812, 0.0,
+        DEFAULT_DYNAMICVLA_WRIST_CAMERA_QUAT
     )
 
     # 机器人运动能力限制
@@ -336,6 +347,16 @@ class EnvConfig:
                 self.robot_motion_limit_profile = "nero_v1"
             if self.arm_joint_velocity_limits == DEFAULT_ARM_JOINT_VELOCITY_LIMITS:
                 self.arm_joint_velocity_limits = NERO_ARM_JOINT_VELOCITY_LIMITS
+            # Match the Panda camera-rig convention: offset the camera along
+            # the gripper's lateral axis and look down its approach axis.
+            # NERO's housing occupies the +Y side, so use the clear -Y side;
+            # place the camera just 2 cm along the approach direction so only
+            # the finger tips enter the lower corners of the view.  Keep an
+            # explicit user override.
+            if self.dynamicvla_wrist_camera_pos == DEFAULT_DYNAMICVLA_WRIST_CAMERA_POS:
+                self.dynamicvla_wrist_camera_pos = NERO_DYNAMICVLA_WRIST_CAMERA_POS
+            if self.dynamicvla_wrist_camera_quat == DEFAULT_DYNAMICVLA_WRIST_CAMERA_QUAT:
+                self.dynamicvla_wrist_camera_quat = NERO_DYNAMICVLA_WRIST_CAMERA_QUAT
         if self.target_selection not in {"random", "middle"}:
             raise ValueError(
                 "target_selection must be either 'random' or 'middle'"
