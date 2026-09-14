@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import mujoco
 import numpy as np
 
 from ..env.environment import CableGraspEnv
@@ -33,10 +34,8 @@ class DynamicVLAAdapterConfig:
     orientation_damping_max: float = 0.16
     ik_target_horizon: float = 0.11
     nullspace_gain: float = 0.8
-    # The NERO expert labels are the task-space target before its own
-    # hierarchical velocity IK.  Use the same velocity-style adapter when
-    # replaying or evaluating a policy trained on those labels.  The pose-IK
-    # path remains available for older FK-derived checkpoints.
+    # NERO evaluation can use the same iterative damped pose IK as the
+    # pi0.5 path. Keep the velocity-Jacobian path available for ablations.
     nero_pose_ik_enabled: bool = True
     pose_ik_iterations: int = 20
     pose_ik_damping: float = 0.025
@@ -98,6 +97,86 @@ class DynamicVLATaskSpaceAdapter:
         norm = float(np.linalg.norm(vector))
         return vector if norm <= limit else vector * (limit / norm)
 
+    def _pose_ik_target(
+        self,
+        desired_position: np.ndarray,
+        desired_quaternion: np.ndarray,
+    ) -> np.ndarray:
+        """Solve an absolute TCP pose into a joint-position target.
+
+        This is the NERO/Pi05-style iterative damped least-squares pose IK.
+        The environment still applies its normal joint-velocity and collision
+        limits when the returned target is stepped.
+        """
+
+        q_current = np.asarray(
+            self.env.data.qpos[self.env.arm_qpos_adr], dtype=float
+        ).copy()
+        q_candidate = q_current.copy()
+        joint_range = self.env.model.jnt_range[self.env.arm_joint_ids]
+        saved_qpos = self.env.data.qpos.copy()
+        saved_qvel = self.env.data.qvel.copy()
+        try:
+            for _ in range(int(self.config.pose_ik_iterations)):
+                self.env.data.qpos[self.env.arm_qpos_adr] = q_candidate
+                self.env.data.qvel[self.env.arm_dof_adr] = 0.0
+                mujoco.mj_forward(self.env.model, self.env.data)
+
+                position_error = (
+                    np.asarray(desired_position, dtype=float)
+                    - self.env.hand_position
+                )
+                current_rotation = self.env.data.xmat[
+                    self.env.hand_id
+                ].reshape(3, 3)
+                orientation_error = quat_error(
+                    rotation_to_quat(current_rotation), desired_quaternion
+                )
+                if (
+                    np.linalg.norm(position_error) < 2e-4
+                    and np.linalg.norm(orientation_error) < 2e-4
+                ):
+                    break
+
+                jac_pos, jac_rot = point_jacobian(
+                    self.env.model,
+                    self.env.data,
+                    self.env.hand_id,
+                    self.env.GRASP_CENTER_LOCAL,
+                )
+                jacobian = np.vstack((jac_pos, jac_rot))[
+                    :, self.env.arm_dof_adr
+                ]
+                orientation_weight = float(
+                    self.config.pose_ik_orientation_weight
+                )
+                weighted_jacobian = np.vstack((
+                    jacobian[:3], orientation_weight * jacobian[3:]
+                ) )
+                weighted_error = np.concatenate((
+                    position_error, orientation_weight * orientation_error
+                ))
+                damping = float(self.config.pose_ik_damping)
+                delta = weighted_jacobian.T @ np.linalg.solve(
+                    weighted_jacobian @ weighted_jacobian.T
+                    + damping**2 * np.eye(6),
+                    weighted_error,
+                )
+                maximum = float(np.max(np.abs(delta)))
+                max_step = float(self.config.pose_ik_max_joint_step)
+                if maximum > max_step:
+                    delta *= max_step / maximum
+                q_candidate = np.clip(
+                    q_candidate + delta,
+                    joint_range[:, 0],
+                    joint_range[:, 1],
+                )
+        finally:
+            self.env.data.qpos[:] = saved_qpos
+            self.env.data.qvel[:] = saved_qvel
+            mujoco.mj_forward(self.env.model, self.env.data)
+        return q_candidate
+
     def set_model_action(self, action: np.ndarray) -> None:
         """Accept one official server-format action ``[xyz, quat_wxyz, grip]``."""
 
@@ -155,6 +234,15 @@ class DynamicVLATaskSpaceAdapter:
 
         desired_position = self.last_pose_command[:3]
         desired_quaternion = self.last_pose_command[3:]
+        if self.env.robot == "nero" and self.config.nero_pose_ik_enabled:
+            self.last_joint_action[:7] = self._pose_ik_target(
+                desired_position, desired_quaternion
+            )
+            self.last_joint_action[self.env.gripper_actuator_id] = (
+                self._gripper_ctrl
+            )
+            return self.last_joint_action.copy()
+
         current_rotation = self.env.data.xmat[self.env.hand_id].reshape(3, 3)
         current_quaternion = rotation_to_quat(current_rotation)
         position_error = desired_position - self.env.hand_position

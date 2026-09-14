@@ -29,6 +29,8 @@ from ..evaluation.defaults import DEFAULT_EVALUATION_SEED, DEFAULT_VIDEO_FPS
 from ..evaluation.recording import EpisodeRecorder
 from ..env.environment import (
     CableGraspEnv,
+    DEFAULT_DYNAMICVLA_WRIST_CAMERA_POS,
+    DEFAULT_DYNAMICVLA_WRIST_CAMERA_QUAT,
     EnvConfig,
     PANDA_XML_PATH,
     ROBOT_SPECS,
@@ -46,7 +48,10 @@ from ..paths import output_path
 
 def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
     scenario = get_scenario(args.scenario)
-    return EnvConfig(
+    wrist_camera = getattr(args, "wrist_camera", "new")
+    if wrist_camera not in {"new", "old"}:
+        raise ValueError(f"unsupported wrist camera preset: {args.wrist_camera!r}")
+    config = EnvConfig(
         robot=getattr(args, "robot", "panda"),
         seed=args.seed,
         episode_seconds=args.episode_seconds,
@@ -57,13 +62,20 @@ def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
         dynamicvla_cameras_enabled=True,
         **scenario.to_env_overrides(),
     )
+    # EnvConfig.__post_init__ intentionally maps its default camera values to
+    # NERO's new rig.  For the old-camera control arm, restore the old rig
+    # after construction so it is not remapped by that compatibility rule.
+    if wrist_camera == "old" and config.robot == "nero":
+        config.dynamicvla_wrist_camera_pos = DEFAULT_DYNAMICVLA_WRIST_CAMERA_POS
+        config.dynamicvla_wrist_camera_quat = DEFAULT_DYNAMICVLA_WRIST_CAMERA_QUAT
+    return config
 
 
 def adapter_for_env(env: CableGraspEnv) -> DynamicVLATaskSpaceAdapter:
     """Use the controller semantics that match the NERO expert labels."""
 
     config = (
-        DynamicVLAAdapterConfig(nero_pose_ik_enabled=False)
+        DynamicVLAAdapterConfig(nero_pose_ik_enabled=True)
         if env.robot == "nero"
         else None
     )
@@ -527,6 +539,7 @@ def run_server(args: argparse.Namespace) -> None:
                 "cameras": ["opst_cam", "wrist_cam"],
             },
             "camera": {
+                "wrist_preset": args.wrist_camera,
                 "width": env.config.dynamicvla_camera_width,
                 "height": env.config.dynamicvla_camera_height,
                 "fovy": env.config.dynamicvla_camera_fovy,
@@ -608,6 +621,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
         help="robot model used by the MuJoCo environment",
+    )
+    parser.add_argument(
+        "--wrist-camera", choices=("new", "old"), default="new",
+        help="NERO wrist-camera rig: new training position or old position",
     )
     parser.add_argument("--video-fps", type=float, default=DEFAULT_VIDEO_FPS)
     parser.add_argument(
