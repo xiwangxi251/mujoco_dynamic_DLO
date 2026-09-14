@@ -609,6 +609,12 @@ def run_cell(job: dict[str, Any]) -> dict[str, Any]:
     return {"summary": summary, "rows": rows}
 
 
+DEFAULT_SCRIPTED_CONFIG = {
+    # Shared defaults used by the historical NERO calibration commands.
+    "lift_distance": 0.3,
+}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=10)
@@ -627,9 +633,16 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--variants", nargs="+", choices=("scripted", "expert"),
-        default=["scripted", "expert"],
+        default=["scripted"],
     )
-    parser.add_argument("--scripted-config-json", default="{}")
+    parser.add_argument(
+        "--scripted-config-json",
+        default=None,
+        help=(
+            "JSON overrides for scripted policy defaults; only supplied "
+            "fields need to be listed"
+        ),
+    )
     parser.add_argument(
         "--scenarios",
         nargs="+",
@@ -645,8 +658,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--nero-use-panda-velocity-limits",
+        dest="nero_use_panda_velocity_limits",
         action="store_true",
-        help="Override NERO arm joint velocity limits with Panda's limits for this run",
+        default=True,
+        help=(
+            "Override NERO arm joint velocity limits with Panda's limits "
+            "(default: enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--no-nero-use-panda-velocity-limits",
+        dest="nero_use_panda_velocity_limits",
+        action="store_false",
+        help="Keep NERO's own arm joint velocity limits",
     )
     parser.add_argument(
         "--nero-ready-qpos",
@@ -673,7 +697,7 @@ def main() -> None:
         help="Scale NERO joint1-7 position-servo kv for this run",
     )
     parser.add_argument(
-        "--nero-gripper-force-scale", type=float, default=None,
+        "--nero-gripper-force-scale", type=float, default=10.0,
         help="Override NERO gripper force scale for this run",
     )
     parser.add_argument(
@@ -689,8 +713,8 @@ def main() -> None:
         help="save successful FULLPHYSICS trajectories without rendering videos",
     )
     parser.add_argument("--video-fps", type=float, default=25.0)
-    parser.add_argument("--base-values", nargs="+", type=float, default=[0.15, 0.20, 0.25])
-    parser.add_argument("--tcp-dx-values", nargs="+", type=float, default=[0.0])
+    parser.add_argument("--base-values", nargs="+", type=float, default=[0.35])
+    parser.add_argument("--tcp-dx-values", nargs="+", type=float, default=[0.01])
     parser.add_argument(
         "--tcp-dy-values", nargs="+", type=float, default=[0.0],
         help="NERO grasp-center offset along link7 local y in metres",
@@ -737,12 +761,15 @@ def main() -> None:
             dynamic_portfolio_enabled=False,
         )
     )
-    try:
-        scripted_config = json.loads(args.scripted_config_json)
-    except json.JSONDecodeError as error:
-        parser.error(f"invalid --scripted-config-json: {error}")
-    if not isinstance(scripted_config, dict):
-        parser.error("--scripted-config-json must decode to an object")
+    scripted_config = dict(DEFAULT_SCRIPTED_CONFIG)
+    if args.scripted_config_json is not None:
+        try:
+            scripted_overrides = json.loads(args.scripted_config_json)
+        except json.JSONDecodeError as error:
+            parser.error(f"invalid --scripted-config-json: {error}")
+        if not isinstance(scripted_overrides, dict):
+            parser.error("--scripted-config-json must decode to an object")
+        scripted_config.update(scripted_overrides)
     jobs: list[dict[str, Any]] = []
     for base_x in args.base_values:
         for tcp_dx in args.tcp_dx_values:

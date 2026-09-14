@@ -61,6 +61,41 @@ class PolicyConfig:
     # primary IK task and solve translation only in its nullspace.
     strict_vertical_gripper: bool = False
     strict_vertical_tolerance: float = math.radians(5.0)
+    # NERO can accumulate a large orientation error while lifting a confirmed
+    # grasp.  This optional mode keeps the normal position-priority IK for
+    # approach/intercept, then makes orientation primary only after grasp
+    # confirmation so the lift/carry motion does not twist the cable out.
+    nero_post_grasp_orientation_priority: bool = False
+    # Optional NERO-only ablation: make orientation primary during the final
+    # descent/intercept, while retaining position priority during the longer
+    # approach where exact pose tracking would otherwise prevent contact.
+    nero_intercept_orientation_priority: bool = False
+    # Optional NERO-only ablation: regulate the two tilt components of the
+    # vertical grasp frame while approaching and after grasp confirmation.
+    # Translation remains available in the orientation nullspace; unlike
+    # strict_vertical_gripper this does not halt translation when tilt is high.
+    nero_approach_orientation_priority: bool = False
+    # NERO-only alternative to full-pose priority: regulate only the two tilt
+    # components of the approach axis in the position-task nullspace, leaving
+    # the horizontal yaw free for dynamic tracking.
+    nero_tilt_only_orientation_control: bool = False
+    # Optional NERO-only weighted 6-D IK.  The baseline uses a strict
+    # position-primary/nullspace decomposition; this mode lets a small pose
+    # weight trade a little translation error for better orientation retention.
+    nero_weighted_pose_ik: bool = False
+    nero_pose_orientation_weight: float = 0.25
+    # NERO's stock vertical convention leaves the finger tips pointing away
+    # from the table.  This optional 180-degree flip about the jaw axis keeps
+    # the jaw closing direction unchanged while pointing the tips downward.
+    nero_finger_tips_down: bool = False
+    # Rotate the NERO grasp frame in the horizontal plane while preserving the
+    # downward approach axis.  This is a task-space pose ablation; zero keeps
+    # the calibrated baseline unchanged.
+    nero_grasp_yaw_offset_deg: float = 0.0
+    # Optional two-stage yaw schedule for NERO: use this yaw during APPROACH,
+    # then switch to nero_grasp_yaw_offset_deg at the start of INTERCEPT.
+    # None preserves the single fixed-yaw behavior.
+    nero_approach_yaw_offset_deg: float | None = None
     policy_joint_velocity_fraction: float = 1.0
     ik_target_horizon: float = 0.11
     intercept_timeout: float = 9.0
@@ -95,7 +130,7 @@ class PolicyConfig:
             "precision_linear_velocity_limit", "policy_joint_velocity_fraction",
             "approach_orientation_gain", "precision_orientation_gain",
             "ik_target_horizon", "strict_vertical_tolerance",
-            "retry_min_remaining_seconds",
+            "retry_min_remaining_seconds", "nero_pose_orientation_weight",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
@@ -109,6 +144,25 @@ class PolicyConfig:
             raise ValueError("policy_joint_velocity_fraction must be in (0, 1]")
         if not isinstance(self.strict_vertical_gripper, bool):
             raise ValueError("strict_vertical_gripper must be boolean")
+        if not isinstance(self.nero_post_grasp_orientation_priority, bool):
+            raise ValueError("nero_post_grasp_orientation_priority must be boolean")
+        if not isinstance(self.nero_intercept_orientation_priority, bool):
+            raise ValueError("nero_intercept_orientation_priority must be boolean")
+        if not isinstance(self.nero_approach_orientation_priority, bool):
+            raise ValueError("nero_approach_orientation_priority must be boolean")
+        if not isinstance(self.nero_tilt_only_orientation_control, bool):
+            raise ValueError("nero_tilt_only_orientation_control must be boolean")
+        if not isinstance(self.nero_weighted_pose_ik, bool):
+            raise ValueError("nero_weighted_pose_ik must be boolean")
+        if not isinstance(self.nero_finger_tips_down, bool):
+            raise ValueError("nero_finger_tips_down must be boolean")
+        if not math.isfinite(self.nero_grasp_yaw_offset_deg):
+            raise ValueError("nero_grasp_yaw_offset_deg must be finite")
+        if (
+            self.nero_approach_yaw_offset_deg is not None
+            and not math.isfinite(self.nero_approach_yaw_offset_deg)
+        ):
+            raise ValueError("nero_approach_yaw_offset_deg must be finite or None")
         if (
             self.max_retries is not None
             and (
@@ -183,6 +237,22 @@ class DynamicCableGraspPolicy:
         self.desired_approach_axis = np.array([0.0, 0.0, 1.0])
         self.reset()
 
+    def _nero_grasp_rotation(self, yaw_offset_deg: float) -> np.ndarray:
+        """Return one NERO vertical grasp frame with a horizontal yaw offset."""
+
+        desired_rotation = self.env.vertical_grasp_rotation()
+        if self.config.nero_finger_tips_down:
+            desired_rotation = np.diag([-1.0, 1.0, -1.0]) @ desired_rotation
+        yaw = math.radians(yaw_offset_deg)
+        if abs(yaw) > 1e-12:
+            yaw_rotation = np.array([
+                [math.cos(yaw), -math.sin(yaw), 0.0],
+                [math.sin(yaw), math.cos(yaw), 0.0],
+                [0.0, 0.0, 1.0],
+            ])
+            desired_rotation = yaw_rotation @ desired_rotation
+        return desired_rotation
+
     def reset(self) -> None:
         self.phase = Phase.SETTLE
         self.phase_start = float(self.env.data.time)
@@ -218,8 +288,13 @@ class DynamicCableGraspPolicy:
         ])
         if self.env.robot == "nero":
             # NERO's jaw closing and tool approach axes differ from Panda's
-            # link frame, so use the calibrated robot-frame convention.
-            desired_rotation = self.env.vertical_grasp_rotation()
+            # link frame, so use the calibrated robot-frame convention.  A
+            # two-stage schedule may defer the final horizontal yaw until the
+            # arm is already above the cable.
+            approach_yaw = self.config.nero_grasp_yaw_offset_deg
+            if self.config.nero_approach_yaw_offset_deg is not None:
+                approach_yaw = self.config.nero_approach_yaw_offset_deg
+            desired_rotation = self._nero_grasp_rotation(approach_yaw)
         else:
             desired_rotation = (
                 self.VERTICAL_GRASP_ROTATION.copy()
@@ -238,6 +313,18 @@ class DynamicCableGraspPolicy:
     def _transition(self, phase: Phase) -> None:
         self.phase = phase
         self.phase_start = float(self.env.data.time)
+        if (
+            phase is Phase.INTERCEPT
+            and self.env.robot == "nero"
+            and self.config.nero_approach_yaw_offset_deg is not None
+        ):
+            desired_rotation = self._nero_grasp_rotation(
+                self.config.nero_grasp_yaw_offset_deg
+            )
+            self.desired_quat = rotation_to_quat(desired_rotation)
+            self.desired_approach_axis = (
+                desired_rotation @ self.env.gripper_approach_axis_local
+            )
 
     @staticmethod
     def _smoothstep(value: float) -> float:
@@ -427,7 +514,101 @@ class DynamicCableGraspPolicy:
 
         jacobian = self._task_jacobian()
         position_jacobian = jacobian[:3]
-        if self.config.strict_vertical_gripper:
+        post_grasp_orientation_priority = bool(
+            self.config.nero_post_grasp_orientation_priority
+            and self.env.robot == "nero"
+            and self.phase in {Phase.LIFT, Phase.CARRY, Phase.HOLD}
+        )
+        intercept_orientation_priority = bool(
+            self.config.nero_intercept_orientation_priority
+            and self.env.robot == "nero"
+            and self.phase is Phase.INTERCEPT
+        )
+        approach_orientation_priority = bool(
+            self.config.nero_approach_orientation_priority
+            and self.env.robot == "nero"
+            and self.phase is Phase.APPROACH
+        )
+        tilt_only_orientation_control = bool(
+            self.config.nero_tilt_only_orientation_control
+            and self.env.robot == "nero"
+            and self.phase in {
+                Phase.APPROACH,
+                Phase.INTERCEPT,
+                Phase.LIFT,
+                Phase.CARRY,
+                Phase.HOLD,
+            }
+        )
+        orientation_primary = (
+            self.config.strict_vertical_gripper
+            or post_grasp_orientation_priority
+            or intercept_orientation_priority
+            or approach_orientation_priority
+        )
+        if self.env.robot == "nero" and self.config.nero_weighted_pose_ik:
+            pose_weight = self.config.nero_pose_orientation_weight
+            weighted_jacobian = np.vstack([
+                position_jacobian,
+                pose_weight * jacobian[3:],
+            ])
+            weighted_velocity = np.concatenate([
+                linear_velocity,
+                pose_weight * angular_velocity,
+            ])
+            pose_damping = 0.04
+            pose_inverse = np.linalg.solve(
+                weighted_jacobian @ weighted_jacobian.T
+                + pose_damping**2 * np.eye(6),
+                np.eye(6),
+            )
+            q_velocity = weighted_jacobian.T @ pose_inverse @ weighted_velocity
+        elif tilt_only_orientation_control:
+            # For NERO, preserve the safety-critical downward approach axis
+            # without forcing a complete world-frame yaw during the dynamic
+            # chase. The tilt controller lives in the position nullspace.
+            position_damping = 0.04
+            position_inverse = np.linalg.solve(
+                position_jacobian @ position_jacobian.T
+                + position_damping**2 * np.eye(3),
+                np.eye(3),
+            )
+            position_pseudoinverse = position_jacobian.T @ position_inverse
+            position_velocity = position_pseudoinverse @ linear_velocity
+            position_nullspace = np.eye(7) - np.linalg.pinv(
+                position_jacobian, rcond=1e-5
+            ) @ position_jacobian
+            actual_axis = data.xmat[self.env.hand_id].reshape(3, 3) @ (
+                self.env.gripper_approach_axis_local
+            )
+            desired_axis = self.desired_approach_axis
+            tilt_projection = np.eye(3) - np.outer(actual_axis, actual_axis)
+            tilt_jacobian = (
+                tilt_projection @ jacobian[3:] @ position_nullspace
+            )
+            tilt_velocity_target = self._limit_vector_norm(
+                2.5 * np.cross(actual_axis, desired_axis), 1.40
+            )
+            tilt_residual = (
+                tilt_velocity_target
+                - tilt_projection @ jacobian[3:] @ position_velocity
+            )
+            tilt_damping = 0.04
+            tilt_inverse = np.linalg.solve(
+                tilt_jacobian @ tilt_jacobian.T
+                + tilt_damping**2 * np.eye(3),
+                np.eye(3),
+            )
+            tilt_velocity = (
+                tilt_jacobian.T @ tilt_inverse @ tilt_residual
+            )
+            orientation_gain = (
+                self.config.approach_orientation_gain
+                if fast_approach
+                else self.config.precision_orientation_gain
+            )
+            q_velocity = position_velocity + orientation_gain * tilt_velocity
+        elif orientation_primary:
             # The full vertical grasp pose is primary. Translation receives the
             # remaining four-DOF nullspace and may lag instead of tilting the hand.
             # An exact pseudoinverse is intentional here: damping the primary
