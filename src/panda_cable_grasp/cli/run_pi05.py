@@ -393,7 +393,7 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="number of predicted actions to execute before replanning",
     )
-    parser.add_argument("--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda")
+    parser.add_argument("--robot", choices=tuple(sorted(ROBOT_SPECS)), default="nero")
     parser.add_argument("--video-fps", type=float, default=DEFAULT_VIDEO_FPS)
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
     parser.add_argument("--policy-host", default="10.1.114.130")
