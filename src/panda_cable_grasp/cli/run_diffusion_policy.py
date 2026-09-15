@@ -29,6 +29,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-fps", type=float, default=25.0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
+        "--inference-steps", type=int, default=None,
+        help="override checkpoint diffusion denoising steps for evaluation",
+    )
+    parser.add_argument(
         "--deterministic", action=argparse.BooleanOptionalAction, default=True,
         help="use a seedable diffusion noise generator for repeatable evaluation",
     )
@@ -44,6 +48,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"Diffusion Policy checkpoint not found: {args.model}")
     if args.trials < 1 or args.episode_seconds <= 0.0 or args.video_fps <= 0.0:
         parser.error("trials, episode duration, and video FPS must be positive")
+    if args.inference_steps is not None and args.inference_steps < 1:
+        parser.error("inference steps must be positive")
     return args
 
 
@@ -92,7 +98,8 @@ def run(args: argparse.Namespace) -> Path:
     recording = not args.no_recording
     try:
         policy = DiffusionPolicyRunner(
-            env, args.model, device=args.device, deterministic=args.deterministic
+            env, args.model, device=args.device, deterministic=args.deterministic,
+            inference_steps=args.inference_steps,
         )
         for trial_offset in range(args.trials):
             seed = args.seed + trial_offset
@@ -187,6 +194,7 @@ def run(args: argparse.Namespace) -> Path:
             "state": "observation.state.end_effector.pos + quat(wxyz)",
         },
         "action": "absolute_xyz_quaternion_wxyz_gripper_through_dynamicvla_ik",
+        "diffusion_inference_steps": policy.config.inference_steps,
         "robot": env.robot,
         "compiled_model": str(compiled_model.resolve()),
         "compiled_model_sha256": sha256_file(compiled_model),

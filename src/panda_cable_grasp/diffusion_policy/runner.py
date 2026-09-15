@@ -9,6 +9,7 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation
 
 from ..dynamicvla.adapter import (
     DynamicVLATaskSpaceAdapter,
@@ -51,6 +52,7 @@ class DiffusionPolicyRunner:
         *,
         device: str = "cpu",
         deterministic: bool = True,
+        inference_steps: int | None = None,
     ) -> None:
         self.env = env
         self.device = torch.device(device)
@@ -69,6 +71,10 @@ class DiffusionPolicyRunner:
                 "the DynaMimicGen-style v2 implementation"
             )
         config_values = dict(payload.get("config", {}))
+        if inference_steps is not None:
+            if inference_steps < 1 or inference_steps > int(config_values["diffusion_steps"]):
+                raise ValueError("inference_steps must be in [1, diffusion_steps]")
+            config_values["inference_steps"] = int(inference_steps)
         from .config import DiffusionPolicyConfig
 
         self.config = DiffusionPolicyConfig(**config_values)
@@ -90,6 +96,7 @@ class DiffusionPolicyRunner:
         self._action_queue: deque[np.ndarray] = deque()
         self._inference_count = 0
         self._last_model_action = np.full(8, np.nan, dtype=np.float32)
+        self._last_raw_state = np.full(6, np.nan, dtype=np.float32)
         self._last_observation_index = 0
         self.result = "running"
         self.finished = False
@@ -104,6 +111,7 @@ class DiffusionPolicyRunner:
         self._action_queue.clear()
         self._inference_count = 0
         self._last_model_action[:] = np.nan
+        self._last_raw_state[:] = np.nan
         self._last_observation_index = 0
         self.result = "running"
         self.finished = False
@@ -124,10 +132,14 @@ class DiffusionPolicyRunner:
             quaternion = quaternion[0]
         if position.shape != (3,) or quaternion.shape != (4,):
             raise ValueError("DynamicVLA end-effector state must be shapes (1,3)/(1,4)")
-        return np.concatenate((position, quaternion)).astype(np.float32)
+        # Environment quaternions are wxyz; DynamicVLA parquet states use
+        # Euler xyz.  Keep the model-side representation identical to training.
+        euler = Rotation.from_quat(quaternion[[1, 2, 3, 0]]).as_euler("xyz")
+        return np.concatenate((position, euler)).astype(np.float32)
 
     def _append_observation(self, observation: dict[str, Any]) -> None:
         state = self._state_from_observation(observation)
+        self._last_raw_state[:] = state
         opst = np.asarray(observation["observation.images.opst_cam"])
         wrist = np.asarray(observation["observation.images.wrist_cam"])
         if opst.ndim == 4:
@@ -146,7 +158,11 @@ class DiffusionPolicyRunner:
         )
         self._opst_history.append(opst.astype(np.float32) / 255.0)
         self._wrist_history.append(wrist.astype(np.float32) / 255.0)
-        self._state_history.append(normalize_array(state, self.state_low, self.state_high))
+        self._state_history.append(
+            np.clip(
+                normalize_array(state, self.state_low, self.state_high), -1.0, 1.0
+            ).astype(np.float32)
+        )
         while len(self._opst_history) < self.config.observation_horizon:
             self._opst_history.appendleft(self._opst_history[0].copy())
             self._wrist_history.appendleft(self._wrist_history[0].copy())
@@ -165,11 +181,20 @@ class DiffusionPolicyRunner:
             tensors["opst_cam"], tensors["wrist_cam"], tensors["state"],
             generator=self._generator,
         )[0].detach().cpu().numpy()
-        model_chunk = denormalize_array(
+        delta_chunk = denormalize_array(
             normalized_chunk, self.action_low, self.action_high
         )
-        execute_count = min(self.config.action_horizon, len(model_chunk))
-        self._action_queue.extend(np.asarray(model_chunk[:execute_count], dtype=np.float32))
+        # DynamicVLA delta_action=True semantics: every item in the chunk is
+        # relative to the same current state, not the corresponding future state.
+        absolute_chunk = np.asarray(delta_chunk, dtype=np.float32).copy()
+        absolute_chunk[:, :6] += self._last_raw_state[None, :6]
+        xyzw = Rotation.from_euler("xyz", absolute_chunk[:, 3:6]).as_quat()
+        wxyz = xyzw[:, [3, 0, 1, 2]].astype(np.float32)
+        task_space_chunk = np.concatenate(
+            (absolute_chunk[:, :3], wxyz, absolute_chunk[:, 6:7]), axis=-1
+        )
+        execute_count = min(self.config.action_horizon, len(task_space_chunk))
+        self._action_queue.extend(task_space_chunk[:execute_count])
         self._inference_count += 1
 
     def action(self, observation: dict[str, Any] | None = None) -> np.ndarray:
@@ -192,6 +217,8 @@ class DiffusionPolicyRunner:
             "diffusion_inference_count": self._inference_count,
             "diffusion_action_queue": len(self._action_queue),
             "diffusion_model_action": self._last_model_action.copy(),
+            "diffusion_state_format": "dynamicvla_absolute_xyz_euler_xyz",
+            "diffusion_action_format": "dynamicvla_chunk_delta_xyz_euler_xyz_gripper",
             "diffusion_position_clipped": bool(diagnostics["position_clipped"]),
             "diffusion_quaternion_repaired": bool(diagnostics["quaternion_repaired"]),
         }

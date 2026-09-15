@@ -232,7 +232,7 @@ def train(args: argparse.Namespace) -> Path:
         f"validation={0 if validation_dataset is None else validation_dataset.episode_count} "
         f"train_frames={len(train_dataset)} validation_frames={None if validation_dataset is None else len(validation_dataset)} "
         f"state_dim={config.state_dim} action_dim=7 variant={args.variant} include_velocity={config.include_velocity} "
-        f"action_source={args.action_source} action_target=pi05_delta_xyz_euler_gripper "
+        f"action_source={args.action_source} action_target=pi05_chunk_delta_xyz_euler_gripper "
         f"state_input={args.state_input} "
         f"normalization=pi05_q01_q99_clip rotation_format={args.rotation_format} "
         f"preprocess_seconds={time.monotonic() - started:.1f}",
@@ -315,7 +315,7 @@ def train(args: argparse.Namespace) -> Path:
                         "action_low": action_norm_low.tolist(),
                         "action_high": action_norm_high.tolist(),
                         "action_source": args.action_source,
-                        "action_target": "pi05_delta_xyz_euler_gripper",
+                        "action_target": "pi05_chunk_delta_xyz_euler_gripper",
                         "observation_normalization": "pi05_q01_q99_pose_plus_train_mean_std_privileged",
                         "action_normalization": "pi05_q01_q99_clip",
                         "variant": args.variant,
@@ -367,7 +367,7 @@ def train(args: argparse.Namespace) -> Path:
             "train_frame_count": len(train_dataset),
             "validation_frame_count": None if validation_dataset is None else len(validation_dataset),
             "action_source": args.action_source,
-            "action_target": "pi05_delta_xyz_euler_gripper",
+            "action_target": "pi05_chunk_delta_xyz_euler_gripper",
             "observation_normalization": "pi05_q01_q99_pose_plus_train_mean_std_privileged",
             "observation_pose_q01": obs_pose_norm_low.tolist(),
             "observation_pose_q99": obs_pose_norm_high.tolist(),

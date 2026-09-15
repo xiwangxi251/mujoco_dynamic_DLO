@@ -1166,9 +1166,23 @@ class LowDimEpisodeDataset(Dataset):
         self, episode_indices: Iterable[int] | None = None
     ) -> tuple[np.ndarray, np.ndarray]:
         selected = self.episode_indices if episode_indices is None else list(episode_indices)
-        values = np.concatenate(
-            [self._all_episodes[index].action for index in selected], axis=0
-        ).astype(np.float64)
+        # The stored episode action is a per-frame delta (absolute action minus
+        # that frame's observation). Pi0.5 supervises every action in a chunk
+        # relative to the chunk's current/first observation, so fit q01/q99
+        # bounds on those actual chunk targets.
+        values_by_episode = []
+        for index in selected:
+            episode = self._all_episodes[index]
+            frame_indices = np.arange(0, len(episode.action), 4, dtype=np.int64)
+            offsets = np.arange(self.config.prediction_horizon, dtype=np.int64)
+            future_indices = np.minimum(
+                frame_indices[:, None] + offsets[None, :], len(episode.action) - 1
+            )
+            chunk = episode.action[future_indices].copy()
+            chunk[:, :, :6] += episode.observation[future_indices, :6]
+            chunk[:, :, :6] -= episode.observation[frame_indices, None, :6]
+            values_by_episode.append(chunk.reshape(-1, 7))
+        values = np.concatenate(values_by_episode, axis=0).astype(np.float64)
         lower = np.quantile(values, 0.01, axis=0).astype(np.float32)
         upper = np.quantile(values, 0.99, axis=0).astype(np.float32)
         upper = np.maximum(upper, lower + 1.0e-6)
@@ -1242,6 +1256,21 @@ class LowDimEpisodeDataset(Dataset):
     def _future_indices(index: int, count: int, length: int) -> list[int]:
         return [min(length - 1, index + offset) for offset in range(count)]
 
+    def _chunk_action_target(
+        self, episode: LowDimEpisode, frame_index: int
+    ) -> np.ndarray:
+        """Return a Pi0.5-style action chunk relative to the current state."""
+
+        future = self._future_indices(
+            frame_index, self.config.prediction_horizon, len(episode.action)
+        )
+        action = episode.action[future].copy()
+        # Reconstruct each expert absolute pose, then reference the complete
+        # chunk to the state at frame_index. Gripper remains absolute.
+        action[:, :6] += episode.observation[future, :6]
+        action[:, :6] -= episode.observation[frame_index, None, :6]
+        return action
+
     def __getitem__(self, item: int) -> dict[str, torch.Tensor]:
         if self.obs_mean is None or self.obs_std is None:
             raise RuntimeError("call set_observation_stats before reading samples")
@@ -1251,9 +1280,6 @@ class LowDimEpisodeDataset(Dataset):
         frame_index = int(item - self._sample_offsets[episode_position])
         episode = self._all_episodes[self.episode_indices[episode_position]]
         history = self._history_indices(frame_index, self.config.observation_horizon)
-        future = self._future_indices(
-            frame_index, self.config.prediction_horizon, len(episode.action)
-        )
         observation = (episode.observation[history] - self.obs_mean) / self.obs_std
         if self._obs_pose_norm_low is not None and self._obs_pose_norm_high is not None:
             observation[:, :6] = _pi05_quantile_normalize(
@@ -1262,7 +1288,9 @@ class LowDimEpisodeDataset(Dataset):
                 self._obs_pose_norm_high,
             )
         action = _pi05_quantile_normalize(
-            episode.action[future], self.action_low, self.action_high
+            self._chunk_action_target(episode, frame_index),
+            self.action_low,
+            self.action_high,
         )
         return {
             "obs": torch.from_numpy(np.asarray(observation, dtype=np.float32)),
@@ -1458,7 +1486,10 @@ class LowDimPolicyRunner:
         model_chunk = _pi05_quantile_denormalize(
             normalized, self.action_low, self.action_high
         )
-        if self.action_target == "pi05_delta_xyz_euler_gripper":
+        if self.action_target in {
+            "pi05_delta_xyz_euler_gripper",
+            "pi05_chunk_delta_xyz_euler_gripper",
+        }:
             if self._last_raw_observation is None:
                 raise RuntimeError("cannot decode a delta action without a current observation")
             model_chunk[:, :6] += self._last_raw_observation[None, :6]
@@ -1507,7 +1538,10 @@ class LowDimPolicyRunner:
             "diffusion_position_clipped": bool(diagnostics["position_clipped"]),
             "diffusion_quaternion_repaired": bool(diagnostics["quaternion_repaired"]),
             "action_target": self.action_target,
-            "action_normalization": "pi05_q01_q99_clip" if self.action_target == "pi05_delta_xyz_euler_gripper" else "legacy_fixed_bounds",
+            "action_normalization": "pi05_q01_q99_clip" if self.action_target in {
+                "pi05_delta_xyz_euler_gripper",
+                "pi05_chunk_delta_xyz_euler_gripper",
+            } else "legacy_fixed_bounds",
             "observation_pose_normalization": "pi05_q01_q99_clip" if self.obs_pose_norm_low is not None else "legacy_mean_std",
         }
 
