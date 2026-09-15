@@ -32,6 +32,11 @@ from .environment import (
     make_rl_env,
 )
 from .metrics import TrainingMetricsCallback, plot_training_curves
+from .pointcloud import (
+    DLOPointCloudObservation,
+    PointCloudObservationConfig,
+    PointNet2FeaturesExtractor,
+)
 
 
 RL_L1_SCENARIOS = (
@@ -141,20 +146,68 @@ def linear_schedule(
     return schedule
 
 
+def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
+    """Build one immutable-by-convention reward/action configuration per env."""
+    return RLConfig(
+        singularity_avoidance_enabled=(
+            not args.disable_singularity_avoidance
+        ),
+        safety_reward_enabled=args.enable_safety_penalties,
+        reward_table_filter_step=args.reward_table_filter_step,
+        reward_table_contact_step=args.reward_table_contact_step,
+        table_safety_penalty_cap=args.table_safety_penalty_cap,
+        reward_singularity_step=args.reward_singularity_step,
+        singularity_safety_penalty_cap=args.singularity_safety_penalty_cap,
+        safety_penalty_ramp_env_steps=args.safety_penalty_ramp_env_steps,
+    )
+
+
+def pointcloud_config_from_args(
+    args: argparse.Namespace,
+) -> PointCloudObservationConfig:
+    return PointCloudObservationConfig(
+        point_count=args.pointcloud_points,
+        width=args.pointcloud_width,
+        height=args.pointcloud_height,
+        camera_update_steps=args.pointcloud_update_steps,
+        sensor_delay_steps=args.pointcloud_delay_steps,
+        voxel_size_m=args.pointcloud_voxel_size,
+    )
+
+
+def make_configured_env(
+    args: argparse.Namespace,
+    *,
+    seed: int,
+    scenario_names: tuple[str, ...],
+):
+    pointcloud = args.observation_mode == "pointcloud"
+    env = make_rl_env(
+        action_mode=args.action_mode,
+        robot=getattr(args, "robot", "panda"),
+        seed=seed,
+        disturbance_strength=args.disturbance,
+        episode_seconds=args.episode_seconds,
+        dynamicvla_cameras_enabled=pointcloud,
+        scenario_names=scenario_names,
+        rl_config=rl_config_from_args(args),
+        geometric_safety_enabled=args.geometric_safety,
+        table_finger_collision_filter_enabled=(
+            not args.disable_table_finger_collision_filter
+        ),
+    )
+    if pointcloud:
+        return DLOPointCloudObservation(env, pointcloud_config_from_args(args))
+    return env
+
+
 def make_worker(rank: int, args: argparse.Namespace):
     """返回可由Windows spawn进程安全构造的独立环境工厂。"""
     def initialize():
-        env = make_rl_env(
-            action_mode=args.action_mode,
-            robot=getattr(args, "robot", "panda"),
+        env = make_configured_env(
+            args,
             seed=args.seed + rank,
-            disturbance_strength=args.disturbance,
-            episode_seconds=args.episode_seconds,
             scenario_names=args.training_scenario_names,
-            geometric_safety_enabled=args.geometric_safety,
-            table_finger_collision_filter_enabled=(
-                not args.disable_table_finger_collision_filter
-            ),
         )
         if (
             args.training_distribution == "l1"
@@ -173,17 +226,10 @@ def make_worker(rank: int, args: argparse.Namespace):
 def make_eval_worker(rank: int, args: argparse.Namespace):
     """Build one deterministic strict-evaluation environment."""
     def initialize():
-        return make_rl_env(
-            action_mode=args.action_mode,
-            robot=getattr(args, "robot", "panda"),
+        return make_configured_env(
+            args,
             seed=args.eval_seed + rank,
-            disturbance_strength=args.disturbance,
-            episode_seconds=args.episode_seconds,
             scenario_names=args.eval_scenario_names,
-            geometric_safety_enabled=args.geometric_safety,
-            table_finger_collision_filter_enabled=(
-                not args.disable_table_finger_collision_filter
-            ),
         )
     return initialize
 
@@ -688,6 +734,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--observation-mode",
+        choices=("state", "pointcloud"),
+        default="state",
+        help="state uses the 99-D privileged baseline; pointcloud uses RGB-D",
+    )
+    parser.add_argument("--pointcloud-points", type=int, default=384)
+    parser.add_argument("--pointcloud-width", type=int, default=480)
+    parser.add_argument("--pointcloud-height", type=int, default=360)
+    parser.add_argument(
+        "--pointcloud-update-steps",
+        type=int,
+        default=5,
+        help="render a new RGB-D observation every N 50-Hz control steps",
+    )
+    parser.add_argument(
+        "--pointcloud-delay-steps",
+        type=int,
+        default=3,
+        help="sensor delivery latency in 50-Hz control steps",
+    )
+    parser.add_argument("--pointcloud-voxel-size", type=float, default=0.002)
+    parser.add_argument(
         "--geometric-safety",
         action="store_true",
         help="enable the shared geometric robot-obstacle safety layer",
@@ -696,6 +764,30 @@ def parse_args() -> argparse.Namespace:
         "--disable-table-finger-collision-filter",
         action="store_true",
         help="disable the vertical-down gripper/table target filter",
+    )
+    parser.add_argument(
+        "--disable-singularity-avoidance",
+        action="store_true",
+        help=(
+            "disable the IK damping/null-space/target-clipping guard; useful "
+            "when training with the bounded singularity reward instead"
+        ),
+    )
+    parser.add_argument(
+        "--enable-safety-penalties",
+        action="store_true",
+        help="enable bounded table-risk and singularity reward shaping",
+    )
+    parser.add_argument("--reward-table-filter-step", type=float, default=-0.02)
+    parser.add_argument("--reward-table-contact-step", type=float, default=-0.05)
+    parser.add_argument("--table-safety-penalty-cap", type=float, default=2.0)
+    parser.add_argument("--reward-singularity-step", type=float, default=-0.01)
+    parser.add_argument("--singularity-safety-penalty-cap", type=float, default=1.5)
+    parser.add_argument(
+        "--safety-penalty-ramp-env-steps",
+        type=int,
+        default=5_000,
+        help="per-worker control steps used to ramp safety penalties from 0 to 1",
     )
     parser.add_argument(
         "--training-distribution", choices=("legacy", "l1", "id"), default="l1",
@@ -830,6 +922,11 @@ def parse_args() -> argparse.Namespace:
         args.target_kl,
         args.disturbance,
         args.episode_seconds,
+        args.reward_table_filter_step,
+        args.reward_table_contact_step,
+        args.table_safety_penalty_cap,
+        args.reward_singularity_step,
+        args.singularity_safety_penalty_cap,
     )
     if not all(np.isfinite(value) for value in finite_values):
         parser.error("floating-point training parameters must be finite")
@@ -849,6 +946,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("disturbance strength must be non-negative")
     if args.episode_seconds <= 0.0:
         parser.error("--episode-seconds must be positive")
+    if args.reward_table_filter_step > 0.0 or args.reward_table_contact_step > 0.0:
+        parser.error("table safety rewards must be non-positive")
+    if args.reward_singularity_step > 0.0:
+        parser.error("singularity safety reward must be non-positive")
+    if args.table_safety_penalty_cap < 0.0 or args.singularity_safety_penalty_cap < 0.0:
+        parser.error("safety penalty caps must be non-negative")
+    if args.safety_penalty_ramp_env_steps < 0:
+        parser.error("--safety-penalty-ramp-env-steps must be non-negative")
+    if args.pointcloud_points < 32:
+        parser.error("--pointcloud-points must be at least 32")
+    if args.pointcloud_width < 32 or args.pointcloud_height < 32:
+        parser.error("point-cloud image dimensions must be at least 32")
+    if args.pointcloud_update_steps < 1 or args.pointcloud_delay_steps < 0:
+        parser.error("point-cloud update/delay steps are invalid")
+    if args.pointcloud_voxel_size <= 0.0:
+        parser.error("--pointcloud-voxel-size must be positive")
     if args.checkpoint_steps < 1:
         parser.error("--checkpoint-steps must be positive")
     if (
@@ -913,17 +1026,10 @@ def main() -> None:
     target_kl = args.target_kl if args.target_kl > 0.0 else None
 
     # 启动大批量训练前先检查一次Gymnasium API、shape和数据类型。
-    check_candidate = make_rl_env(
-        action_mode=args.action_mode,
-        robot=getattr(args, "robot", "panda"),
+    check_candidate = make_configured_env(
+        args,
         seed=args.seed,
-        disturbance_strength=args.disturbance,
-        episode_seconds=args.episode_seconds,
         scenario_names=args.training_scenario_names,
-        geometric_safety_enabled=args.geometric_safety,
-        table_finger_collision_filter_enabled=(
-            not args.disable_table_finger_collision_filter
-        ),
     )
     check_env(check_candidate, warn=True)
     check_candidate.close()
@@ -953,8 +1059,19 @@ def main() -> None:
             learning_rate_initial,
             learning_rate_final,
         )
+        policy_name = (
+            "MultiInputPolicy"
+            if args.observation_mode == "pointcloud"
+            else "MlpPolicy"
+        )
+        policy_kwargs = {
+            "activation_fn": nn.ReLU,
+            "net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]},
+        }
+        if args.observation_mode == "pointcloud":
+            policy_kwargs["features_extractor_class"] = PointNet2FeaturesExtractor
         model = PPO(
-            "MlpPolicy",
+            policy_name,
             vector_env,
             learning_rate=learning_rate,
             n_steps=args.n_steps,
@@ -967,10 +1084,7 @@ def main() -> None:
             vf_coef=0.5,
             max_grad_norm=0.5,
             target_kl=target_kl,
-            policy_kwargs={
-                "activation_fn": nn.ReLU,
-                "net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]},
-            },
+            policy_kwargs=policy_kwargs,
             tensorboard_log=str(args.output / "tensorboard"),
             verbose=1,
             seed=args.seed,
@@ -1075,11 +1189,16 @@ def main() -> None:
         "algorithm": "PPO",
         "rl_interface_version": action_interface_version(args.action_mode),
         "action_mode": args.action_mode,
+        "observation_mode": args.observation_mode,
         "arm_acceleration_limit_enabled": True,
         "geometric_safety_enabled": args.geometric_safety,
         "table_finger_collision_filter_enabled": (
             not args.disable_table_finger_collision_filter
         ),
+        "singularity_avoidance_enabled": (
+            not args.disable_singularity_avoidance
+        ),
+        "safety_reward_enabled": args.enable_safety_penalties,
         "grasp_model": "physical_friction_v1",
         "output": str(args.output.resolve()),
         "timesteps": args.timesteps,
@@ -1124,6 +1243,11 @@ def main() -> None:
         "max_grad_norm": 0.5,
         "policy_net_arch": {"pi": [256, 256, 128], "vf": [256, 256, 128]},
         "policy_activation": "ReLU",
+        "pointcloud": (
+            asdict(pointcloud_config_from_args(args))
+            if args.observation_mode == "pointcloud"
+            else None
+        ),
         "curriculum_stages": RL_L1_CURRICULUM_STAGES,
         "curriculum_training_mixes": args.curriculum_training_mixes,
         "curriculum_stage1_static_replay": args.curriculum_stage1_static_replay,
@@ -1164,10 +1288,18 @@ def main() -> None:
             "50 Hz for 0.80 s, intersected with the base environment's current "
             "qualification; diagnostic and shaping only"
         ),
-        "observation_names": list(RLCableGraspEnv.OBSERVATION_NAMES),
-        "observation_dimension": len(RLCableGraspEnv.OBSERVATION_NAMES),
-        "action_names": list(check_candidate.ACTION_NAMES),
-        "rl_config": asdict(RLConfig()),
+        "observation_names": (
+            {"points": [args.pointcloud_points, 3], "proprio": [16]}
+            if args.observation_mode == "pointcloud"
+            else list(RLCableGraspEnv.OBSERVATION_NAMES)
+        ),
+        "observation_dimension": (
+            args.pointcloud_points * 3 + 16
+            if args.observation_mode == "pointcloud"
+            else len(RLCableGraspEnv.OBSERVATION_NAMES)
+        ),
+        "action_names": list(check_candidate.unwrapped.ACTION_NAMES),
+        "rl_config": asdict(rl_config_from_args(args)),
         "reward": (
             "pre-pinch nearest-segment reach progress + planar perpendicular "
             "alignment potential progress + centered, pad-depth-qualified capture "
@@ -1175,6 +1307,7 @@ def main() -> None:
             "aligned-pinch bonus + capped unloaded-pinch penalties + episode-global "
             "lift/strict-hold high-water credit + shared task success; "
             "post-secured active-open and physical-slip penalties remain causal"
+            "; optional bounded table-filter/contact and singularity shaping"
         ),
         "action": (
             "base-frame delta xyz (0.010 m vector-norm cap), world-z yaw "

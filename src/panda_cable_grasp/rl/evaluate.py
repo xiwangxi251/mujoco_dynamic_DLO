@@ -40,6 +40,7 @@ from ..evaluation.defaults import DEFAULT_EVALUATION_SEED
 from ..scenarios.registry import list_scenario_names
 from ..paths import output_path
 from .environment import (
+    RLConfig,
     RLCableGraspEnv,
     action_interface_version,
     make_rl_env,
@@ -112,6 +113,11 @@ EPISODE_FIELDS = (
     "first_active_open_after_confirmed_time_s",
     "first_physical_slip_after_confirmed_time_s",
     "first_open_during_contact_loss_after_confirmed_time_s",
+    "ik_singularity_guard_count",
+    "ik_singularity_target_clip_count",
+    "ik_singularity_sigma_min_final",
+    "ik_singularity_condition_final",
+    "ik_joint_margin_ratio_final",
     "target_distance_final_m",
     "target_distance_min_m",
     "finger_aperture_final_m",
@@ -606,6 +612,8 @@ def print_episode(episode: int, episode_return: float, steps: int, info: dict) -
         f"lift_delta={1000.0 * info['grasp_lift_delta']:.1f}mm "
         f"strict_hold={info['strict_success_hold']:.2f}s "
         f"lifted_fraction={info['lifted_fraction']:.2f} max_z={info['max_z']:.3f}m "
+        f"sing_guard={info.get('ik_singularity_guard_count', 0)} "
+        f"sing_clip={info.get('ik_singularity_target_clip_count', 0)} "
         f"table_finger_filter={info.get('table_finger_collision_filter_count', 0)}",
         flush=True,
     )
@@ -737,6 +745,21 @@ def _episode_row(
         "first_open_during_contact_loss_after_confirmed_time_s": (
             confirmed_times.get("open_during_contact_loss")
         ),
+        "ik_singularity_guard_count": int(
+            final_info.get("ik_singularity_guard_count", 0)
+        ),
+        "ik_singularity_target_clip_count": int(
+            final_info.get("ik_singularity_target_clip_count", 0)
+        ),
+        "ik_singularity_sigma_min_final": _finite_or_none(
+            final_info.get("ik_singularity_sigma_min")
+        ),
+        "ik_singularity_condition_final": _finite_or_none(
+            final_info.get("ik_singularity_condition")
+        ),
+        "ik_joint_margin_ratio_final": _finite_or_none(
+            final_info.get("ik_joint_margin_ratio")
+        ),
         "target_distance_final_m": _finite_or_none(final_info.get("target_distance")),
         "target_distance_min_m": _finite_or_none(diagnostics.min_target_distance),
         "finger_aperture_final_m": _finite_or_none(final_info.get("finger_aperture")),
@@ -833,6 +856,11 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         scenario_names=args.scenario_names,
         dynamicvla_cameras_enabled=True,
         geometric_safety_enabled=args.geometric_safety,
+        rl_config=RLConfig(
+            singularity_avoidance_enabled=(
+                not args.disable_singularity_avoidance
+            )
+        ),
     )
 
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
@@ -1262,6 +1290,11 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         scenario_names=args.scenario_names,
         dynamicvla_cameras_enabled=True,
         geometric_safety_enabled=args.geometric_safety,
+        rl_config=RLConfig(
+            singularity_avoidance_enabled=(
+                not args.disable_singularity_avoidance
+            )
+        ),
     )
     observation, info = env.reset(seed=args.seed)
     episode = 1
@@ -1355,6 +1388,14 @@ def parse_args() -> argparse.Namespace:
         "--geometric-safety",
         action="store_true",
         help="enable the shared geometric robot-obstacle safety layer",
+    )
+    parser.add_argument(
+        "--disable-singularity-avoidance",
+        action="store_true",
+        help=(
+            "disable the soft task-space IK singularity/joint-limit guard "
+            "without changing episode termination"
+        ),
     )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument(

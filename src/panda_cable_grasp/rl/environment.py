@@ -32,6 +32,17 @@ class RLConfig:
     translation_delta_scale: float = 0.010
     yaw_delta_scale: float = 0.020
     ik_damping: float = 0.05
+    # Task-space IK singularity avoidance is soft: it only becomes active near
+    # a rank-deficient Jacobian or a joint limit, and never terminates an episode.
+    singularity_avoidance_enabled: bool = True
+    singularity_soft_sigma: float = 0.040
+    singularity_hard_sigma: float = 0.008
+    singularity_max_damping: float = 0.16
+    singularity_posture_gain: float = 0.25
+    singularity_joint_limit_gain: float = 1.00
+    singularity_joint_limit_buffer_ratio: float = 0.04
+    singularity_nullspace_velocity_limit: float = 0.75
+    singularity_joint_margin_ratio: float = 0.15
     graspable_end_fraction: float = 0.25
     gripper_close_threshold: float = -0.35
     gripper_open_threshold: float = 0.35
@@ -78,6 +89,21 @@ class RLConfig:
     reward_action_magnitude: float = -0.0005
     reward_action_rate: float = -0.01
     reward_geometric_safety_violation: float = -5.0
+    # Optional late-stage safety shaping.  The table filter remains the hard
+    # execution backstop; these bounded penalties teach the policy not to rely
+    # on it and not to settle in poorly conditioned arm postures.
+    safety_reward_enabled: bool = False
+    reward_table_filter_step: float = -0.02
+    reward_table_contact_step: float = -0.05
+    table_safety_penalty_cap: float = 2.0
+    reward_singularity_step: float = -0.01
+    singularity_penalty_soft_sigma: float = 0.020
+    singularity_penalty_hard_sigma: float = 0.005
+    singularity_penalty_joint_margin_ratio: float = 0.05
+    singularity_safety_penalty_cap: float = 1.5
+    # This is per worker.  With 24 workers, 5k control steps is about 120k
+    # global samples, so resumed PPO sees the new objective gradually.
+    safety_penalty_ramp_env_steps: int = 5_000
 
     def __post_init__(self) -> None:
         if self.cable_sample_count != 14:
@@ -85,6 +111,12 @@ class RLConfig:
         for name in (
             "cable_position_scale", "cable_velocity_scale",
             "translation_delta_scale", "yaw_delta_scale", "ik_damping",
+            "singularity_soft_sigma", "singularity_hard_sigma",
+            "singularity_max_damping", "singularity_posture_gain",
+            "singularity_joint_limit_gain",
+            "singularity_joint_limit_buffer_ratio",
+            "singularity_nullspace_velocity_limit",
+            "singularity_joint_margin_ratio",
             "alignment_distance_scale",
             "capture_ready_distance", "capture_longitudinal_tolerance",
             "capture_lateral_tolerance", "capture_pad_tip_offset",
@@ -92,6 +124,9 @@ class RLConfig:
             "secured_lift_delta", "pinch_minimum_lift",
             "pinch_stall_grace_seconds",
             "secured_confirm_seconds", "secured_contact_loss_grace_seconds",
+            "singularity_penalty_soft_sigma",
+            "singularity_penalty_hard_sigma",
+            "singularity_penalty_joint_margin_ratio",
         ):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value <= 0.0:
@@ -107,6 +142,19 @@ class RLConfig:
                 "capture_min_insertion_depth must be less than "
                 "capture_max_insertion_depth"
             )
+        if self.singularity_hard_sigma >= self.singularity_soft_sigma:
+            raise ValueError(
+                "singularity_hard_sigma must be less than singularity_soft_sigma"
+            )
+        if self.singularity_penalty_hard_sigma >= self.singularity_penalty_soft_sigma:
+            raise ValueError(
+                "singularity_penalty_hard_sigma must be less than "
+                "singularity_penalty_soft_sigma"
+            )
+        if self.singularity_joint_limit_buffer_ratio >= 0.5:
+            raise ValueError(
+                "singularity_joint_limit_buffer_ratio must be less than 0.5"
+            )
         if not self.gripper_close_threshold < self.gripper_open_threshold:
             raise ValueError("gripper hysteresis thresholds must be increasing")
         if self.pinch_stall_step_penalty > 0.0:
@@ -117,6 +165,8 @@ class RLConfig:
             "reward_capture_ready_open_step", "reward_premature_close_event",
             "reward_premature_close_step",
             "reward_geometric_safety_violation",
+            "reward_table_filter_step", "reward_table_contact_step",
+            "reward_singularity_step",
         ):
             if float(getattr(self, name)) > 0.0:
                 raise ValueError(f"{name} must be non-positive")
@@ -124,9 +174,16 @@ class RLConfig:
             "pinch_stall_penalty_cap",
             "unloaded_pinch_episode_penalty_cap",
             "premature_close_episode_penalty_cap",
+            "table_safety_penalty_cap", "singularity_safety_penalty_cap",
         ):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be non-negative")
+        if self.singularity_penalty_joint_margin_ratio >= 0.5:
+            raise ValueError(
+                "singularity_penalty_joint_margin_ratio must be less than 0.5"
+            )
+        if int(self.safety_penalty_ramp_env_steps) < 0:
+            raise ValueError("safety_penalty_ramp_env_steps must be non-negative")
 
 
 TASK_SPACE_ACTION_MODE = "task_space"
@@ -280,6 +337,14 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._previous_distance = 0.0
         self._episode_return = 0.0
         self._episode_steps = 0
+        self._total_env_steps = 0
+        self._table_safety_penalty_total = 0.0
+        self._singularity_safety_penalty_total = 0.0
+        self._last_table_filter_reward = 0.0
+        self._last_table_contact_reward = 0.0
+        self._last_singularity_safety_reward = 0.0
+        self._last_singularity_penalty_severity = 0.0
+        self._last_safety_penalty_scale = 0.0
         self._episode_initial_cable_z = np.zeros(len(self.base_env.cable_ids))
         self._secured_candidate_hold = 0.0
         self._secured_contact_loss_hold = 0.0
@@ -296,6 +361,15 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._alignment_potential = 0.0
         self._desired_hand_rotation = np.eye(3)
         self._last_ik_velocity_scale = 1.0
+        self._last_ik_singularity_sigma_min = float("inf")
+        self._last_ik_singularity_condition = 1.0
+        self._last_ik_singularity_damping = self.rl_config.ik_damping
+        self._last_ik_singularity_severity = 0.0
+        self._last_ik_singularity_guard_active = False
+        self._last_ik_singularity_guard_count = 0
+        self._last_ik_singularity_target_clipped = False
+        self._last_ik_singularity_target_clip_count = 0
+        self._last_ik_joint_margin_ratio = 1.0
         self._gripper_switch_event = False
         self._gripper_switch_count = 0
         self._max_contacting_fingers = 0
@@ -623,6 +697,139 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         return local_offset, insertion_depth, inside
 
+    def _singularity_metrics(
+        self, jacobian: np.ndarray,
+    ) -> tuple[float, float, float, float, bool]:
+        """Measure IK conditioning and return an adaptive damping decision.
+
+        This is deliberately a soft, action-decoder guard.  It does not alter
+        episode termination or reward; it only makes the local IK solution more
+        conservative when the hand Jacobian loses rank or a joint approaches a
+        hard limit.
+        """
+        singular_values = np.linalg.svd(
+            np.asarray(jacobian, dtype=float), compute_uv=False
+        )
+        if singular_values.size and np.all(np.isfinite(singular_values)):
+            sigma_min = float(singular_values[-1])
+            sigma_max = float(singular_values[0])
+        else:
+            sigma_min = 0.0
+            sigma_max = 0.0
+        condition = sigma_max / max(sigma_min, 1e-12)
+
+        joint_range = np.asarray(
+            self.model.jnt_range[self.base_env.arm_joint_ids], dtype=float
+        )
+        joint_span = np.maximum(joint_range[:, 1] - joint_range[:, 0], 1e-6)
+        arm_qpos = np.asarray(
+            self.data.qpos[self.base_env.arm_qpos_adr], dtype=float
+        )
+        lower_margin = (arm_qpos - joint_range[:, 0]) / joint_span
+        upper_margin = (joint_range[:, 1] - arm_qpos) / joint_span
+        joint_margin_ratio = float(
+            np.clip(np.min(np.minimum(lower_margin, upper_margin)), 0.0, 0.5)
+        )
+
+        if self.rl_config.singularity_avoidance_enabled:
+            sigma_span = max(
+                self.rl_config.singularity_soft_sigma
+                - self.rl_config.singularity_hard_sigma,
+                1e-9,
+            )
+            sigma_severity = float(np.clip(
+                (self.rl_config.singularity_soft_sigma - sigma_min)
+                / sigma_span,
+                0.0,
+                1.0,
+            ))
+            margin_target = self.rl_config.singularity_joint_margin_ratio
+            limit_severity = float(np.clip(
+                (margin_target - joint_margin_ratio)
+                / max(margin_target, 1e-9),
+                0.0,
+                1.0,
+            ))
+            severity = max(sigma_severity, limit_severity)
+        else:
+            severity = 0.0
+
+        base_damping = float(self.rl_config.ik_damping)
+        max_damping = max(base_damping, float(
+            self.rl_config.singularity_max_damping
+        ))
+        damping = base_damping + severity * (max_damping - base_damping)
+        active = bool(
+            self.rl_config.singularity_avoidance_enabled and severity > 0.0
+        )
+        self._last_ik_singularity_sigma_min = sigma_min
+        self._last_ik_singularity_condition = condition
+        self._last_ik_singularity_damping = damping
+        self._last_ik_singularity_severity = severity
+        self._last_ik_singularity_guard_active = active
+        self._last_ik_joint_margin_ratio = joint_margin_ratio
+        if active:
+            self._last_ik_singularity_guard_count += 1
+        return sigma_min, condition, severity, damping, active
+
+    def _apply_singularity_nullspace(
+        self,
+        jacobian: np.ndarray,
+        q_velocity: np.ndarray,
+        damping: float,
+        severity: float,
+    ) -> np.ndarray:
+        """Add a bounded null-space velocity away from singular postures."""
+        if (
+            not self.rl_config.singularity_avoidance_enabled
+            or severity <= 0.0
+        ):
+            return np.asarray(q_velocity, dtype=float)
+
+        joint_range = np.asarray(
+            self.model.jnt_range[self.base_env.arm_joint_ids], dtype=float
+        )
+        joint_span = np.maximum(joint_range[:, 1] - joint_range[:, 0], 1e-6)
+        arm_qpos = np.asarray(
+            self.data.qpos[self.base_env.arm_qpos_adr], dtype=float
+        )
+        center = 0.5 * (joint_range[:, 0] + joint_range[:, 1])
+        half_range = np.maximum(0.5 * joint_span, 1e-6)
+        normalized_center = np.clip(
+            (arm_qpos - center) / half_range, -1.0, 1.0
+        )
+        lower_margin = (arm_qpos - joint_range[:, 0]) / joint_span
+        upper_margin = (joint_range[:, 1] - arm_qpos) / joint_span
+        margin = np.minimum(lower_margin, upper_margin)
+        limit_activation = np.clip(
+            (self.rl_config.singularity_joint_margin_ratio - margin)
+            / max(self.rl_config.singularity_joint_margin_ratio, 1e-9),
+            0.0,
+            1.0,
+        )
+        posture_bias = (
+            -self.rl_config.singularity_posture_gain
+            * severity
+            * normalized_center
+        )
+        limit_bias = (
+            -self.rl_config.singularity_joint_limit_gain
+            * limit_activation
+            * normalized_center
+        )
+        bias = np.clip(
+            posture_bias + limit_bias,
+            -self.rl_config.singularity_nullspace_velocity_limit,
+            self.rl_config.singularity_nullspace_velocity_limit,
+        )
+        identity = np.eye(jacobian.shape[1])
+        damped_pinv = jacobian.T @ np.linalg.solve(
+            jacobian @ jacobian.T + damping**2 * np.eye(jacobian.shape[0]),
+            np.eye(jacobian.shape[0]),
+        )
+        nullspace_projector = identity - damped_pinv @ jacobian
+        return np.asarray(q_velocity, dtype=float) + nullspace_projector @ bias
+
     def _limit_ik_joint_velocity(self, q_velocity: np.ndarray) -> np.ndarray:
         """Apply the legacy task-space decoder joint-velocity scaling."""
         velocity_limits = np.asarray(
@@ -674,16 +881,40 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         jacp, jacr = self.base_env._hand_jacobian()
         jacobian = np.vstack((jacp, jacr))[:, self.base_env.arm_dof_adr]
         twist = np.concatenate((linear_velocity, angular_velocity))
-        damping = self.rl_config.ik_damping
+        _, _, singularity_severity, damping, singularity_active = (
+            self._singularity_metrics(jacobian)
+        )
         q_velocity = jacobian.T @ np.linalg.solve(
             jacobian @ jacobian.T + damping**2 * np.eye(6),
             twist,
+        )
+        q_velocity = self._apply_singularity_nullspace(
+            jacobian, q_velocity, damping, singularity_severity
         )
         q_velocity = self._limit_ik_joint_velocity(q_velocity)
 
         previous_target = self.base_env._last_applied_action[:7]
         target_qpos = previous_target + control_dt * q_velocity
         joint_range = self.model.jnt_range[self.base_env.arm_joint_ids]
+        if singularity_active:
+            # Keep a small margin from the hard stop only while the guard is
+            # active.  This is a command buffer, not an episode termination.
+            buffer = self.rl_config.singularity_joint_limit_buffer_ratio
+            joint_span = np.maximum(
+                joint_range[:, 1] - joint_range[:, 0], 1e-6
+            )
+            safe_lower = joint_range[:, 0] + buffer * joint_span
+            safe_upper = joint_range[:, 1] - buffer * joint_span
+            guarded_target = np.clip(target_qpos, safe_lower, safe_upper)
+            self._last_ik_singularity_target_clipped = bool(
+                np.any(np.abs(guarded_target - target_qpos) > 1e-10)
+            )
+            self._last_ik_singularity_target_clip_count += int(
+                self._last_ik_singularity_target_clipped
+            )
+            target_qpos = guarded_target
+        else:
+            self._last_ik_singularity_target_clipped = False
         mujoco_action = np.empty(8)
         mujoco_action[:7] = np.clip(
             target_qpos, joint_range[:, 0], joint_range[:, 1]
@@ -1157,6 +1388,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         action_rate = float(np.mean(np.square(action - self._previous_action)))
         self._previous_action = action.copy()
 
+        safety_components = self._safety_reward_components()
+
         components = {
             "reward_reach_progress": self.rl_config.reward_reach_progress * progress,
             "reward_alignment_progress": (
@@ -1219,8 +1452,101 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                     == "geometric_safety_violation"
                 )
             ),
+            **safety_components,
         }
         return float(sum(components.values())), components
+
+    def _safety_reward_components(self) -> dict[str, float]:
+        """Return bounded shaping terms without changing termination semantics."""
+        self._last_table_filter_reward = 0.0
+        self._last_table_contact_reward = 0.0
+        self._last_singularity_safety_reward = 0.0
+        self._last_singularity_penalty_severity = 0.0
+        if not self.rl_config.safety_reward_enabled:
+            self._last_safety_penalty_scale = 0.0
+            return {
+                "reward_table_filter": 0.0,
+                "reward_table_contact": 0.0,
+                "reward_singularity_safety": 0.0,
+            }
+
+        ramp_steps = int(self.rl_config.safety_penalty_ramp_env_steps)
+        scale = (
+            1.0
+            if ramp_steps == 0
+            else min(1.0, float(self._total_env_steps) / float(ramp_steps))
+        )
+        self._last_safety_penalty_scale = scale
+
+        table_remaining = max(
+            0.0,
+            self.rl_config.table_safety_penalty_cap
+            - self._table_safety_penalty_total,
+        )
+        if bool(getattr(self, "_table_finger_filter_active", False)):
+            magnitude = min(
+                -self.rl_config.reward_table_filter_step * scale,
+                table_remaining,
+            )
+            self._last_table_filter_reward = -magnitude
+            self._table_safety_penalty_total += magnitude
+            table_remaining -= magnitude
+
+        # Recompute after the physical step.  Only the two finger collision
+        # geoms are considered; normal cable-table contact is intentionally
+        # excluded.
+        distance_fn = getattr(self, "_table_finger_min_distance", None)
+        actual_distance = float("inf")
+        if callable(distance_fn):
+            actual_distance = float(distance_fn(self.data))
+            self._table_finger_actual_min_distance = actual_distance
+        if actual_distance < 0.0 and table_remaining > 0.0:
+            magnitude = min(
+                -self.rl_config.reward_table_contact_step * scale,
+                table_remaining,
+            )
+            self._last_table_contact_reward = -magnitude
+            self._table_safety_penalty_total += magnitude
+
+        sigma_span = max(
+            self.rl_config.singularity_penalty_soft_sigma
+            - self.rl_config.singularity_penalty_hard_sigma,
+            1e-9,
+        )
+        sigma_severity = float(np.clip(
+            (self.rl_config.singularity_penalty_soft_sigma
+             - self._last_ik_singularity_sigma_min) / sigma_span,
+            0.0,
+            1.0,
+        ))
+        margin_target = self.rl_config.singularity_penalty_joint_margin_ratio
+        margin_severity = float(np.clip(
+            (margin_target - self._last_ik_joint_margin_ratio)
+            / max(margin_target, 1e-9),
+            0.0,
+            1.0,
+        ))
+        severity = max(sigma_severity, margin_severity)
+        self._last_singularity_penalty_severity = severity
+        singularity_remaining = max(
+            0.0,
+            self.rl_config.singularity_safety_penalty_cap
+            - self._singularity_safety_penalty_total,
+        )
+        if severity > 0.0 and singularity_remaining > 0.0:
+            magnitude = min(
+                -self.rl_config.reward_singularity_step
+                * severity * severity * scale,
+                singularity_remaining,
+            )
+            self._last_singularity_safety_reward = -magnitude
+            self._singularity_safety_penalty_total += magnitude
+
+        return {
+            "reward_table_filter": self._last_table_filter_reward,
+            "reward_table_contact": self._last_table_contact_reward,
+            "reward_singularity_safety": self._last_singularity_safety_reward,
+        }
 
     def reset(
         self,
@@ -1235,6 +1561,12 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         _, info = self.base_env.reset(randomize=True, seed=seed)
         self._episode_return = 0.0
         self._episode_steps = 0
+        self._table_safety_penalty_total = 0.0
+        self._singularity_safety_penalty_total = 0.0
+        self._last_table_filter_reward = 0.0
+        self._last_table_contact_reward = 0.0
+        self._last_singularity_safety_reward = 0.0
+        self._last_singularity_penalty_severity = 0.0
         self._episode_initial_cable_z = self.data.xpos[
             self.base_env.cable_ids, 2
         ].copy()
@@ -1255,6 +1587,15 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self.base_env.hand_id
         ].reshape(3, 3).copy()
         self._last_ik_velocity_scale = 1.0
+        self._last_ik_singularity_sigma_min = float("inf")
+        self._last_ik_singularity_condition = 1.0
+        self._last_ik_singularity_damping = self.rl_config.ik_damping
+        self._last_ik_singularity_severity = 0.0
+        self._last_ik_singularity_guard_active = False
+        self._last_ik_singularity_guard_count = 0
+        self._last_ik_singularity_target_clipped = False
+        self._last_ik_singularity_target_clip_count = 0
+        self._last_ik_joint_margin_ratio = 1.0
         self._gripper_switch_event = False
         self._gripper_switch_count = 0
         self._max_contacting_fingers = 0
@@ -1326,6 +1667,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         normalized_action = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
         mujoco_action = self._convert_action(normalized_action)
         _, _, base_success, truncated, info = self.base_env.step(mujoco_action)
+        self._total_env_steps += 1
         grasp_status = self._update_grasp_status(info)
         # RL 的原始双侧接触/secured进度在50 Hz动作边界检查，作为训练漏斗
         # 和过程奖励诊断。跨方法共享的底层任务成功是唯一终止条件与终点奖励
@@ -1363,6 +1705,38 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         result["rl_grasped_body_id"] = self._locked_body_id
         result["ik_velocity_scale"] = self._last_ik_velocity_scale
+        result["ik_singularity_sigma_min"] = (
+            self._last_ik_singularity_sigma_min
+        )
+        result["ik_singularity_condition"] = (
+            self._last_ik_singularity_condition
+        )
+        result["ik_singularity_damping"] = self._last_ik_singularity_damping
+        result["ik_singularity_severity"] = (
+            self._last_ik_singularity_severity
+        )
+        result["ik_singularity_guard_active"] = (
+            self._last_ik_singularity_guard_active
+        )
+        result["ik_singularity_guard_count"] = (
+            self._last_ik_singularity_guard_count
+        )
+        result["ik_singularity_target_clipped"] = (
+            self._last_ik_singularity_target_clipped
+        )
+        result["ik_singularity_target_clip_count"] = (
+            self._last_ik_singularity_target_clip_count
+        )
+        result["ik_joint_margin_ratio"] = self._last_ik_joint_margin_ratio
+        result["safety_reward_enabled"] = self.rl_config.safety_reward_enabled
+        result["safety_penalty_scale"] = self._last_safety_penalty_scale
+        result["table_safety_penalty_total"] = self._table_safety_penalty_total
+        result["singularity_safety_penalty_total"] = (
+            self._singularity_safety_penalty_total
+        )
+        result["singularity_penalty_severity"] = (
+            self._last_singularity_penalty_severity
+        )
         result["gripper_switch_event"] = self._gripper_switch_event
         result["gripper_switch_count"] = self._gripper_switch_count
         result["premature_close_event"] = self._premature_close_event
