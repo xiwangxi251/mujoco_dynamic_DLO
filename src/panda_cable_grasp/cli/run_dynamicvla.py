@@ -295,6 +295,15 @@ def run_server(args: argparse.Namespace) -> None:
     model_path = models_dir / f"{scenario.name}.mjb"
     mujoco.mj_saveModel(env.model, str(model_path), None)
     control_dt = float(env.model.opt.timestep * env.config.frame_skip)
+    fixed_delay_steps = int(round(args.fixed_decision_delay / control_dt))
+    if args.fixed_decision_delay > 0.0:
+        fixed_delay_steps = max(1, fixed_delay_steps)
+        print(
+            "dynamicvla_fixed_decision_delay="
+            f"{args.fixed_decision_delay:.3f}s "
+            f"({fixed_delay_steps} control steps at {1.0 / control_dt:.1f}Hz)",
+            flush=True,
+        )
     successes = 0
     rows: list[dict] = []
     try:
@@ -322,6 +331,7 @@ def run_server(args: argparse.Namespace) -> None:
             ee_path: list[np.ndarray] = []
             min_target_distance = float("inf")
             model_action_messages = 0
+            fixed_delay_control_steps = 0
             termination_reason: str | None = None
             previous_wall_step = control_dt
             observation_index = 0
@@ -341,6 +351,13 @@ def run_server(args: argparse.Namespace) -> None:
                         observation["sync_mode"] = True
                         observation["sync_index"] = observation_index
                         observation["execute_steps"] = args.execute_steps
+                        if (
+                            args.pipeline_discard_steps > 0
+                            and model_action_messages % args.execute_steps == 0
+                        ):
+                            observation["pipeline_discard_steps"] = (
+                                args.pipeline_discard_steps
+                            )
                         obs_socket.send_pyobj(observation)
                         message = _wait_for_sync_action(
                             act_socket, observation_index, args.action_timeout
@@ -354,6 +371,61 @@ def run_server(args: argparse.Namespace) -> None:
                                 flush=True,
                             )
                             break
+                        # A real arm keeps executing its previous command while
+                        # a fresh 16-action chunk is being inferred.  In strict
+                        # sync mode wall-clock inference normally freezes MuJoCo;
+                        # emulate that physical interval here, at a fixed and
+                        # reproducible duration, only when the client refills its
+                        # action queue (once per execute_steps responses).
+                        if (
+                            fixed_delay_steps > 0
+                            and model_action_messages % args.execute_steps == 0
+                        ):
+                            for _ in range(fixed_delay_steps):
+                                diagnostics = adapter.diagnostics()
+                                position_clipped.append(
+                                    diagnostics["position_clipped"]
+                                )
+                                quaternion_repaired.append(
+                                    diagnostics["quaternion_repaired"]
+                                )
+                                ee_path.append(env.hand_position.copy())
+                                held_action = adapter.action()
+                                _, reward, success, truncated, step_info = env.step(
+                                    held_action
+                                )
+                                recorder.record_step(
+                                    diagnostics["raw_action"],
+                                    reward,
+                                    success,
+                                    truncated,
+                                    step_info,
+                                    extras={
+                                        "pose_commands": diagnostics["pose_command"],
+                                        "joint_actions": held_action,
+                                        "received_action_mask": False,
+                                        "fixed_latency_hold": True,
+                                        "position_clipped": diagnostics["position_clipped"],
+                                        "quaternion_repaired": diagnostics["quaternion_repaired"],
+                                    },
+                                )
+                                min_target_distance = min(
+                                    min_target_distance,
+                                    float(
+                                        np.linalg.norm(
+                                            env.target_position() - env.hand_position
+                                        )
+                                    ),
+                                )
+                                termination_reason = step_info.get(
+                                    "termination_reason"
+                                )
+                                observation_index += 1
+                                fixed_delay_control_steps += 1
+                                if success or truncated:
+                                    break
+                            if success or truncated:
+                                break
                         try:
                             adapter.set_model_action(message["action"])
                             model_action_messages += 1
@@ -452,6 +524,8 @@ def run_server(args: argparse.Namespace) -> None:
                 "model_action_received": model_action_messages > 0,
                 "sync_mode": sync_mode,
                 "execute_steps": args.execute_steps if sync_mode else None,
+                "fixed_decision_delay_seconds": args.fixed_decision_delay,
+                "fixed_delay_control_steps": fixed_delay_control_steps,
                 "position_clip_frames": int(np.count_nonzero(position_clipped)),
                 "quaternion_repair_frames": int(np.count_nonzero(quaternion_repaired)),
                 "instruction": args.instruction,
@@ -519,6 +593,8 @@ def run_server(args: argparse.Namespace) -> None:
                 ),
                 "synchronous": sync_mode,
                 "execute_steps": args.execute_steps if sync_mode else None,
+                "fixed_decision_delay_seconds": args.fixed_decision_delay,
+                "fixed_decision_delay_control_steps": fixed_delay_steps,
                 "predicted_chunk_size": handshake.get("chunk_size"),
                 "rotation": "euler_in_model_quaternion_on_wire_wxyz",
                 "delta_action": bool(handshake.get("delta_action", True)),
@@ -652,6 +728,25 @@ def parse_args() -> argparse.Namespace:
         help="Actions consumed from each predicted chunk before the next prediction",
     )
     parser.add_argument(
+        "--fixed-decision-delay",
+        type=float,
+        default=0.0,
+        help=(
+            "In sync mode, advance MuJoCo with the previous command for this "
+            "fixed number of wall-clock-equivalent seconds before each action "
+            "chunk refill; this simulates inference delay without async stepping."
+        ),
+    )
+    parser.add_argument(
+        "--pipeline-discard-steps",
+        type=int,
+        default=0,
+        help=(
+            "For sync chunk-pipeline evaluation, discard this many leading "
+            "actions from every newly inferred chunk before execution."
+        ),
+    )
+    parser.add_argument(
         "--action-timeout",
         "--action_timeout",
         type=float,
@@ -678,6 +773,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--video-fps must be positive")
     if args.execute_steps < 1:
         parser.error("--execute-steps must be positive")
+    if args.fixed_decision_delay < 0.0:
+        parser.error("--fixed-decision-delay must be non-negative")
+    if args.pipeline_discard_steps < 0:
+        parser.error("--pipeline-discard-steps must be non-negative")
+    if args.pipeline_discard_steps + args.execute_steps > 16:
+        parser.error(
+            "pipeline-discard-steps + execute-steps exceeds the D2 chunk size (16)"
+        )
     if args.action_timeout <= 0.0:
         parser.error("--action-timeout must be positive")
     if not args.instruction.strip():
