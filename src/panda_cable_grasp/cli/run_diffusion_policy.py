@@ -23,11 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260804)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument(
-        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="nero",
         help="robot model used by the MuJoCo environment",
     )
     parser.add_argument("--video-fps", type=float, default=25.0)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--inference-steps", type=int, default=None,
         help="override checkpoint diffusion denoising steps for evaluation",
