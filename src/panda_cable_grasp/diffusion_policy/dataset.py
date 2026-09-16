@@ -13,15 +13,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ..dynamicvla.finetune.convert_dataset import JointTargetForwardKinematics
-from .config import (
-    ACTION_HIGH,
-    ACTION_LOW,
-    STATE_HIGH,
-    STATE_LOW,
-    normalize_array,
-    split_episode_indices,
+from ..dynamicvla.finetune.convert_dataset import (
+    JointTargetForwardKinematics,
+    _wxyz_to_euler_xyz,
 )
+from .config import split_episode_indices
 
 
 @dataclass(frozen=True)
@@ -98,7 +94,13 @@ def _episode_record(
             raise ValueError(
                 f"{path} is not a privileged-expert trajectory; missing {missing}"
             )
-        state = np.concatenate((data["hand_position"], data["hand_quaternion"]), axis=-1)
+        state = np.concatenate(
+            (
+                np.asarray(data["hand_position"], dtype=np.float64),
+                _wxyz_to_euler_xyz(data["hand_quaternion"]).astype(np.float64),
+            ),
+            axis=-1,
+        )
         if action_source not in {"requested", "applied"}:
             raise ValueError("action_source must be requested or applied")
         command_key = f"{action_source}_actions"
@@ -117,6 +119,7 @@ def _episode_record(
 
     fk = _forward_kinematics(str(model_path.resolve()))
     action_position, action_quaternion = fk.poses(command[:, :7])
+    action_euler = _wxyz_to_euler_xyz(action_quaternion).astype(np.float64)
     threshold = (
         float(gripper_threshold)
         if gripper_threshold is not None
@@ -125,7 +128,14 @@ def _episode_record(
     gripper = np.where(
         command[:, fk.gripper_actuator_id] > threshold, 1.0, -1.0
     )[:, None]
-    action = np.concatenate((action_position, action_quaternion, gripper), axis=-1)
+    action = np.concatenate(
+        (
+            np.asarray(action_position, dtype=np.float64),
+            action_euler,
+            gripper,
+        ),
+        axis=-1,
+    )
     state = np.asarray(state, dtype=np.float32)
     action = np.asarray(action, dtype=np.float32)
     frame_count = min(len(state), len(action))
@@ -148,11 +158,17 @@ class DiffusionEpisodeDataset(Dataset):
     """Lazy dual-camera sequence dataset with action-chunk padding.
 
     Each item contains normalized tensors with keys ``opst_cam``, ``wrist_cam``,
-    ``state`` and ``action``.  The camera/state history is padded with the first
-    observation at episode boundaries, and future actions are padded with the
-    final demonstrated command.  This matches the receding-horizon semantics
-    used during inference.
+    ``state`` and ``action``.  States use DynamicVLA's ``[xyz, euler_xyz]``
+    convention and actions are ``[xyz, euler_xyz, gripper]`` chunk deltas
+    relative to the current frame, identical to ``DynamicVLAEpisodeDataset``.
+    The camera/state history is padded with the first observation at episode
+    boundaries, and future actions are padded with the final demonstrated
+    command.  This matches the receding-horizon semantics used during
+    inference.
     """
+
+    state_format = "dynamicvla_absolute_xyz_euler_xyz"
+    action_format = "dynamicvla_chunk_delta_xyz_euler_xyz_gripper"
 
     def __init__(
         self,
@@ -162,13 +178,14 @@ class DiffusionEpisodeDataset(Dataset):
         action_source: str = "applied",
         gripper_threshold: float | None = None,
         episode_indices: Iterable[int] | None = None,
+        normalization_bounds: tuple[np.ndarray, ...] | None = None,
     ) -> None:
         self.config = config
         records = [
             _episode_record(path, action_source, gripper_threshold)
             for path in _find_trajectories(inputs)
         ]
-        self._initialize_from_records(records, episode_indices)
+        self._initialize_from_records(records, episode_indices, normalization_bounds)
 
     @classmethod
     def from_records(
@@ -177,12 +194,13 @@ class DiffusionEpisodeDataset(Dataset):
         *,
         config,
         episode_indices: Iterable[int] | None = None,
+        normalization_bounds: tuple[np.ndarray, ...] | None = None,
     ) -> "DiffusionEpisodeDataset":
         """Create a split view without reparsing trajectories or rebuilding FK."""
 
         dataset = cls.__new__(cls)
         dataset.config = config
-        dataset._initialize_from_records(records, episode_indices)
+        dataset._initialize_from_records(records, episode_indices, normalization_bounds)
         return dataset
 
     def subset(self, episode_indices: Iterable[int]) -> "DiffusionEpisodeDataset":
@@ -192,12 +210,19 @@ class DiffusionEpisodeDataset(Dataset):
             self.records,
             config=self.config,
             episode_indices=episode_indices,
+            normalization_bounds=(
+                self._state_low,
+                self._state_high,
+                self._action_low,
+                self._action_high,
+            ),
         )
 
     def _initialize_from_records(
         self,
         records: list[EpisodeRecord],
         episode_indices: Iterable[int] | None,
+        normalization_bounds: tuple[np.ndarray, ...] | None,
     ) -> None:
         selected = list(range(len(records))) if episode_indices is None else list(episode_indices)
         if not selected:
@@ -213,7 +238,51 @@ class DiffusionEpisodeDataset(Dataset):
         ]
         if not self.samples:
             raise ValueError("dataset contains no frames")
+        if normalization_bounds is None:
+            normalization_bounds = self._fit_normalization_bounds()
+        (
+            self._state_low,
+            self._state_high,
+            self._action_low,
+            self._action_high,
+        ) = normalization_bounds
         self._video_cache: OrderedDict[int, tuple[np.ndarray, np.ndarray]] = OrderedDict()
+
+    def _fit_normalization_bounds(self) -> tuple[np.ndarray, ...]:
+        """Fit q01/q99 bounds on states and on chunk-delta action targets.
+
+        Sampling every eighth chunk start keeps the pass linear while covering
+        the same distribution ``__getitem__`` produces; bounds intentionally
+        span all records so train/validation subsets share one normalization.
+        """
+
+        state_values = np.concatenate(
+            [record.state for record in self.records], axis=0
+        ).astype(np.float64)
+        offsets = np.arange(self.config.prediction_horizon, dtype=np.int64)
+        delta_values: list[np.ndarray] = []
+        for record in self.records:
+            starts = np.arange(0, len(record.state), 8, dtype=np.int64)
+            future = np.minimum(
+                starts[:, None] + offsets[None, :], len(record.state) - 1
+            )
+            target = record.action[future].astype(np.float64)
+            target[:, :, :6] -= record.state[starts, None, :6]
+            delta_values.append(target.reshape(-1, 7))
+        action_values = np.concatenate(delta_values, axis=0)
+        state_low, state_high, action_low, action_high = (
+            np.quantile(values, quantile, axis=0).astype(np.float32)
+            for values, quantile in (
+                (state_values, 0.01), (state_values, 0.99),
+                (action_values, 0.01), (action_values, 0.99),
+            )
+        )
+        return (
+            state_low,
+            np.maximum(state_high, state_low + 1.0e-6),
+            action_low,
+            np.maximum(action_high, action_low + 1.0e-6),
+        )
 
     @property
     def episode_count(self) -> int:
@@ -221,19 +290,19 @@ class DiffusionEpisodeDataset(Dataset):
 
     @property
     def action_low(self) -> np.ndarray:
-        return np.asarray(ACTION_LOW, dtype=np.float32)
+        return self._action_low
 
     @property
     def action_high(self) -> np.ndarray:
-        return np.asarray(ACTION_HIGH, dtype=np.float32)
+        return self._action_high
 
     @property
     def state_low(self) -> np.ndarray:
-        return np.asarray(STATE_LOW, dtype=np.float32)
+        return self._state_low
 
     @property
     def state_high(self) -> np.ndarray:
-        return np.asarray(STATE_HIGH, dtype=np.float32)
+        return self._state_high
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -266,6 +335,11 @@ class DiffusionEpisodeDataset(Dataset):
     def _future_indices(index: int, count: int, length: int) -> list[int]:
         return [min(length - 1, index + offset) for offset in range(count)]
 
+    @staticmethod
+    def _normalized(value: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
+        normalized = 2.0 * (value - low) / np.maximum(high - low, 1.0e-6) - 1.0
+        return np.clip(normalized, -1.0, 1.0).astype(np.float32)
+
     def __getitem__(self, item: int) -> dict[str, torch.Tensor]:
         episode_index, frame_index = self.samples[item]
         record = self.records[episode_index]
@@ -274,10 +348,14 @@ class DiffusionEpisodeDataset(Dataset):
         future = self._future_indices(
             frame_index, self.config.prediction_horizon, len(record.action)
         )
+        # DynamicVLA delta_action=True semantics: every action in the chunk is
+        # expressed relative to the current frame's state, not its own.
+        target = record.action[future].copy()
+        target[:, :6] -= record.state[frame_index, :6]
         opst_tensor = torch.from_numpy(opst[history].transpose(0, 3, 1, 2)).float() / 255.0
         wrist_tensor = torch.from_numpy(wrist[history].transpose(0, 3, 1, 2)).float() / 255.0
-        state = normalize_array(record.state[history], STATE_LOW, STATE_HIGH)
-        action = normalize_array(record.action[future], ACTION_LOW, ACTION_HIGH)
+        state = self._normalized(record.state[history], self._state_low, self._state_high)
+        action = self._normalized(target, self._action_low, self._action_high)
         return {
             "opst_cam": opst_tensor,
             "wrist_cam": wrist_tensor,

@@ -86,20 +86,27 @@ class DiffusionPolicyConfig:
                 raise ValueError(f"{name} must be finite and non-negative")
 
 
-# DynamicVLA's task-space action is [xyz, quaternion(wxyz), gripper].  The
-# position bounds intentionally match DynamicVLAAdapterConfig.  Quaternion and
-# gripper values are already naturally represented in [-1, 1].
+# DynamicVLA's task-space state is [xyz, euler_xyz] and its action is a
+# chunk-delta [dxyz, deuler_xyz, gripper] relative to the current state.  The
+# position bounds intentionally match DynamicVLAAdapterConfig; the Euler deltas
+# cover the wrap-safe ±2π range and the gripper is already in [-1, 1].  Both
+# datasets fit tighter q01/q99 bounds from data; these constants are only
+# fallbacks for checkpoints that predate stored normalization statistics.
 STATE_LOW = (
-    0.20, -0.55, 0.005, -1.0, -1.0, -1.0, -1.0,
+    0.20, -0.55, 0.005, -math.pi, -math.pi, -math.pi,
 )
 STATE_HIGH = (
-    0.85, 0.55, 0.70, 1.0, 1.0, 1.0, 1.0,
+    0.85, 0.55, 0.70, math.pi, math.pi, math.pi,
 )
 ACTION_LOW = (
-    0.20, -0.55, 0.005, -1.0, -1.0, -1.0, -1.0, -1.0,
+    -0.65, -1.10, -0.695,
+    -2.0 * math.pi, -2.0 * math.pi, -2.0 * math.pi,
+    -1.0,
 )
 ACTION_HIGH = (
-    0.85, 0.55, 0.70, 1.0, 1.0, 1.0, 1.0, 1.0,
+    0.65, 1.10, 0.695,
+    2.0 * math.pi, 2.0 * math.pi, 2.0 * math.pi,
+    1.0,
 )
 
 

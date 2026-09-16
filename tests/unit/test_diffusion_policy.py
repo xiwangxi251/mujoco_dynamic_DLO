@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 import unittest
 
 import numpy as np
@@ -61,14 +62,64 @@ class DiffusionPolicyTorchShapeTests(unittest.TestCase):
         observations = {
             "opst_cam": torch.rand(2, 2, 3, 84, 84),
             "wrist_cam": torch.rand(2, 2, 3, 84, 84),
-            "state": torch.rand(2, 2, 7),
+            "state": torch.rand(2, 2, 6),
         }
-        actions = torch.rand(2, 4, 8) * 2.0 - 1.0
+        actions = torch.rand(2, 4, 7) * 2.0 - 1.0
         self.assertIsNot(model.opst_encoder, model.wrist_encoder)
         loss = model.forward_loss(**observations, action=actions)
         sample = model.sample(**observations)
         self.assertEqual(loss.ndim, 0)
-        self.assertEqual(tuple(sample.shape), (2, 4, 8))
+        self.assertEqual(tuple(sample.shape), (2, 4, 7))
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "requires optional PyTorch")
+class DiffusionEpisodeDatasetContractTests(unittest.TestCase):
+    """The raw-NPZ dataset must match the DynamicVLA/LeRobot contract."""
+
+    def test_items_are_6d_euler_state_and_7d_delta_actions(self) -> None:
+        import torch  # noqa: F401 - dataset returns torch tensors
+
+        from panda_cable_grasp.diffusion_policy.dataset import (
+            DiffusionEpisodeDataset,
+            EpisodeRecord,
+        )
+
+        config = DiffusionPolicyConfig(
+            observation_horizon=2,
+            prediction_horizon=4,
+            action_horizon=2,
+        )
+        frames = 12
+        rng = np.random.default_rng(0)
+        state = rng.uniform(-0.5, 0.5, size=(frames, 6)).astype(np.float32)
+        action = rng.uniform(-0.5, 0.5, size=(frames, 7)).astype(np.float32)
+        record = EpisodeRecord(
+            trajectory=Path("episode_000.npz"),
+            opst_video=Path("global.mp4"),
+            wrist_video=Path("wrist.mp4"),
+            state=state,
+            action=action,
+            scenario="id_static",
+            seed=0,
+        )
+        dataset = DiffusionEpisodeDataset.from_records([record], config=config)
+        images = np.zeros((frames, 84, 84, 3), dtype=np.uint8)
+        dataset._videos = lambda _index: (images, images)
+
+        item = dataset[3]
+        self.assertEqual(tuple(item["state"].shape), (2, 6))
+        self.assertEqual(tuple(item["action"].shape), (4, 7))
+        self.assertEqual(dataset.state_low.shape, (6,))
+        self.assertEqual(dataset.action_low.shape, (7,))
+
+        # Every future action is a delta from the current frame's state; the
+        # gripper channel stays absolute.
+        expected_delta = action[3:7].copy()
+        expected_delta[:, :6] -= state[3, :6]
+        expected = dataset._normalized(
+            expected_delta, dataset.action_low, dataset.action_high
+        )
+        np.testing.assert_allclose(item["action"].numpy(), expected, atol=1e-6)
 
 
 if __name__ == "__main__":
