@@ -59,6 +59,22 @@ class RLConfig:
     secured_lift_delta: float = 0.03
     secured_confirm_seconds: float = 0.10
     secured_contact_loss_grace_seconds: float = 0.06
+    # Reward a stable lift into a broad, task-useful height band instead of
+    # making an ever-higher cable neutral.  Heights are measured from the
+    # tabletop to the centre of the currently grasped cable body.
+    height_band_reward_enabled: bool = True
+    height_band_low_m: float = 0.18
+    height_band_high_m: float = 0.25
+    reward_overheight_progress: float = 20.0
+    reward_overheight_step: float = -0.05
+    overheight_full_scale_m: float = 0.10
+    overheight_step_penalty_cap: float = 2.0
+    success_overheight_penalty_per_m: float = 20.0
+    success_overheight_penalty_cap: float = 6.0
+    # Per worker.  At 20 workers this corresponds to about 200k global steps.
+    height_penalty_ramp_env_steps: int = 10_000
+    # Retained for diagnostics and legacy checkpoints; height-band shaping no
+    # longer uses this one-sided cap as its reward potential.
     lift_credit_cap: float = 0.12
     cable_lift_credit_cap: float = 0.30
     reward_reach_progress: float = 6.0
@@ -124,6 +140,8 @@ class RLConfig:
             "secured_lift_delta", "pinch_minimum_lift",
             "pinch_stall_grace_seconds",
             "secured_confirm_seconds", "secured_contact_loss_grace_seconds",
+            "height_band_low_m", "height_band_high_m",
+            "overheight_full_scale_m",
             "singularity_penalty_soft_sigma",
             "singularity_penalty_hard_sigma",
             "singularity_penalty_joint_margin_ratio",
@@ -157,6 +175,17 @@ class RLConfig:
             )
         if not self.gripper_close_threshold < self.gripper_open_threshold:
             raise ValueError("gripper hysteresis thresholds must be increasing")
+        if self.height_band_low_m >= self.height_band_high_m:
+            raise ValueError(
+                "height_band_low_m must be less than height_band_high_m"
+            )
+        for name in (
+            "reward_lift_progress", "reward_overheight_progress",
+            "success_overheight_penalty_per_m",
+        ):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
         if self.pinch_stall_step_penalty > 0.0:
             raise ValueError("pinch_stall_step_penalty must be non-positive")
         if self.failed_unloaded_pinch_penalty > 0.0:
@@ -166,7 +195,7 @@ class RLConfig:
             "reward_premature_close_step",
             "reward_geometric_safety_violation",
             "reward_table_filter_step", "reward_table_contact_step",
-            "reward_singularity_step",
+            "reward_singularity_step", "reward_overheight_step",
         ):
             if float(getattr(self, name)) > 0.0:
                 raise ValueError(f"{name} must be non-positive")
@@ -174,6 +203,8 @@ class RLConfig:
             "pinch_stall_penalty_cap",
             "unloaded_pinch_episode_penalty_cap",
             "premature_close_episode_penalty_cap",
+            "overheight_step_penalty_cap",
+            "success_overheight_penalty_cap",
             "table_safety_penalty_cap", "singularity_safety_penalty_cap",
         ):
             if float(getattr(self, name)) < 0.0:
@@ -184,6 +215,8 @@ class RLConfig:
             )
         if int(self.safety_penalty_ramp_env_steps) < 0:
             raise ValueError("safety_penalty_ramp_env_steps must be non-negative")
+        if int(self.height_penalty_ramp_env_steps) < 0:
+            raise ValueError("height_penalty_ramp_env_steps must be non-negative")
 
 
 TASK_SPACE_ACTION_MODE = "task_space"
@@ -345,6 +378,13 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._last_singularity_safety_reward = 0.0
         self._last_singularity_penalty_severity = 0.0
         self._last_safety_penalty_scale = 0.0
+        self._height_band_hold = 0.0
+        self._height_below_distance_previous: float | None = None
+        self._overheight_distance_previous: float | None = None
+        self._overheight_step_penalty_total = 0.0
+        self._last_height_penalty_scale = 0.0
+        self._last_overheight_severity = 0.0
+        self._last_grasp_body_height_above_table = 0.0
         self._episode_initial_cable_z = np.zeros(len(self.base_env.cable_ids))
         self._secured_candidate_hold = 0.0
         self._secured_contact_loss_hold = 0.0
@@ -951,6 +991,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             "secured_hysteresis_active": False,
             "secured_contact_loss_seconds": 0.0,
             "grasp_lift_delta": 0.0,
+            "grasp_body_height_above_table": 0.0,
+            "height_band_hold": 0.0,
             "strict_success_qualification": False,
             "strict_success_hold": 0.0,
             "rl_hold_success": False,
@@ -967,6 +1009,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._secured_candidate_hold = 0.0
             self._secured_contact_loss_hold = 0.0
             self._strict_success_hold = 0.0
+            self._height_band_hold = 0.0
+            self._last_grasp_body_height_above_table = 0.0
             self._last_grasp_status = self._empty_grasp_status()
             return self._last_grasp_status
 
@@ -987,6 +1031,13 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self.data.xpos[body_id, 2]
             - self._episode_initial_cable_z[body_index]
         )
+        table_geom_id = self.base_env.table_geom_id
+        table_top_z = float(
+            self.data.geom_xpos[table_geom_id, 2]
+            + self.model.geom_size[table_geom_id, 2]
+        )
+        grasp_body_height = float(self.data.xpos[body_id, 2] - table_top_z)
+        self._last_grasp_body_height_above_table = grasp_body_height
 
         aperture = self.base_env.finger_aperture
         distance = float(np.linalg.norm(
@@ -1043,6 +1094,15 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._strict_success_hold += action_seconds
         else:
             self._strict_success_hold = 0.0
+        height_in_band = bool(
+            self.rl_config.height_band_low_m
+            <= grasp_body_height
+            <= self.rl_config.height_band_high_m
+        )
+        if strict_qualification and height_in_band:
+            self._height_band_hold += action_seconds
+        else:
+            self._height_band_hold = 0.0
         rl_hold_success = bool(
             self._strict_success_hold >= self.base_env.config.success_hold_seconds
         )
@@ -1055,6 +1115,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             "secured_hysteresis_active": secured_hysteresis_active,
             "secured_contact_loss_seconds": self._secured_contact_loss_hold,
             "grasp_lift_delta": lift_delta,
+            "grasp_body_height_above_table": grasp_body_height,
+            "height_band_hold": self._height_band_hold,
             "strict_success_qualification": strict_qualification,
             "strict_success_hold": self._strict_success_hold,
             "rl_hold_success": rl_hold_success,
@@ -1317,21 +1379,108 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._pinch_rewarded = self._pinch_rewarded or pinch_confirmed
         self._secured_rewarded = self._secured_rewarded or secured_grasp
 
-        # 抬升塑形使用可逆势能：上升给正奖励，下降给对称负奖励。
-        # high-water 仍保留为诊断指标，不能单独作为奖励基准。
+        # Keep the historical lift high-water only as a diagnostic.  The new
+        # reward is a reversible potential around a useful absolute height
+        # band, so continuing upward after a good lift is no longer neutral.
         capped_lift = float(np.clip(
             float(grasp_status["grasp_lift_delta"]),
             0.0,
             self.rl_config.lift_credit_cap,
         ))
-        previous_lift_credit = self._lift_credit_previous
-        current_lift_credit = capped_lift if pinch_confirmed else 0.0
-        lift_progress = current_lift_credit - previous_lift_credit
-        self._lift_credit_previous = current_lift_credit
         if pinch_confirmed:
             self._lift_credit_high_water = max(
                 self._lift_credit_high_water, capped_lift
             )
+
+        ramp_steps = int(self.rl_config.height_penalty_ramp_env_steps)
+        height_penalty_scale = (
+            1.0
+            if ramp_steps == 0
+            else min(1.0, float(self._total_env_steps) / float(ramp_steps))
+        )
+        self._last_height_penalty_scale = (
+            height_penalty_scale
+            if self.rl_config.height_band_reward_enabled
+            else 0.0
+        )
+        grasp_height = float(grasp_status.get(
+            "grasp_body_height_above_table",
+            grasp_status["grasp_lift_delta"],
+        ))
+        below_distance = max(
+            self.rl_config.height_band_low_m - grasp_height, 0.0
+        )
+        overheight_distance = max(
+            grasp_height - self.rl_config.height_band_high_m, 0.0
+        )
+        lift_progress_reward = 0.0
+        overheight_progress_reward = 0.0
+        overheight_step_reward = 0.0
+        success_overheight_reward = 0.0
+        self._last_overheight_severity = 0.0
+
+        if self.rl_config.height_band_reward_enabled:
+            if pinch_confirmed:
+                if self._height_below_distance_previous is not None:
+                    lift_progress_reward = (
+                        self.rl_config.reward_lift_progress
+                        * (self._height_below_distance_previous - below_distance)
+                    )
+                    overheight_progress_reward = (
+                        self.rl_config.reward_overheight_progress
+                        * height_penalty_scale
+                        * (
+                            self._overheight_distance_previous
+                            - overheight_distance
+                        )
+                    )
+                self._height_below_distance_previous = below_distance
+                self._overheight_distance_previous = overheight_distance
+            else:
+                # Reacquiring a dropped cable starts a fresh potential.  The
+                # height change caused by dropping it must never earn reward.
+                self._height_below_distance_previous = None
+                self._overheight_distance_previous = None
+
+            severity = float(np.clip(
+                overheight_distance
+                / self.rl_config.overheight_full_scale_m,
+                0.0,
+                1.0,
+            ))
+            self._last_overheight_severity = severity
+            smooth_severity = severity * severity * (3.0 - 2.0 * severity)
+            remaining = max(
+                0.0,
+                self.rl_config.overheight_step_penalty_cap
+                - self._overheight_step_penalty_total,
+            )
+            if pinch_confirmed and severity > 0.0 and remaining > 0.0:
+                magnitude = min(
+                    -self.rl_config.reward_overheight_step
+                    * smooth_severity * height_penalty_scale,
+                    remaining,
+                )
+                overheight_step_reward = -magnitude
+                self._overheight_step_penalty_total += magnitude
+            if success and pinch_confirmed and overheight_distance > 0.0:
+                success_overheight_reward = -min(
+                    self.rl_config.success_overheight_penalty_cap,
+                    self.rl_config.success_overheight_penalty_per_m
+                    * overheight_distance * height_penalty_scale,
+                )
+            strict_hold_seconds = float(grasp_status.get(
+                "height_band_hold", 0.0
+            ))
+        else:
+            previous_lift_credit = self._lift_credit_previous
+            current_lift_credit = capped_lift if pinch_confirmed else 0.0
+            lift_progress_reward = (
+                self.rl_config.reward_lift_progress
+                * (current_lift_credit - previous_lift_credit)
+            )
+            self._lift_credit_previous = current_lift_credit
+            strict_hold_seconds = float(grasp_status["strict_success_hold"])
 
         lifted_fraction = float(info["lifted_fraction"])
         capped_lifted_fraction = float(np.clip(
@@ -1372,8 +1521,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         penalize_physical_slip = bool(penalize_contact_loss and physical_slip)
 
         strict_progress = float(np.clip(
-            float(grasp_status["strict_success_hold"])
-            / self.base_env.config.success_hold_seconds,
+            strict_hold_seconds / self.base_env.config.success_hold_seconds,
             0.0,
             1.0,
         ))
@@ -1417,7 +1565,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             "reward_new_secured_grasp": (
                 self.rl_config.reward_new_secured_grasp * float(new_secured)
             ),
-            "reward_lift_progress": self.rl_config.reward_lift_progress * lift_progress,
+            "reward_lift_progress": lift_progress_reward,
+            "reward_overheight_progress": overheight_progress_reward,
+            "reward_overheight_step": overheight_step_reward,
+            "reward_success_overheight": success_overheight_reward,
             "reward_cable_lift_progress": (
                 self.rl_config.reward_cable_lift_progress * cable_lift_progress
             ),
@@ -1567,6 +1718,13 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._last_table_contact_reward = 0.0
         self._last_singularity_safety_reward = 0.0
         self._last_singularity_penalty_severity = 0.0
+        self._height_band_hold = 0.0
+        self._height_below_distance_previous = None
+        self._overheight_distance_previous = None
+        self._overheight_step_penalty_total = 0.0
+        self._last_height_penalty_scale = 0.0
+        self._last_overheight_severity = 0.0
+        self._last_grasp_body_height_above_table = 0.0
         self._episode_initial_cable_z = self.data.xpos[
             self.base_env.cable_ids, 2
         ].copy()
@@ -1800,6 +1958,20 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         result["strict_hold_credit_high_water"] = (
             self._strict_hold_credit_high_water
+        )
+        result["height_band_reward_enabled"] = (
+            self.rl_config.height_band_reward_enabled
+        )
+        result["height_band_low_m"] = self.rl_config.height_band_low_m
+        result["height_band_high_m"] = self.rl_config.height_band_high_m
+        result["grasp_body_height_above_table"] = (
+            self._last_grasp_body_height_above_table
+        )
+        result["height_band_hold"] = self._height_band_hold
+        result["height_penalty_scale"] = self._last_height_penalty_scale
+        result["overheight_severity"] = self._last_overheight_severity
+        result["overheight_step_penalty_total"] = (
+            self._overheight_step_penalty_total
         )
         result["aligned_pinch_event"] = self._aligned_pinch_event
         result["ever_aligned_pinch"] = self._ever_aligned_pinch

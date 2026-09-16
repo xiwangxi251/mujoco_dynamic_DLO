@@ -152,6 +152,18 @@ def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
         singularity_avoidance_enabled=(
             not args.disable_singularity_avoidance
         ),
+        height_band_reward_enabled=(not args.disable_height_band_reward),
+        height_band_low_m=args.height_band_low_m,
+        height_band_high_m=args.height_band_high_m,
+        reward_overheight_progress=args.reward_overheight_progress,
+        reward_overheight_step=args.reward_overheight_step,
+        overheight_full_scale_m=args.overheight_full_scale_m,
+        overheight_step_penalty_cap=args.overheight_step_penalty_cap,
+        success_overheight_penalty_per_m=(
+            args.success_overheight_penalty_per_m
+        ),
+        success_overheight_penalty_cap=args.success_overheight_penalty_cap,
+        height_penalty_ramp_env_steps=args.height_penalty_ramp_env_steps,
         safety_reward_enabled=args.enable_safety_penalties,
         reward_table_filter_step=args.reward_table_filter_step,
         reward_table_contact_step=args.reward_table_contact_step,
@@ -778,6 +790,33 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="enable bounded table-risk and singularity reward shaping",
     )
+    parser.add_argument(
+        "--disable-height-band-reward",
+        action="store_true",
+        help=(
+            "restore the legacy one-sided 0.12 m lift reward; by default PPO "
+            "targets a stable tabletop-relative height band"
+        ),
+    )
+    parser.add_argument("--height-band-low-m", type=float, default=0.18)
+    parser.add_argument("--height-band-high-m", type=float, default=0.25)
+    parser.add_argument("--reward-overheight-progress", type=float, default=20.0)
+    parser.add_argument("--reward-overheight-step", type=float, default=-0.05)
+    parser.add_argument("--overheight-full-scale-m", type=float, default=0.10)
+    parser.add_argument("--overheight-step-penalty-cap", type=float, default=2.0)
+    parser.add_argument(
+        "--success-overheight-penalty-per-m", type=float, default=20.0
+    )
+    parser.add_argument("--success-overheight-penalty-cap", type=float, default=6.0)
+    parser.add_argument(
+        "--height-penalty-ramp-env-steps",
+        type=int,
+        default=10_000,
+        help=(
+            "per-worker control steps used to ramp only the overheight "
+            "penalties; useful-height lift progress is active immediately"
+        ),
+    )
     parser.add_argument("--reward-table-filter-step", type=float, default=-0.02)
     parser.add_argument("--reward-table-contact-step", type=float, default=-0.05)
     parser.add_argument("--table-safety-penalty-cap", type=float, default=2.0)
@@ -922,6 +961,14 @@ def parse_args() -> argparse.Namespace:
         args.target_kl,
         args.disturbance,
         args.episode_seconds,
+        args.height_band_low_m,
+        args.height_band_high_m,
+        args.reward_overheight_progress,
+        args.reward_overheight_step,
+        args.overheight_full_scale_m,
+        args.overheight_step_penalty_cap,
+        args.success_overheight_penalty_per_m,
+        args.success_overheight_penalty_cap,
         args.reward_table_filter_step,
         args.reward_table_contact_step,
         args.table_safety_penalty_cap,
@@ -946,6 +993,24 @@ def parse_args() -> argparse.Namespace:
         parser.error("disturbance strength must be non-negative")
     if args.episode_seconds <= 0.0:
         parser.error("--episode-seconds must be positive")
+    if args.height_band_low_m <= 0.0:
+        parser.error("--height-band-low-m must be positive")
+    if args.height_band_high_m <= args.height_band_low_m:
+        parser.error("--height-band-high-m must exceed --height-band-low-m")
+    if args.reward_overheight_progress < 0.0:
+        parser.error("--reward-overheight-progress must be non-negative")
+    if args.reward_overheight_step > 0.0:
+        parser.error("--reward-overheight-step must be non-positive")
+    if args.overheight_full_scale_m <= 0.0:
+        parser.error("--overheight-full-scale-m must be positive")
+    if (
+        args.overheight_step_penalty_cap < 0.0
+        or args.success_overheight_penalty_per_m < 0.0
+        or args.success_overheight_penalty_cap < 0.0
+    ):
+        parser.error("height penalty scales and caps must be non-negative")
+    if args.height_penalty_ramp_env_steps < 0:
+        parser.error("--height-penalty-ramp-env-steps must be non-negative")
     if args.reward_table_filter_step > 0.0 or args.reward_table_contact_step > 0.0:
         parser.error("table safety rewards must be non-positive")
     if args.reward_singularity_step > 0.0:
@@ -1198,6 +1263,7 @@ def main() -> None:
         "singularity_avoidance_enabled": (
             not args.disable_singularity_avoidance
         ),
+        "height_band_reward_enabled": not args.disable_height_band_reward,
         "safety_reward_enabled": args.enable_safety_penalties,
         "grasp_model": "physical_friction_v1",
         "output": str(args.output.resolve()),
@@ -1305,7 +1371,8 @@ def main() -> None:
             "alignment potential progress + centered, pad-depth-qualified capture "
             "close bonus + premature-close event/hold penalties + "
             "aligned-pinch bonus + capped unloaded-pinch penalties + episode-global "
-            "lift/strict-hold high-water credit + shared task success; "
+            "tabletop-relative 0.18-0.25 m height-band progress, bounded "
+            "overheight penalties, in-band hold credit + shared task success; "
             "post-secured active-open and physical-slip penalties remain causal"
             "; optional bounded table-filter/contact and singularity shaping"
         ),

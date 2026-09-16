@@ -215,19 +215,32 @@ class RLBaselineContractTests(unittest.TestCase):
         grasp_status = {
             "pinch_confirmed": True,
             "secured_grasp": False,
-            "grasp_lift_delta": 0.04,
+            "grasp_lift_delta": 0.01,
+            "grasp_body_height_above_table": 0.01,
             "strict_success_hold": 0.0,
+            "height_band_hold": 0.0,
         }
+        # Acquiring a cable initializes the potential and does not claim its
+        # pre-existing height as policy progress.
+        _, acquired = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        self.assertEqual(acquired["reward_lift_progress"], 0.0)
+
+        grasp_status["grasp_lift_delta"] = 0.04
+        grasp_status["grasp_body_height_above_table"] = 0.04
         _, rising = self.env._reward(
             np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
         )
 
         grasp_status["grasp_lift_delta"] = 0.01
+        grasp_status["grasp_body_height_above_table"] = 0.01
         _, falling = self.env._reward(
             np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
         )
 
         grasp_status["grasp_lift_delta"] = 0.04
+        grasp_status["grasp_body_height_above_table"] = 0.04
         _, rising_again = self.env._reward(
             np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
         )
@@ -240,6 +253,44 @@ class RLBaselineContractTests(unittest.TestCase):
             + rising_again["reward_lift_progress"],
             rising["reward_lift_progress"],
         )
+
+    def test_height_band_penalizes_overshoot_and_rewards_recovery(self) -> None:
+        self.env.reset(seed=32)
+        self.env._total_env_steps = (
+            self.env.rl_config.height_penalty_ramp_env_steps
+        )
+        grasp_status = {
+            "pinch_confirmed": True,
+            "secured_grasp": True,
+            "grasp_lift_delta": 0.20,
+            "grasp_body_height_above_table": 0.24,
+            "strict_success_hold": 0.0,
+            "height_band_hold": 0.0,
+        }
+        self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+
+        grasp_status["grasp_body_height_above_table"] = 0.30
+        _, rising_too_high = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+        self.assertLess(rising_too_high["reward_overheight_progress"], 0.0)
+        self.assertLess(rising_too_high["reward_overheight_step"], 0.0)
+
+        grasp_status["grasp_body_height_above_table"] = 0.24
+        _, recovering = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+        self.assertGreater(recovering["reward_overheight_progress"], 0.0)
+        self.assertEqual(recovering["reward_overheight_step"], 0.0)
+
+        grasp_status["grasp_body_height_above_table"] = 0.30
+        _, terminal = self.env._reward(
+            np.zeros(5), True, {"lifted_fraction": 0.3}, grasp_status
+        )
+        self.assertLess(terminal["reward_success_overheight"], 0.0)
+        self.assertGreater(terminal["reward_success"], 0.0)
 
     def test_aligned_pinch_reward_only_fires_on_pinch_transition(self) -> None:
         self.env.reset(seed=27)
