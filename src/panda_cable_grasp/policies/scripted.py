@@ -253,6 +253,15 @@ class DynamicCableGraspPolicy:
             desired_rotation = yaw_rotation @ desired_rotation
         return desired_rotation
 
+    def _initial_target(self) -> np.ndarray:
+        """Return the target used to initialise or restart target filtering.
+
+        The ordinary scripted baseline is privileged and therefore uses the
+        simulator target. Vision-only subclasses override this hook so the
+        shared phase machine never needs to read cable ground truth.
+        """
+        return self.env.target_position()
+
     def reset(self) -> None:
         self.phase = Phase.SETTLE
         self.phase_start = float(self.env.data.time)
@@ -263,7 +272,7 @@ class DynamicCableGraspPolicy:
         self.finished = False
         self.result = "running"
         self.failure_diagnostics = None
-        self.filtered_target = self.env.target_position()
+        self.filtered_target = self._initial_target()
         self.locked_segment_index = None
         self.locked_segment_alpha = 0.0
         self.last_close_contact_time = -math.inf
@@ -872,7 +881,7 @@ class DynamicCableGraspPolicy:
             blend = self._smoothstep(self.phase_time / 1.0)
             desired = (1.0 - blend) * self.recover_start + blend * self.recover_goal
             if self.phase_time > 1.0:
-                self.filtered_target = self.env.target_position()
+                self.filtered_target = self._initial_target()
                 self._transition(Phase.APPROACH)
             return self._ik_action(desired, self.env.gripper_open_ctrl)
 
