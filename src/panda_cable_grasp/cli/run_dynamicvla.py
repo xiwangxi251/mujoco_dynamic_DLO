@@ -731,7 +731,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fixed-decision-delay",
         type=float,
-        default=0.261,
+        default=0.0,
         help=(
             "In sync mode, advance MuJoCo with the previous command for this "
             "fixed number of wall-clock-equivalent seconds before each action "
@@ -741,7 +741,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pipeline-discard-steps",
         type=int,
-        default=7,
+        default=0,
         help=(
             "For sync chunk-pipeline evaluation, discard this many leading "
             "actions from every newly inferred chunk before execution."
@@ -762,10 +762,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-dir", type=Path, default=output_path("dynamicvla", "evaluation"))
     parser.add_argument("--run-name")
     parser.add_argument(
+        "--latency-preset",
+        choices=("node130-gpu1",),
+        help="Optional node130 GPU1 0.261s/7-step latency profile.",
+    )
+    parser.add_argument(
         "--check-only", action="store_true",
         help="validate cameras/schema/IK without connecting to or running a model",
     )
     args = parser.parse_args()
+    if args.latency_preset == "node130-gpu1":
+        if args.fixed_decision_delay != 0.0 or args.pipeline_discard_steps != 0:
+            parser.error("--latency-preset cannot combine with explicit latency values")
+        args.fixed_decision_delay = 0.261
+        args.pipeline_discard_steps = 7
     if args.trials < 1:
         parser.error("--trials must be positive")
     if args.episode_seconds <= 0.0:
