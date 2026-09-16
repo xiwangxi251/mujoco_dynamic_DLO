@@ -695,11 +695,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument(
-        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
+        "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="nero",
         help="robot model used by the MuJoCo environment",
     )
     parser.add_argument(
-        "--wrist-camera", choices=("new", "old"), default="new",
+        "--wrist-camera", choices=("new", "old"), default="old",
         help="NERO wrist-camera rig: new training position or old position",
     )
     parser.add_argument("--video-fps", type=float, default=DEFAULT_VIDEO_FPS)
@@ -717,20 +717,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sync",
         "--synchronous",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Wait for the matching action before every simulation step",
     )
     parser.add_argument(
         "--execute-steps",
         "--execute_steps",
         type=int,
-        default=20,
+        default=8,
         help="Actions consumed from each predicted chunk before the next prediction",
     )
     parser.add_argument(
         "--fixed-decision-delay",
         type=float,
-        default=0.0,
+        default=0.261,
         help=(
             "In sync mode, advance MuJoCo with the previous command for this "
             "fixed number of wall-clock-equivalent seconds before each action "
@@ -740,7 +741,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pipeline-discard-steps",
         type=int,
-        default=0,
+        default=7,
         help=(
             "For sync chunk-pipeline evaluation, discard this many leading "
             "actions from every newly inferred chunk before execution."
