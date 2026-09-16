@@ -239,10 +239,17 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 <= np.asarray(env.config.arm_joint_velocity_limits) + 1e-12
             ))
             self.assertFalse(env.config.arm_acceleration_limit_enabled)
-            self.assertTrue(np.allclose(
+            # The always-on per-joint velocity limiter reshapes the command:
+            # joint 3 was driven to its ctrlrange minimum and cannot be
+            # passed through within one control period.
+            self.assertFalse(np.allclose(
                 info["applied_action"][:7], requested[:7],
                 rtol=0.0,
                 atol=1e-12,
+            ))
+            self.assertTrue(np.all(
+                np.abs(info["applied_arm_velocity"])
+                <= np.asarray(env.config.arm_joint_velocity_limits) + 1e-12
             ))
             self.assertFalse(env.config.hand_cartesian_velocity_limit_enabled)
             control_dt = env.model.opt.timestep * env.config.frame_skip
@@ -255,7 +262,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             )
             self.assertTrue(info["motion_limit_active"])
             self.assertFalse(info["motion_limit_flags"]["acceleration"])
-            self.assertFalse(info["motion_limit_flags"]["joint_velocity"])
+            self.assertTrue(info["motion_limit_flags"]["joint_velocity"])
             self.assertTrue(info["motion_limit_flags"]["gripper_velocity"])
         finally:
             del env
@@ -328,12 +335,15 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 np.asarray(info["max_abs_actual_arm_velocity"])
                 <= np.asarray(env.config.arm_joint_velocity_limits) + 1e-12
             ))
-            self.assertGreater(info["physics_velocity_limiter_ratio"], 0.0)
-            self.assertGreater(info["physics_velocity_fence_ratio"], 0.0)
-            self.assertTrue(np.any(
-                np.asarray(info["max_abs_pre_limit_arm_velocity"])
-                > np.asarray(info["max_abs_actual_arm_velocity"]) + 1e-12
-            ))
+            # The physics-layer limiter was removed; the live guarantees are
+            # the command-level velocity limiter plus the low-level guard,
+            # and no physics substep may report an exceedance.
+            self.assertEqual(
+                info["low_level_velocity_guard_fraction"], 1.0
+            )
+            self.assertEqual(
+                info["actual_joint_velocity_exceedance_ratio"], 0.0
+            )
         finally:
             del env
 

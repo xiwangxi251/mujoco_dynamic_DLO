@@ -27,6 +27,7 @@ def _args(**overrides):
         "max_attempts_per_scenario": 20,
         "seed": 100,
         "episode_seconds": 15.0,
+        "robot": "panda",
         "instruction": "Grasp and lift the cable.",
         "workers": 1,
         "envs_per_scenario": 2,

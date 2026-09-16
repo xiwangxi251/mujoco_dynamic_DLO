@@ -1227,9 +1227,6 @@ class CableGraspEnv:
         self._physics_steps = 0
         self._velocity_guard_steps = 0
         self._actual_velocity_exceedance_steps = 0
-        self._physics_velocity_limit_steps = 0
-        self._physics_velocity_fence_steps = 0
-        self._physics_velocity_fence_dof_steps = 0
         self._max_abs_actual_arm_velocity = np.zeros(7)
         self._max_abs_pre_limit_arm_velocity = np.zeros(7)
         self._max_actual_hand_linear_speed = 0.0
@@ -1392,9 +1389,6 @@ class CableGraspEnv:
         self._physics_steps = 0
         self._velocity_guard_steps = 0
         self._actual_velocity_exceedance_steps = 0
-        self._physics_velocity_limit_steps = 0
-        self._physics_velocity_fence_steps = 0
-        self._physics_velocity_fence_dof_steps = 0
         self._geometric_safety_filter_count = 0
         self._geometric_safety_fence_steps = 0
         self._geometric_safety_filter.total_probe_count = 0
@@ -2020,17 +2014,6 @@ class CableGraspEnv:
             "actual_joint_velocity_exceedance_ratio": (
                 self._actual_velocity_exceedance_steps
                 / physics_step_denominator
-            ),
-            "physics_velocity_limiter_ratio": (
-                self._physics_velocity_limit_steps
-                / physics_step_denominator
-            ),
-            "physics_velocity_fence_ratio": (
-                self._physics_velocity_fence_steps
-                / physics_step_denominator
-            ),
-            "physics_velocity_fence_dof_steps": (
-                self._physics_velocity_fence_dof_steps
             ),
             "geometric_safety_enabled": self.config.geometric_safety_enabled,
             "geometric_safety_geom_count": len(self.geometric_safety_geom_ids),

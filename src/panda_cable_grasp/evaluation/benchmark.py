@@ -384,15 +384,6 @@ def _base_row(
         "max_pre_limit_hand_angular_speed": float(info.get(
             "max_pre_limit_hand_angular_speed", 0.0
         )),
-        "physics_velocity_limiter_ratio": float(info.get(
-            "physics_velocity_limiter_ratio", 0.0
-        )),
-        "physics_velocity_fence_ratio": float(info.get(
-            "physics_velocity_fence_ratio", 0.0
-        )),
-        "physics_velocity_fence_dof_steps": int(info.get(
-            "physics_velocity_fence_dof_steps", 0
-        )),
     }
     row["task_failure_type"] = classify_task_outcome(
         task_success=task_success,

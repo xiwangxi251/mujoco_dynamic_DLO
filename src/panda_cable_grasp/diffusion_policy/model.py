@@ -341,6 +341,8 @@ class ConditionalUnet1D(nn.Module):
             value = residual2(value, condition)
             skips.append(value)
             value = downsample(value)
+        for module in self.mid_modules:
+            value = module(value, condition)
         for residual, residual2, upsample in self.up_modules:
             value = torch.cat((value, skips.pop()), dim=1)
             value = residual(value, condition)
