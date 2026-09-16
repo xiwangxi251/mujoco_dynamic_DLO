@@ -254,6 +254,7 @@ def _run_episode(
             "quaternion_repair_frames": int(np.count_nonzero(quaternion_repaired)),
             "policy_inference_mean_ms": float(np.mean(inference_ms)) if inference_ms else np.nan,
             "policy_inference_p95_ms": float(np.quantile(inference_ms, 0.95)) if inference_ms else np.nan,
+            "compiled_model": str(model_path.relative_to(run_dir)),
         })
         artifacts = recorder.finish(row)
         row.update(artifacts.relative_to(run_dir))

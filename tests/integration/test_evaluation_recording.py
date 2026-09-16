@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -58,6 +59,60 @@ class EvaluationRecordingTests(unittest.TestCase):
             model, states, times, state_spec = load_episode(episode_dir)
             self.assertEqual(states.shape[1], mujoco.mj_stateSize(model, state_spec))
             np.testing.assert_allclose(times, recorded_times)
+
+    def test_replay_resolves_model_from_three_level_episode_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            models_dir = run_dir / "models"
+            models_dir.mkdir(parents=True)
+            episode_dir = run_dir / "episodes" / "recording_test" / "seed_7"
+            episode_dir.mkdir(parents=True)
+            env = CableGraspEnv(EnvConfig(
+                seed=7,
+                episode_seconds=0.02,
+                scenario_name="recording_test",
+                dynamicvla_cameras_enabled=True,
+            ))
+            try:
+                env.reset(seed=7)
+                model_path = models_dir / "recording_test.mjb"
+                mujoco.mj_saveModel(env.model, str(model_path), None)
+            finally:
+                env.close()
+            state_size = mujoco.mj_stateSize(
+                mujoco.MjModel.from_binary_path(str(model_path)),
+                mujoco.mjtState.mjSTATE_FULLPHYSICS,
+            )
+            np.savez_compressed(
+                episode_dir / "trajectory.npz",
+                schema_version=np.asarray(1, dtype=np.int64),
+                state_spec=np.asarray(
+                    int(mujoco.mjtState.mjSTATE_FULLPHYSICS), dtype=np.int64
+                ),
+                states=np.zeros((2, state_size), dtype=np.float64),
+                state_times=np.asarray([0.0, 0.02], dtype=np.float64),
+            )
+            (episode_dir / "episode.json").write_text(
+                json.dumps({
+                    "files": {"trajectory": "trajectory.npz"},
+                    "result": {"compiled_model": "models/recording_test.mjb"},
+                }),
+                encoding="utf-8",
+            )
+
+            model, states, times, state_spec = load_episode(episode_dir)
+            self.assertEqual(states.shape[1], mujoco.mj_stateSize(model, state_spec))
+            np.testing.assert_allclose(times, [0.0, 0.02])
+
+            (episode_dir / "episode.json").write_text(
+                json.dumps({
+                    "files": {"trajectory": "trajectory.npz"},
+                    "result": {},
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                load_episode(episode_dir)
 
 
 if __name__ == "__main__":

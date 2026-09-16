@@ -22,9 +22,32 @@ def load_episode(episode_dir: Path) -> tuple[mujoco.MjModel, np.ndarray, np.ndar
         states = np.asarray(trajectory["states"], dtype=np.float64)
         times = np.asarray(trajectory["state_times"], dtype=np.float64)
         state_spec = int(trajectory["state_spec"])
-    model_reference = Path(metadata["result"]["compiled_model"])
-    run_dir = episode_dir.parents[3]
-    model_path = model_reference if model_reference.is_absolute() else run_dir / model_reference
+    model_reference_raw = metadata.get("result", {}).get("compiled_model")
+    if not model_reference_raw:
+        raise ValueError(
+            f"{episode_dir} metadata lacks result.compiled_model; "
+            "re-record with a current evaluation entry point"
+        )
+    model_reference = Path(model_reference_raw)
+    if model_reference.is_absolute():
+        model_path = model_reference
+    else:
+        # Layouts differ across entry points (run/episodes/<scenario>/seed_*
+        # vs run/episodes/<method>/<scenario>/seed_*), so search the episode
+        # directory and each ancestor for the run-relative reference.
+        model_path = next(
+            (
+                base / model_reference
+                for base in (episode_dir, *episode_dir.parents, Path.cwd())
+                if (base / model_reference).is_file()
+            ),
+            None,
+        )
+        if model_path is None:
+            raise FileNotFoundError(
+                f"cannot resolve compiled_model {model_reference} "
+                f"relative to {episode_dir}"
+            )
     model = mujoco.MjModel.from_binary_path(str(model_path))
     expected = mujoco.mj_stateSize(model, state_spec)
     if states.ndim != 2 or states.shape[1] != expected:

@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> Path:
+    import mujoco
     import numpy as np
 
     from ..diffusion_policy.lowdim import LowDimPolicyRunner
@@ -68,6 +69,10 @@ def run(args: argparse.Namespace) -> Path:
     if run_dir.exists():
         raise FileExistsError(f"refusing to overwrite {run_dir}")
     run_dir.mkdir(parents=True)
+    model_dir = run_dir / "models"
+    model_dir.mkdir()
+    compiled_model = model_dir / f"{scenario.name}.mjb"
+    mujoco.mj_saveModel(env.model, str(compiled_model), None)
     rows: list[dict] = []
     try:
         policy = LowDimPolicyRunner(
@@ -133,6 +138,7 @@ def run(args: argparse.Namespace) -> Path:
                 "truncated": bool(truncated),
                 "diffusion_policy_model": str(args.model.expanduser().resolve()),
                 "diffusion_inference_steps": policy.config.inference_steps,
+                "compiled_model": str(compiled_model.relative_to(run_dir)),
                 **policy.policy_info(),
             })
             if recorder is not None:

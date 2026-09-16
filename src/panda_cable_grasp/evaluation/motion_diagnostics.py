@@ -38,11 +38,11 @@ from ..scenarios.registry import (
     get_scenario,
     list_suite_scenarios,
 )
-from ..paths import output_path
+from ..paths import PROJECT_ROOT, output_path
 from .defaults import DEFAULT_EVALUATION_SEED
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = PROJECT_ROOT
 DIAGNOSTIC_OUTPUT_ROOT = output_path("diagnostics", "motion")
 
 

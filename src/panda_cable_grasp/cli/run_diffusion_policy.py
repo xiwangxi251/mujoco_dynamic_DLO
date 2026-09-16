@@ -156,6 +156,7 @@ def run(args: argparse.Namespace) -> Path:
                 "terminated": bool(terminated),
                 "truncated": bool(truncated),
                 "diffusion_policy_model": str(args.model.expanduser().resolve()),
+                "compiled_model": str(compiled_model.relative_to(run_dir)),
                 **policy.policy_info(),
             })
             if recorder is not None:
