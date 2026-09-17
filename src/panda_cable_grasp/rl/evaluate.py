@@ -45,6 +45,7 @@ from .environment import (
     action_interface_version,
     make_rl_env,
 )
+from .pointcloud import DLOPointCloudObservation, PointCloudObservationConfig
 from .train import RL_L1_SCENARIOS
 
 
@@ -855,6 +856,22 @@ def _episode_row(
     }
 
 
+def _wrap_policy_observation(args: argparse.Namespace, env):
+    if args.observation_mode != "pointcloud":
+        return env
+    return DLOPointCloudObservation(
+        env,
+        PointCloudObservationConfig(
+            point_count=args.pointcloud_points,
+            width=args.pointcloud_width,
+            height=args.pointcloud_height,
+            camera_update_steps=args.pointcloud_update_steps,
+            sensor_delay_steps=args.pointcloud_delay_steps,
+            voxel_size_m=args.pointcloud_voxel_size,
+        ),
+    )
+
+
 def run_headless(args: argparse.Namespace, model: PPO) -> None:
     outcomes = Counter({outcome: 0 for outcome in FAILURE_TYPES})
     task_outcomes = Counter({outcome: 0 for outcome in TASK_OUTCOME_TYPES})
@@ -883,6 +900,7 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         ),
     )
 
+    env = _wrap_policy_observation(args, env)
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
     output_dir = args.video_dir / run_name
     suffix = 1
@@ -1319,6 +1337,7 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
             )
         ),
     )
+    env = _wrap_policy_observation(args, env)
     observation, info = env.reset(seed=args.seed)
     episode = 1
     episode_return = 0.0
@@ -1407,6 +1426,18 @@ def parse_args() -> argparse.Namespace:
             "training manifest"
         ),
     )
+    parser.add_argument(
+        "--observation-mode",
+        choices=("state", "pointcloud"),
+        default="state",
+        help="policy observation interface used by the checkpoint",
+    )
+    parser.add_argument("--pointcloud-points", type=int, default=384)
+    parser.add_argument("--pointcloud-width", type=int, default=480)
+    parser.add_argument("--pointcloud-height", type=int, default=360)
+    parser.add_argument("--pointcloud-update-steps", type=int, default=5)
+    parser.add_argument("--pointcloud-delay-steps", type=int, default=3)
+    parser.add_argument("--pointcloud-voxel-size", type=float, default=0.002)
     parser.add_argument(
         "--geometric-safety",
         action="store_true",

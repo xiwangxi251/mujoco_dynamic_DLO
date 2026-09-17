@@ -165,6 +165,33 @@ class DLOPointCloudObservation(gym.Wrapper):
             }
         )
 
+    # Evaluation and recording operate on the shared MuJoCo state while the
+    # policy consumes the wrapped point-cloud observation. Expose read-only
+    # delegates so one evaluator can handle both observation modes.
+    @property
+    def base_env(self):
+        return self.unwrapped.base_env
+
+    @property
+    def model(self):
+        return self.unwrapped.model
+
+    @property
+    def data(self):
+        return self.unwrapped.data
+
+    @property
+    def rl_config(self):
+        return self.unwrapped.rl_config
+
+    @property
+    def OBSERVATION_NAMES(self):
+        return ("points", "proprio")
+
+    @property
+    def ACTION_NAMES(self):
+        return self.unwrapped.ACTION_NAMES
+
     def _capture(self) -> tuple[np.ndarray, float]:
         started = perf_counter()
         self._renderer.disable_depth_rendering()
