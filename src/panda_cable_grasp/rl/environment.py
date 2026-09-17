@@ -280,6 +280,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         rl_config: RLConfig | None = None,
         geometric_safety_enabled: bool | None = None,
         table_finger_collision_filter_enabled: bool = True,
+        suspend_rigid_motion_on_confirmed_grasp: bool = True,
     ):
         super().__init__()
         self.rl_config = rl_config or RLConfig()
@@ -334,6 +335,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 scenario_id=first_scenario.scenario_id,
                 scenario_split=first_scenario.split.value,
                 dynamicvla_cameras_enabled=dynamicvla_cameras_enabled,
+                suspend_rigid_motion_on_confirmed_grasp=(
+                    suspend_rigid_motion_on_confirmed_grasp
+                ),
                 **first_overrides,
             )
         self.base_env = CableGraspEnv(
@@ -345,6 +349,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 disturbance_strength=disturbance_strength,
                 episode_seconds=episode_seconds,
                 dynamicvla_cameras_enabled=dynamicvla_cameras_enabled,
+                suspend_rigid_motion_on_confirmed_grasp=(
+                    suspend_rigid_motion_on_confirmed_grasp
+                ),
             )
         )
         if geometric_safety_enabled is not None:

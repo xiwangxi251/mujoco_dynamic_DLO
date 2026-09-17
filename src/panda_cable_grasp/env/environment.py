@@ -260,6 +260,10 @@ class EnvConfig:
     motion_mode: str = "shape"          # static / rigid / shape / combined
     motion_profile_version: str = "legacy_v1"     # legacy_v1 / factorized_v1/v2 / rigid_level{1,2}_single_pass_v2
     motion_regularity: str = "quasiperiodic"  # regular / quasiperiodic / stochastic
+    # L1/L2 historically pause their external rigid drive while a bilateral
+    # grasp is confirmed. Keep that behavior by default, but expose it for
+    # evaluation ablations without changing checkpoint actions or rewards.
+    suspend_rigid_motion_on_confirmed_grasp: bool = True
 
     # 运动强度/速度相关参数
     motion_frequency_scale: float = 1.0
@@ -2136,7 +2140,8 @@ class CableGraspEnv:
     def _update_rigid_motion_suspension_state(self) -> None:
         """Suspend L1/L2 drive only while a confirmed grasp remains active."""
         self.rigid_motion_suspended = bool(
-            self.config.motion_profile_version in RIGID_MOTION_PROFILES
+            self.config.suspend_rigid_motion_on_confirmed_grasp
+            and self.config.motion_profile_version in RIGID_MOTION_PROFILES
             and self.grasp_confirmed
         )
         if self.rigid_motion_suspended:

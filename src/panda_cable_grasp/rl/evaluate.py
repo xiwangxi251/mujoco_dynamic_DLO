@@ -873,6 +873,9 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         scenario_names=args.scenario_names,
         dynamicvla_cameras_enabled=True,
         geometric_safety_enabled=args.geometric_safety,
+        suspend_rigid_motion_on_confirmed_grasp=(
+            not args.disable_confirmed_grasp_motion_suspension
+        ),
         rl_config=RLConfig(
             singularity_avoidance_enabled=(
                 not args.disable_singularity_avoidance
@@ -1307,6 +1310,9 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         scenario_names=args.scenario_names,
         dynamicvla_cameras_enabled=True,
         geometric_safety_enabled=args.geometric_safety,
+        suspend_rigid_motion_on_confirmed_grasp=(
+            not args.disable_confirmed_grasp_motion_suspension
+        ),
         rl_config=RLConfig(
             singularity_avoidance_enabled=(
                 not args.disable_singularity_avoidance
@@ -1412,6 +1418,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "disable the soft task-space IK singularity/joint-limit guard "
             "without changing episode termination"
+        ),
+    )
+    parser.add_argument(
+        "--disable-confirmed-grasp-motion-suspension",
+        action="store_true",
+        help=(
+            "keep L1/L2 rigid cable motion active after grasp confirmation; "
+            "evaluation ablation only"
         ),
     )
     selection = parser.add_mutually_exclusive_group()

@@ -1162,6 +1162,11 @@ class EnvironmentScenarioTests(unittest.TestCase):
             self.assertTrue(env.rigid_motion_suspended)
             self.assertTrue(env.rigid_motion_released)
 
+            env.config.suspend_rigid_motion_on_confirmed_grasp = False
+            env._update_rigid_motion_suspension_state()
+            self.assertFalse(env.rigid_motion_suspended)
+            env.config.suspend_rigid_motion_on_confirmed_grasp = True
+
             env._clear_grasp_with_reason("lost_physical_pad_contact")
             env._update_rigid_motion_suspension_state()
             self.assertFalse(env.rigid_motion_suspended)
