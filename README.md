@@ -36,6 +36,38 @@ panda-cable-grasp --headless --robot nero --trials 1
 python -m unittest discover -s tests -t . -p "test_*.py"
 ```
 
+## 各方法与代码入口
+
+下表是仓库内几种方法的实现位置和运行方式。**想在真机上用的先看最后一列**：
+MuJoCo 环境只存在于仿真，真机上能复用的是训练好的 checkpoint、观测/动作
+契约和感知模型——需要真实点云/RGB 与机器人位姿反馈替代仿真状态。
+
+| 方法 | 实现位置 | 观测输入 | 真机可部署性 |
+|---|---|---|---|
+| 规则策略（scripted） | `src/panda_cable_grasp/policies/scripted.py` `DynamicCableGraspPolicy` | 仿真特权线缆状态 | ❌ 读仿真状态，仅作基准/专家数据源 |
+| PPO（特权状态） | `src/panda_cable_grasp/rl/`（`--observation-mode` 默认低维状态） | 仿真特权状态 | ❌ 同上 |
+| PPO（点云） | `rl/pointcloud.py` + `rl/train.py --observation-mode pointcloud` | 深度相机点云 | ✅ 需真实深度点云 + 机器人状态 |
+| DynamicVLA | `dynamicvla/adapter.py` `DynamicVLATaskSpaceAdapter`；模型权重在外部 DynamicVLA 仓（服务器 130） | 对侧+腕部 RGB、末端位姿 | ✅ 需真实双相机 RGB + ee pose |
+| Diffusion Policy | `diffusion_policy/`（`model.py`/`runner.py`/`train.py`） | 对侧+腕部 RGB、末端位姿（内部转 euler delta） | ✅ 同上 |
+| π0.5 微调 | 外部仓 `panda_cable_pi05`（服务器 130 `/data/hxai/panda_cable_pi05`） | RGB + 状态 | ✅ 同上 |
+| OccDyn-DLO 感知 | `perception/model.py` `DLOStateEstimator`、`perception/closed_loop.py` `PerceptionStack`、`tools/perception/` | 世界系点云 + 自身上一帧输出 | ✅ 纯感知模块，点云→DLO 节点状态 |
+| TrackDLO 基线 | 独立仓 `dlo_state_estimation/` | 点云 | ✅ 对比基线 |
+
+### 真机部署注意
+
+- **特权方法不能直接上真机**：scripted / 状态 PPO / 特权 expert 读的是
+  MuJoCo 线缆节点真值，真机没有对应信号。它们的价值是 benchmark 基准和
+  为视觉方法产训练数据。
+- 视觉方法（DynamicVLA / Diffusion / π0.5）部署时需要：真实对侧与腕部
+  RGB、末端执行器位姿（前向运动学），以及把策略输出的任务空间 delta 命令
+  转成机器人关节目标的 IK/控制器——`dynamicvla/adapter.py` 的适配器定义了
+  该契约（`[xyz, euler_xyz]` 状态、`[dxyz, deuler_xyz, gripper]` 动作块）。
+- 点云方法需要把真实深度相机的点云变换到世界系并下采样到策略输入规格。
+- 感知模块（OccDyn-DLO）本身不依赖仿真物理，可直接对真实点云做 DLO 状态
+  估计；`tools/perception/` 下有推理与可视化脚本。
+- 已训练 checkpoint 在服务器上：151 `outputs/`（PPO/DP/感知）与 130
+  DynamicVLA/π0.5 产物目录；本地仓不含权重文件。
+
 ## 常用命令
 
 规则策略与诊断：
@@ -79,9 +111,9 @@ panda-cable-diffusion-eval \
   --scenario id_static --trials 20 --headless --device cuda
 ```
 
-该实现使用专家已执行关节目标的前向运动学生成 `[xyz, quat_wxyz, gripper]`
-任务空间标签，预测 16 步动作块，每次执行 8 步后重规划；执行端复用
-DynamicVLA 的任务空间 IK 和安全限幅。详细说明见
+该实现以 `[xyz, euler_xyz]` 状态和 `[dxyz, deuler_xyz, gripper]` 相对
+delta 动作块为契约（与 DynamicVLA 一致），预测 16 步动作块，每次执行
+8 步后重规划；执行端复用 DynamicVLA 的任务空间 IK 和安全限幅。详细说明见
 [`docs/diffusion_policy.md`](docs/diffusion_policy.md)。
 
 并行采集时，`--workers` 控制并行场景数，`--envs-per-scenario` 控制每个场景
