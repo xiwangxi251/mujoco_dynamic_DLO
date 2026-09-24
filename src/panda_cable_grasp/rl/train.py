@@ -172,6 +172,7 @@ def pointcloud_config_from_args(
         camera_update_steps=args.pointcloud_update_steps,
         sensor_delay_steps=args.pointcloud_delay_steps,
         voxel_size_m=args.pointcloud_voxel_size,
+        render_mode=args.pointcloud_render_mode,
     )
 
 
@@ -219,6 +220,11 @@ def make_worker(rank: int, args: argparse.Namespace):
                 tuple(probability for _, probability in initial_mix),
             )
             env.set_motion_difficulty(0.0)
+        elif args.training_scenario_weights is not None:
+            env.set_training_scenario_distribution(
+                tuple(args.training_scenario_names),
+                tuple(args.training_scenario_weights),
+            )
         return env
     return initialize
 
@@ -756,6 +762,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pointcloud-voxel-size", type=float, default=0.002)
     parser.add_argument(
+        "--pointcloud-render-mode",
+        choices=("normal", "gripper_hidden", "mixed"),
+        default="normal",
+        help=(
+            "normal renders the stock scene; gripper_hidden parks gripper "
+            "geoms in a disabled render group; mixed samples per episode"
+        ),
+    )
+    parser.add_argument(
         "--geometric-safety",
         action="store_true",
         help="enable the shared geometric robot-obstacle safety layer",
@@ -799,6 +814,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-distribution", choices=("legacy", "l1", "id"), default="l1",
         help="strict-eval distribution; l1 is the four nominal L1 motion strata",
+    )
+    parser.add_argument(
+        "--training-scenarios", default=None,
+        help=(
+            "comma-separated scenario names; overrides --training-distribution "
+            "and, unless --eval-scenarios is also given, --eval-distribution"
+        ),
+    )
+    parser.add_argument(
+        "--eval-scenarios", default=None,
+        help="comma-separated scenario names; overrides --eval-distribution",
     )
     parser.add_argument(
         "--output", type=Path,
@@ -890,14 +916,58 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
-    if args.training_distribution == "legacy":
+    args.training_scenario_weights = None
+    if args.training_scenarios:
+        names = []
+        weights = []
+        has_weights = False
+        for item in args.training_scenarios.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" in item:
+                name, _, weight_text = item.rpartition(":")
+                has_weights = True
+            else:
+                name, weight_text = item, "1.0"
+            names.append(name.strip())
+            try:
+                weight = float(weight_text)
+            except ValueError:
+                parser.error(
+                    f"invalid training scenario weight in {item!r}; "
+                    "expected name or name:weight"
+                )
+            if not np.isfinite(weight) or weight < 0.0:
+                parser.error(
+                    f"training scenario weight must be non-negative: {item!r}"
+                )
+            weights.append(weight)
+        if not names:
+            parser.error("--training-scenarios resolved to an empty list")
+        if len(set(names)) != len(names):
+            parser.error("--training-scenarios names must be unique")
+        if has_weights:
+            if float(sum(weights)) <= 0.0:
+                parser.error("training scenario weights must have positive mass")
+            args.training_scenario_weights = weights
+        args.training_scenario_names = names
+    elif args.training_distribution == "legacy":
         args.training_scenario_names = None
     elif args.training_distribution == "l1":
         args.training_scenario_names = list(RL_L1_SCENARIOS)
     else:
         args.training_scenario_names = list(list_scenario_names("id"))
     resolved_eval_distribution = args.eval_distribution or args.training_distribution
-    if resolved_eval_distribution == "legacy":
+    if args.eval_scenarios:
+        args.eval_scenario_names = [
+            name.strip()
+            for name in args.eval_scenarios.split(",")
+            if name.strip()
+        ]
+    elif args.training_scenarios:
+        args.eval_scenario_names = list(args.training_scenario_names)
+    elif resolved_eval_distribution == "legacy":
         args.eval_scenario_names = None
     elif resolved_eval_distribution == "l1":
         args.eval_scenario_names = list(RL_L1_SCENARIOS)
@@ -1213,6 +1283,7 @@ def main() -> None:
         "disturbance": args.disturbance,
         "training_distribution": args.training_distribution,
         "training_scenario_names": args.training_scenario_names,
+        "training_scenario_weights": args.training_scenario_weights,
         "eval_distribution": args.eval_distribution,
         "eval_scenario_names": args.eval_scenario_names,
         "episode_seconds": args.episode_seconds,
