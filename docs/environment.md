@@ -1,6 +1,6 @@
 # 环境端进度
 
-> 更新时间：2026-08-28  
+> 更新时间：2026-09-24  
 > 范围：只记录 MuJoCo 环境、线缆运动、场景定义、观测和任务判定，不记录具体策略的训练结果。
 
 环境端的目标是为不同方法提供同一套动态线缆抓取任务，使规则策略、RL 和视觉模仿学习方法能够在
@@ -16,6 +16,10 @@
 | 环境重置、动作执行和状态记录 | 已实现 |
 | 静止、整体运动、形状变化和组合运动 | 已实现 |
 | 形变幅度、频率和规律性控制 | 已实现 |
+| 单模态规律运动（traveling_wave / standing_wave / sine_servo） | 已实现 |
+| 轨迹库回放运动（rigid_replay_v1：weld 刚化 + 记录轨迹） | 已实现 |
+| 复杂初始构型（initial_shape_bank 与 midshape 回放） | 已实现 |
+| 可变形对象族与多对象布局（9 族；conveyor/parallel/crossing） | 已实现，fish GLB 蒙皮需 trimesh |
 | 长度、材质和运动规律 OOD 场景 | 已实现配置与环境映射，正式实验未完成 |
 | 双指抓取、滑脱和任务成功判定 | 已实现 |
 | 固定相机与腕部相机 RGB 观测 | 已实现 |
@@ -23,6 +27,7 @@
 | 真机对应环境 | 未完成 |
 
 2026-08-28 使用 Python 3.11 运行环境、场景和记录相关测试，共 54 项，全部通过。
+2026-09-24 服务器合并后回归：环境/场景相关单测 109 项、集成测试 9 项，全部通过。
 
 ## 2. 当前环境接口
 
@@ -55,7 +60,9 @@ L1 为较简单的单向轨迹，L2 为带横向变化的曲线轨迹。二者�
 
 - 幅度：`low / nominal / high`；
 - 频率：`low / nominal / high`；
-- 规律性：`regular / quasiperiodic / stochastic`；
+- 规律性：`regular / quasiperiodic / stochastic`，以及单模态严格周期变体
+  `traveling_wave / standing_wave / sine_servo`（行波在接触摩擦下产生净输送，
+  驻波无净输送，sine_servo 是位置伺服解析正弦驻波）；
 - 幅度和频率可以独立配置，开发场景中已经包含独立扫描条件。
 
 所有新注册场景共享随机弯曲初始形状分布，并保存 scenario ID、scenario hash 和 motion profile hash，
@@ -71,6 +78,29 @@ L1 为较简单的单向轨迹，L2 为带横向变化的曲线轨迹。二者�
 - stiff 材质：提高质量、刚度、阻尼和摩擦。
 
 这些变体已经能够映射到 MuJoCo 模型参数，但尚未完成正式的大规模 OOD 对比实验。
+
+### 3.4 回放运动、初始构型与对象场景
+
+- `rigid_replay_v1`：回放从形变场景无机器人自由演化录制的轨迹库
+  （`outputs/motion_banks/<bank>.npz`）。回放线缆保持初始形状（编译期休眠
+  weld 约束冻结），COM 与 yaw 跟随库中材料节点的记录轨迹；回放条目按
+  seed 与形变源场景配对，确认抓取期间回放时钟悬挂、松开后重锚续走。
+- `initial_shape_bank`：从同格式轨迹库取中间帧构型作为初始形状。静态场景
+  （`id_static_midshape_*`）单独使用；与 `rigid_replay_v1` 联用时必须满足
+  `initial_shape_bank == replay_bank`（midshape 回放，见
+  `id_rigid_replay_midshape_*`：冻结快照与回放运动同源同 seed）。
+- `initial_cable_yaw_deg`：初始线缆朝向偏置（度），作用于初始形状采样；
+  多对象场景不套用。
+- `arm_motion_start_delay`：非 rigid/combined 场景中机械臂放开前线缆自由
+  运动的时长（秒），用于"接住已经在运动中的物体"的协议变体。
+- `rigid_motion_contact_only`：整体驱动力只作用于与桌面接触的线缆节点
+  （传送带语义，被夹起/悬空的节点不再受虚拟体积力驱动）。
+- 对象场景：`object_family` / `object_families` / `n_objects` /
+  `multi_object_layout` 把单线缆换成 9 个可变形对象族（含步态模板与 GLB
+  蒙皮）或 conveyor/parallel/crossing 多对象布局；细节见
+  [可变形对象场景](experiments/deformable_object_scenes.md)。
+- 评测侧另有 `strict_vertical_gripper` 协议选项（benchmark/run_grasp），
+  约束抓取时夹爪接近竖直姿态，不属于环境配置。
 
 ## 4. 抓取与成功判定
 

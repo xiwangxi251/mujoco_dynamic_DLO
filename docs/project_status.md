@@ -1,11 +1,14 @@
 # 项目目标与当前状态
 
-> 更新时间：2026-08-31  
-> 当前分支：`feat/linux-server-portability`  
-> 当前代码提交：`2596558`  
+> 更新时间：2026-09-24（头部与文档指引已更新；正文实验数据仍截至 2026-08-31）  
+> 当前分支：`dev`  
+> 当前代码提交：`c2b2345`（本地与服务器 151 工作已合并统一）  
 > 状态依据：仓库代码与测试、版本控制中的实验记录、`outputs/` 和本机
 > `../linux_log/` 中的运行产物。未附 checkpoint 哈希或完整 manifest 的结果均标为暂定，
 > 不作为正式论文结果。
+>
+> **注意**：本文 8-31 之后的新进展（对象场景、OccDyn-DLO 感知、回放运动、
+> 遮挡×形变实验等）以 `experiments/` 下的实验笔记为准；正文待统一刷新。
 
 本文只维护项目的整体目标、实验规划、进度和问题。各方法的具体设置、结果和实验过程由
 对应的实验文档维护；冻结后的实验定义以[实验协议](reference/experiment_protocol.md)为准。
@@ -16,6 +19,12 @@
 - [规则策略与特权 Expert 实验](scripted_policy_experiments.md)
 - [RL 实验](rl_experiments.md)
 - [DynamicVLA 实验](dynamicvla_experiments.md)
+- [Diffusion Policy](diffusion_policy.md)
+- [DynaDLO benchmark 论文计划](experiments/dynadlo_benchmark_paper.md)
+- [遮挡×形变 Priority-1 实验协议](experiments/occlusion_deformation_priority_plan.md)
+- [OccDyn-DLO 感知实验](experiments/occluded_dynamic_dlo_perception.md)
+- [可变形对象场景](experiments/deformable_object_scenes.md)
+- [定向抓取 CEM 计划](experiments/targeted_grasp_cem_plan.md)
 
 ## 1. 论文 Idea
 

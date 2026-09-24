@@ -29,7 +29,7 @@ sudo apt-get install -y libosmesa6 libgl1-mesa-dri
 ```bash
 git clone <项目仓库URL> panda_cable_grasp
 cd panda_cable_grasp
-git switch feat/linux-server-portability
+git switch dev
 
 git clone https://github.com/google-deepmind/mujoco_menagerie.git \
   ../mujoco_menagerie
@@ -180,6 +180,9 @@ panda-cable-grasp \
 - elasticity plugin 找不到：确认安装的是 `requirements.txt` 中的官方 `mujoco` wheel，
   不需要另行下载 MuJoCo SDK。
 - MP4 无法编码：确认安装 `ffmpeg`；同时检查输出目录可写且磁盘空间充足。
+- `skin_mesh requires trimesh`：fish GLB 蒙皮依赖 `trimesh`（已声明在
+  `pyproject.toml`，editable install 会带上）。无外网服务器可在有网机器
+  `pip download trimesh --no-deps` 后离线 `pip install --no-deps *.whl`。
 - 多进程训练很慢：当前环境是 CPU MuJoCo，并非 MJX GPU 批量物理；GPU主要用于策略网络
   和视频渲染。
 

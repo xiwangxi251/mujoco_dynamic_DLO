@@ -11,11 +11,14 @@
 - `observation.images.opst_cam`：固定对侧相机 RGB；
 - `observation.images.wrist_cam`：腕部相机 RGB；
 - `observation.state.end_effector.pos`：世界坐标末端位置；
-- `observation.state.end_effector.quat`：世界坐标 `wxyz` 四元数。
+- `observation.state.end_effector.quat`：世界坐标 `wxyz` 四元数（数据集内部
+  转换为 `euler_xyz`）。
 
-训练时 RGB 被缩放为 84×84，状态使用固定工作空间范围归一化到约 `[-1, 1]`。
-策略输出 8 维绝对任务空间命令 `[x, y, z, qw, qx, qy, qz, gripper]`。
-夹爪命令为 `+1=open`、`-1=close`，再由已有
+训练时 RGB 被缩放为 84×84。状态为 6 维 `[x, y, z, roll, pitch, yaw]`，动作是
+相对当前状态的 7 维 chunk-delta `[dx, dy, dz, droll, dpitch, dyaw, gripper]`，
+与 DynamicVLA 的任务空间契约一致。归一化边界从数据按 q01/q99 拟合（欧拉角
+±π、欧拉 delta ±2π、夹爪 [-1, 1] 的固定边界仅作旧 checkpoint 的回退）。
+夹爪命令为 `+1=open`、`-1=close`，策略输出经
 `DynamicVLATaskSpaceAdapter` 转换为 MuJoCo 的 7 关节目标加夹爪控制量。
 
 ## 训练
@@ -40,6 +43,9 @@ panda-cable-diffusion-train \
 `--action-source applied` 是默认值，表示用环境实际执行、经过共享安全限幅后的
 动作训练；如需复现 DynamicVLA 转换器的教师命令，可选 `requested`。数据集在
 episode 级别划分训练/验证集，不会把同一 episode 的帧同时放入两边。
+
+中断后可用 `--resume <checkpoint.pt>` 从已有 checkpoint 恢复训练（恢复模型
+权重、EMA、优化器状态和训练进度）。
 
 默认超参数是 2 帧观测历史、16 步预测块、执行 8 步后重规划、100 个 DDPM 训练
 步和 100 步 DDPM 推理步，与 DynaMimicGen 的 image-DP 配置一致。每个相机使用

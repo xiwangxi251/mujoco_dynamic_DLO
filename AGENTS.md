@@ -2,11 +2,17 @@
 
 ## Server / environment
 
+- Active development branch: `dev` (local, server 151 main checkout and
+  GitHub origin are unified on it; `server-sync-20260924` and
+  `feat/linux-server-portability` are historical references).
 - Repo on server: `/data1/hxai/mujoco/mujoco_dynamic_DLO` (local mirror:
   `C:\Users\27642\Desktop\mujoco\mujoco_dynamic_DLO`, ssh `-p 60022 hxai@10.108.17.151`)
 - Python envs: `/data1/hxai/miniconda3/envs/dynamicvla` (main),
   `/data1/hxai/miniconda3/envs/mp2cdlo` (MP2CDLO baseline)
 - Run python with `PYTHONPATH=src` from repo root.
+- Deps beyond pyproject extras: `trimesh>=4.0` (fish GLB skin mesh;
+  declared in `pyproject.toml`, install offline via wheel on the
+  no-internet server).
 - Packed dataset: `/data1/hxai/mujoco/perception_runs/dataset_v1_packed`
   (mmap `.npy` parts; ~780k frames after extra-episode merge).
 - Test seeds (held-out): `/data1/hxai/mujoco/perception_runs/test_seeds_<scenario>.txt`
