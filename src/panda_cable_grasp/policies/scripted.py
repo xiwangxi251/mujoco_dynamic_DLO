@@ -92,10 +92,6 @@ class PolicyConfig:
     # downward approach axis.  This is a task-space pose ablation; zero keeps
     # the calibrated baseline unchanged.
     nero_grasp_yaw_offset_deg: float = 0.0
-    # Optional two-stage yaw schedule for NERO: use this yaw during APPROACH,
-    # then switch to nero_grasp_yaw_offset_deg at the start of INTERCEPT.
-    # None preserves the single fixed-yaw behavior.
-    nero_approach_yaw_offset_deg: float | None = None
     policy_joint_velocity_fraction: float = 1.0
     ik_target_horizon: float = 0.11
     intercept_timeout: float = 9.0
@@ -159,11 +155,6 @@ class PolicyConfig:
         if not math.isfinite(self.nero_grasp_yaw_offset_deg):
             raise ValueError("nero_grasp_yaw_offset_deg must be finite")
         if (
-            self.nero_approach_yaw_offset_deg is not None
-            and not math.isfinite(self.nero_approach_yaw_offset_deg)
-        ):
-            raise ValueError("nero_approach_yaw_offset_deg must be finite or None")
-        if (
             self.max_retries is not None
             and (
                 isinstance(self.max_retries, bool)
@@ -216,6 +207,7 @@ class DynamicCableGraspPolicy:
         self.filtered_target = np.zeros(3)
         self.locked_segment_index: int | None = None
         self.locked_segment_alpha = 0.0
+        self.locked_node_ids: list[int] | None = None
         self.last_close_contact_time = -math.inf
         self.lift_start = np.zeros(3)
         self.lift_goal = np.zeros(3)
@@ -240,18 +232,31 @@ class DynamicCableGraspPolicy:
     def _nero_grasp_rotation(self, yaw_offset_deg: float) -> np.ndarray:
         """Return one NERO vertical grasp frame with a horizontal yaw offset."""
 
+        return self._nero_rotation_at_yaw(math.radians(yaw_offset_deg))
+
+    def _nero_rotation_at_yaw(self, yaw_rad: float) -> np.ndarray:
+        """NERO vertical grasp frame rotated by an absolute planar yaw."""
+
         desired_rotation = self.env.vertical_grasp_rotation()
         if self.config.nero_finger_tips_down:
             desired_rotation = np.diag([-1.0, 1.0, -1.0]) @ desired_rotation
-        yaw = math.radians(yaw_offset_deg)
-        if abs(yaw) > 1e-12:
+        if abs(yaw_rad) > 1e-12:
             yaw_rotation = np.array([
-                [math.cos(yaw), -math.sin(yaw), 0.0],
-                [math.sin(yaw), math.cos(yaw), 0.0],
+                [math.cos(yaw_rad), -math.sin(yaw_rad), 0.0],
+                [math.sin(yaw_rad), math.cos(yaw_rad), 0.0],
                 [0.0, 0.0, 1.0],
             ])
             desired_rotation = yaw_rotation @ desired_rotation
         return desired_rotation
+
+    def _initial_target(self) -> np.ndarray:
+        """Return the target used to initialise or restart target filtering.
+
+        The ordinary scripted baseline is privileged and therefore uses the
+        simulator target. Vision-only subclasses override this hook so the
+        shared phase machine never needs to read cable ground truth.
+        """
+        return self.env.target_position()
 
     def reset(self) -> None:
         self.phase = Phase.SETTLE
@@ -263,9 +268,10 @@ class DynamicCableGraspPolicy:
         self.finished = False
         self.result = "running"
         self.failure_diagnostics = None
-        self.filtered_target = self.env.target_position()
+        self.filtered_target = self._initial_target()
         self.locked_segment_index = None
         self.locked_segment_alpha = 0.0
+        self.locked_node_ids = None
         self.last_close_contact_time = -math.inf
         self.last_desired = self.env.hand_position.copy()
         self.recover_start = self.last_desired.copy()
@@ -288,13 +294,10 @@ class DynamicCableGraspPolicy:
         ])
         if self.env.robot == "nero":
             # NERO's jaw closing and tool approach axes differ from Panda's
-            # link frame, so use the calibrated robot-frame convention.  A
-            # two-stage schedule may defer the final horizontal yaw until the
-            # arm is already above the cable.
-            approach_yaw = self.config.nero_grasp_yaw_offset_deg
-            if self.config.nero_approach_yaw_offset_deg is not None:
-                approach_yaw = self.config.nero_approach_yaw_offset_deg
-            desired_rotation = self._nero_grasp_rotation(approach_yaw)
+            # link frame, so use the calibrated robot-frame convention.
+            desired_rotation = self._nero_grasp_rotation(
+                self.config.nero_grasp_yaw_offset_deg
+            )
         else:
             desired_rotation = (
                 self.VERTICAL_GRASP_ROTATION.copy()
@@ -313,18 +316,6 @@ class DynamicCableGraspPolicy:
     def _transition(self, phase: Phase) -> None:
         self.phase = phase
         self.phase_start = float(self.env.data.time)
-        if (
-            phase is Phase.INTERCEPT
-            and self.env.robot == "nero"
-            and self.config.nero_approach_yaw_offset_deg is not None
-        ):
-            desired_rotation = self._nero_grasp_rotation(
-                self.config.nero_grasp_yaw_offset_deg
-            )
-            self.desired_quat = rotation_to_quat(desired_rotation)
-            self.desired_approach_axis = (
-                desired_rotation @ self.env.gripper_approach_axis_local
-            )
 
     @staticmethod
     def _smoothstep(value: float) -> float:
@@ -337,13 +328,13 @@ class DynamicCableGraspPolicy:
         """用当前位置加短时速度外推，得到脚本要追踪的目标点。"""
 
         if self.locked_segment_index is None:
-            position = self.env.target_position()
-            velocity = self.env.target_velocity()
+            position, velocity = self._tracked_cable_point()
         else:
             index = self.locked_segment_index
             alpha = self.locked_segment_alpha
-            body0 = self.env.cable_ids[index]
-            body1 = self.env.cable_ids[index + 1]
+            node_ids = self.locked_node_ids or self._policy_node_ids()
+            body0 = node_ids[index]
+            body1 = node_ids[index + 1]
             position = (
                 (1.0 - alpha) * self.env.data.xpos[body0]
                 + alpha * self.env.data.xpos[body1]
@@ -370,9 +361,39 @@ class DynamicCableGraspPolicy:
         )
         return self.filtered_target.copy()
 
+    def _tracked_cable_point(self) -> tuple[np.ndarray, np.ndarray]:
+        """Source position/velocity while no material segment is locked.
+
+        Defaults to the environment-assigned target node.  Subclasses may
+        override to track a selected cable segment instead.
+        """
+
+        return self.env.target_position(), self.env.target_velocity()
+
+    def _select_intercept_segment(self, point: np.ndarray) -> np.ndarray:
+        """Choose the material segment locked when descent begins.
+
+        Defaults to the segment nearest the hand.  Subclasses may override
+        to implement predictive segment selection.
+        """
+
+        return self._lock_segment_near(point)
+
+    def _policy_node_ids(self) -> list[int]:
+        """脚本策略当前关注的对象节点集合（多对象时为目标对象）。"""
+
+        env = self.env
+        objects = getattr(env, "_objects", None)
+        if (
+            objects is not None
+            and getattr(env.config, "n_objects", 1) > 1
+        ):
+            return list(objects[env._target_object].ids)
+        return list(env.cable_ids)
+
     def _nearest_cable_point(self, point: np.ndarray) -> tuple[np.ndarray, float, int, float]:
-        """返回整条线缆中心线上距给定点最近的位置及其线段参数。"""
-        positions = self.env.data.xpos[self.env.cable_ids]
+        """返回目标对象中心线上距给定点最近的位置及其线段参数。"""
+        positions = self.env.data.xpos[self._policy_node_ids()]
         starts = positions[:-1]
         vectors = positions[1:] - starts
         lengths_squared = np.sum(vectors * vectors, axis=1)
@@ -387,9 +408,11 @@ class DynamicCableGraspPolicy:
 
     def _lock_segment_near(self, point: np.ndarray) -> np.ndarray:
         """锁定当前进入夹持中心的线段，闭爪后不再追逐原随机目标节点。"""
+        node_ids = self._policy_node_ids()
         nearest, _, index, alpha = self._nearest_cable_point(point)
         self.locked_segment_index = index
         self.locked_segment_alpha = alpha
+        self.locked_node_ids = node_ids
         self.filtered_target = nearest.copy()
         return nearest
 
@@ -406,6 +429,12 @@ class DynamicCableGraspPolicy:
         # quat_error返回2*sin(theta/2)*axis；这里恢复真实转角用于阶段门控。
         angle = 2.0 * math.asin(float(np.clip(0.5 * np.linalg.norm(error), 0.0, 1.0)))
         return error, angle
+
+    def _hover_target(self, target: np.ndarray) -> np.ndarray:
+        """悬停点：目标 XY 上方 +0.20 高度。"""
+        hover = target.copy()
+        hover[2] += 0.20
+        return hover
 
     def _tilt_error(self) -> float:
         """返回夹爪接近轴相对安全竖直方向的倾斜角，不把平面内偏航算作横倒。"""
@@ -729,13 +758,23 @@ class DynamicCableGraspPolicy:
         """张开夹爪并竖直撤离，然后才开始下一次横向跟踪。"""
         self.locked_segment_index = None
         self.locked_segment_alpha = 0.0
+        self.locked_node_ids = None
         self.recover_start = hand.copy()
         self.recover_goal = hand + np.array([0.0, 0.0, 0.18])
         self._transition(Phase.RECOVER)
 
     def _close_capture_distance(self) -> float:
-        """Distance at which descent transitions to gripper closure."""
+        """Distance at which descent transitions to gripper closure.
 
+        触发距离随目标对象厚度放宽：跨骑更粗的对象时手部参考点天然离
+        目标节点更远，旧线缆标定值会让粗对象永远达不到闭爪阈值。
+        """
+
+        objects = getattr(self.env, "_objects", None)
+        if objects:
+            index = min(self.env._target_object, len(objects) - 1)
+            extra = max(0.0, float(objects[index].radius) - 0.014)
+            return self.config.close_capture_distance + extra
         return self.config.close_capture_distance
 
     def action(self) -> np.ndarray:
@@ -775,7 +814,7 @@ class DynamicCableGraspPolicy:
 
         if self.phase is Phase.APPROACH:
             # 让实际两指夹持中心移动到预测线段上方20 cm，夹爪保持张开。
-            desired = target + np.array([0.0, 0.0, 0.20])
+            desired = self._hover_target(target)
             tilt_angle = self._tilt_error()
             position_ready = (
                 np.linalg.norm(hand - desired)
@@ -791,7 +830,7 @@ class DynamicCableGraspPolicy:
                 # Select one material segment when descent begins.  Re-selecting
                 # the globally nearest point every control step makes the goal
                 # jump between adjacent folds in a deforming cable.
-                self._lock_segment_near(hand)
+                self._select_intercept_segment(hand)
                 self._transition(Phase.INTERCEPT)
             elif self.phase_time > self.config.approach_timeout:
                 return self._retry_from_unsafe_pose(hand)
@@ -872,7 +911,7 @@ class DynamicCableGraspPolicy:
             blend = self._smoothstep(self.phase_time / 1.0)
             desired = (1.0 - blend) * self.recover_start + blend * self.recover_goal
             if self.phase_time > 1.0:
-                self.filtered_target = self.env.target_position()
+                self.filtered_target = self._initial_target()
                 self._transition(Phase.APPROACH)
             return self._ik_action(desired, self.env.gripper_open_ctrl)
 

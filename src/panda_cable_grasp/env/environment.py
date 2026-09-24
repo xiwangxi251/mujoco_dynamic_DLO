@@ -10,7 +10,7 @@ import math
 import os
 from pathlib import Path
 
-from ..paths import PROJECT_ROOT
+from ..paths import PROJECT_ROOT, output_path
 from ..runtime import configure_mujoco_runtime
 
 configure_mujoco_runtime()
@@ -209,6 +209,16 @@ RIGID_MOTION_PROFILES = {
     "rigid_level1_single_pass_v2",
     "rigid_level2_single_pass_v2",
 }
+REPLAY_MOTION_PROFILE = "rigid_replay_v1"
+RIGID_STYLE_PROFILES = RIGID_MOTION_PROFILES | {REPLAY_MOTION_PROFILE}
+
+
+def _wrap_angle(angle: float) -> float:
+    """Wrap ``angle`` to the shortest-path representative in (-pi, pi]."""
+
+    return float(
+        angle - 2.0 * math.pi * round(angle / (2.0 * math.pi))
+    )
 RIGID_MOTION_L2_CONTROL = RIGID_MOTION_TRAVEL * np.array([
     [0.00, 0.00],
     [0.16, 0.30],
@@ -268,6 +278,23 @@ class EnvConfig:
     rigid_rotation_scale: float = 1.0
     rigid_motion_nominal_speed: float = 0.25 # L1/L2标称平均速度，单位m/s
     rigid_motion_exit_y: float = 0.70
+    rigid_motion_contact_only: bool = False
+    # 初始线缆朝向偏置（度）：0=模型默认（缆主轴沿世界X轴），90=横向（沿Y）。
+    # 作用于初始形状生成；L1/L2 驱动的 yaw 伺服在 spawn 朝向之上叠加
+    # 其 24° 旋转剖面，即缆全程保持偏置后的横向进入工作区。
+    initial_cable_yaw_deg: float = 0.0
+
+    # rigid_replay_v1：轨迹库名解析为 <replay_bank_dir>/<replay_bank>.npz；
+    # 回放线缆保持初始形状，COM 与 yaw 跟随所选材料节点的记录轨迹。
+    replay_bank: str | None = None
+    replay_bank_dir: str | None = None   # None -> output_path("motion_banks")
+    replay_seed_fallback: str = "resample"  # resample / error：seed 不在库中时的行为
+
+    # initial_shape_bank：从同格式轨迹库取一个中间帧构型作为本回合
+    # 初始线缆形状（场景内无驱动）。与 rigid_replay_v1 的 replay_bank
+    # 互斥；initial_shape_time_range 为快照时刻在有效步数内的采样比例。
+    initial_shape_bank: str | None = None
+    initial_shape_time_range: tuple[float, float] = (0.30, 0.70)
 
     # rigid 轨迹控制参数
     rigid_path_position_gain: float = 20.0
@@ -392,20 +419,51 @@ class EnvConfig:
             "legacy_v1", "factorized_v1", "factorized_v2",
             "factorized_hidden_velocity_v1",
             "rigid_level1_single_pass_v2", "rigid_level2_single_pass_v2",
+            REPLAY_MOTION_PROFILE,
         }:
             raise ValueError(
                 "unsupported motion_profile_version: "
                 f"{self.motion_profile_version!r}"
             )
-        uses_rigid_trajectory = self.motion_profile_version in RIGID_MOTION_PROFILES
+        uses_rigid_trajectory = self.motion_profile_version in RIGID_STYLE_PROFILES
         if self.motion_mode in {"rigid", "combined"} and not uses_rigid_trajectory:
             raise ValueError(
-                "rigid and combined motion must explicitly select Level-1 or Level-2"
+                "rigid and combined motion must explicitly select Level-1/2 "
+                "or the replay profile"
             )
         if uses_rigid_trajectory and self.motion_mode not in {"rigid", "combined"}:
             raise ValueError(
-                "Level-1/Level-2 profiles require rigid or combined motion"
+                "Level-1/Level-2/replay profiles require rigid or combined motion"
             )
+        uses_replay = self.motion_profile_version == REPLAY_MOTION_PROFILE
+        if uses_replay:
+            if self.replay_bank is None or not str(self.replay_bank).strip():
+                raise ValueError("rigid_replay_v1 requires a replay_bank name")
+        elif self.replay_bank is not None:
+            raise ValueError(
+                "replay_bank is only meaningful with rigid_replay_v1"
+            )
+        if self.replay_seed_fallback not in {"resample", "error"}:
+            raise ValueError(
+                "replay_seed_fallback must be 'resample' or 'error'"
+            )
+        if self.initial_shape_bank is not None:
+            if (
+                self.motion_profile_version == REPLAY_MOTION_PROFILE
+                and self.initial_shape_bank != self.replay_bank
+            ):
+                raise ValueError(
+                    "initial_shape_bank with rigid_replay_v1 must equal "
+                    "replay_bank so the frozen shape snapshot and the "
+                    "replayed motion come from the same source episode"
+                )
+            range_lo, range_hi = (
+                float(v) for v in self.initial_shape_time_range
+            )
+            if not 0.0 <= range_lo <= range_hi <= 1.0:
+                raise ValueError(
+                    "initial_shape_time_range must lie within [0, 1]"
+                )
         nonnegative = (
             "disturbance_strength",
             "motion_frequency_scale",
@@ -1059,6 +1117,23 @@ class CableGraspEnv:
         self.cable_ids = self._cable_bodies()
         self.cable_set = set(self.cable_ids)
         self.cable_index = {body_id: index for index, body_id in enumerate(self.cable_ids)}
+        # rigid_replay_v1 的休眠刚化 weld 组（spec 构建时以 active=False 编译，
+        # 回放回合按放置位姿写 relpose 并激活）。
+        self._replay_weld_eq_ids = np.asarray([
+            eq_id
+            for eq_id in range(self.model.neq)
+            if (
+                mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_EQUALITY, eq_id
+                ) or ""
+            ).startswith("replay_rigidify_")
+        ], dtype=np.int64)
+        self._replay_weld_body_ids = np.asarray(
+            self.model.eq_obj2id[self._replay_weld_eq_ids], dtype=np.int64
+        )
+        self._replay_weld_root_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "cableB_first"
+        )
         robot_root_id = id_of(
             self.model, mujoco.mjtObj.mjOBJ_BODY, self.robot_spec.base_body_name
         )
@@ -1182,6 +1257,42 @@ class CableGraspEnv:
         self._rigid_initial_tangent_angles = np.zeros(node_count - 1)
         self._rigid_motion_rotation_sign = 1.0
 
+        # rigid_replay_v1 的回合级回放状态；reset 时按 seed 配对或随机抽取。
+        self._replay_banks: dict[str, "ReplayBank"] = {}
+        self._replay_bank_active: "ReplayBank | None" = None
+        self._replay_entry = -1
+        self._replay_entry_seed = -1
+        self._replay_tracked_index = 0
+        self._replay_elapsed = 0.0
+        self._replay_dt = 0.02
+        self._replay_horizon = 0
+        self._replay_delta = np.zeros((1, 2))
+        self._replay_vel = np.zeros((1, 2))
+        self._replay_yaw = np.zeros(1)
+        self._replay_yaw_rate = np.zeros(1)
+        self._replay_valid_steps = 0
+        self._replay_placed_com = np.zeros(2)
+        self._replay_source_motion_mode = "rigid"
+        # 回放参考的锚定位姿：reset 时为放置位姿，抓取松开重锚到实际位姿。
+        self._replay_anchor_tracked = np.zeros(2)
+        self._replay_anchor_yaw = 0.0
+        self._replay_anchor_index = 0
+        self._replay_rng = np.random.default_rng(
+            (0 if self.config.seed is None else int(self.config.seed))
+            ^ 0x5EED5EED
+        )
+        # initial_shape_bank 状态：库与回放库同格式，只取一帧构型。
+        self._shape_banks: dict[str, "ReplayBank"] = {}
+        self._shape_rng = np.random.default_rng(
+            (0 if self.config.seed is None else int(self.config.seed))
+            ^ 0x51A9E5
+        )
+        self._initial_shape_entry: int | None = None
+        self._initial_shape_step = 0
+        self._initial_shape_tangents: np.ndarray | None = None
+        self._initial_shape_com = np.zeros(2)
+        self._initial_shape_source_seed: int | None = None
+
         self.target_body_id = self.cable_ids[len(self.cable_ids) // 2]
 
         self.grasp_state: GraspState | None = None
@@ -1246,6 +1357,191 @@ class CableGraspEnv:
     # 1. 生命周期主接口：重置环境、执行动作
     # -------------------------------------------------------------------------
 
+    @property
+    def _uses_replay_motion(self) -> bool:
+        return self.config.motion_profile_version == REPLAY_MOTION_PROFILE
+
+    @property
+    def _uses_l12_motion(self) -> bool:
+        return self.config.motion_profile_version in RIGID_MOTION_PROFILES
+
+    def _replay_bank_dir(self) -> Path:
+        if self.config.replay_bank_dir:
+            return Path(self.config.replay_bank_dir)
+        return output_path("motion_banks")
+
+    def _load_replay_bank(self) -> "ReplayBank":
+        """加载（或复用缓存的）当前 ``config.replay_bank`` 轨迹库。"""
+        from .replay_bank import ReplayBank
+
+        name = str(self.config.replay_bank)
+        bank = self._replay_banks.get(name)
+        if bank is None:
+            path = self._replay_bank_dir() / f"{name}.npz"
+            bank = ReplayBank(path)
+            self._replay_banks[name] = bank
+        control_dt = float(
+            self.model.opt.timestep * max(1, self.config.frame_skip)
+        )
+        bank.check_compatible(np.asarray(self.cable_ids), control_dt)
+        return bank
+
+    def _prepare_replay_entry(self) -> None:
+        """选择本回合的回放条目与追踪节点并预计算参考轨迹。
+
+        显式 seed 命中库时按 seed 配对（与源场景同 seed 回合严格对应）；
+        无 seed 的 reset（构造/训练回合）总是随机抽取；显式 seed 未命中时
+        按 ``replay_seed_fallback`` 随机抽取或报错。追踪节点
+        直接复用本回合已抽取的目标材料索引，使回放刚体的目标点运动学与
+        配对形变场景的目标点逐点一致。所有抽取均使用独立的
+        ``_replay_rng``，不扰动 ``self.rng`` 的配对抽签序列。
+        """
+        bank = self._load_replay_bank()
+        self._replay_bank_active = bank
+        entry = (
+            None
+            if self.episode_seed is None
+            else bank.index_for_seed(self.episode_seed)
+        )
+        if entry is None:
+            if (
+                self.episode_seed is not None
+                and self.config.replay_seed_fallback == "error"
+            ):
+                raise KeyError(
+                    f"episode seed {self.episode_seed} is not present in "
+                    f"replay bank {self.config.replay_bank!r}"
+                )
+            entry = int(self._replay_rng.integers(bank.entry_count))
+        self._replay_entry = entry
+        self._replay_entry_seed = int(bank.seeds[entry])
+        self._replay_tracked_index = int(self.cable_index[self.target_body_id])
+        trajectory = bank.trajectory(entry, self._replay_tracked_index)
+        self._replay_dt = bank.control_dt
+        self._replay_horizon = int(trajectory.delta_position.shape[0])
+        self._replay_delta = trajectory.delta_position
+        self._replay_vel = trajectory.velocity
+        self._replay_yaw = trajectory.delta_yaw
+        self._replay_yaw_rate = trajectory.yaw_rate
+        self._replay_valid_steps = int(bank.valid_steps[entry])
+        self._replay_placed_com = bank.placed_com_xy[entry].astype(float)
+        self._replay_source_motion_mode = bank.source_motion_mode
+        self._replay_elapsed = 0.0
+
+    @property
+    def _uses_initial_shape_bank(self) -> bool:
+        return self.config.initial_shape_bank is not None
+
+    def _load_initial_shape_bank(self) -> "ReplayBank":
+        """加载（或复用缓存的）初始形状库；与回放库同格式。"""
+        from .replay_bank import ReplayBank
+
+        name = str(self.config.initial_shape_bank)
+        bank = self._shape_banks.get(name)
+        if bank is None:
+            bank = ReplayBank(self._replay_bank_dir() / f"{name}.npz")
+            self._shape_banks[name] = bank
+        control_dt = float(
+            self.model.opt.timestep * max(1, self.config.frame_skip)
+        )
+        bank.check_compatible(np.asarray(self.cable_ids), control_dt)
+        return bank
+
+    def _prepare_initial_shape(
+        self, entry: int | None = None,
+    ) -> None:
+        """从形变轨迹库取一个中间帧构型作为本回合初始形状。
+
+        显式 seed 命中库时与同 seed 源回合配对；未命中按
+        ``replay_seed_fallback`` 重抽或报错。快照时刻在有效区间的
+        ``initial_shape_time_range`` 比例内由独立 Generator 采样，
+        不消耗 ``self.rng``，保证与配对场景共享同一抽签序列。
+        """
+        bank = self._load_initial_shape_bank()
+        if entry is not None:
+            entry = int(entry)
+            if not 0 <= entry < bank.entry_count:
+                raise IndexError(
+                    f"initial shape entry {entry} out of range for bank "
+                    f"{self.config.initial_shape_bank!r}"
+                )
+        else:
+            entry = (
+                None
+                if self.episode_seed is None
+                else bank.index_for_seed(self.episode_seed)
+            )
+        if entry is None:
+            if (
+                self.episode_seed is not None
+                and self.config.replay_seed_fallback == "error"
+            ):
+                raise KeyError(
+                    f"episode seed {self.episode_seed} is not present in "
+                    f"initial shape bank {self.config.initial_shape_bank!r}"
+                )
+            entry = int(self._shape_rng.integers(bank.entry_count))
+        valid = max(1, int(bank.valid_steps[entry]))
+        range_lo, range_hi = (
+            float(v) for v in self.config.initial_shape_time_range
+        )
+        if self.episode_seed is None:
+            frac = float(self._shape_rng.uniform(range_lo, range_hi))
+        else:
+            step_rng = np.random.default_rng(
+                int(self.episode_seed) ^ 0x5A9E17
+            )
+            frac = float(step_rng.uniform(range_lo, range_hi))
+        step = min(max(int(frac * valid), 0), valid - 1)
+        positions = np.asarray(
+            bank.positions_xy[entry, step], dtype=np.float64
+        )
+        diffs = np.diff(positions, axis=0)
+        self._initial_shape_entry = int(entry)
+        self._initial_shape_step = int(step)
+        self._initial_shape_tangents = np.arctan2(diffs[:, 1], diffs[:, 0])
+        self._initial_shape_com = positions.mean(axis=0)
+        self._initial_shape_source_seed = int(bank.seeds[entry])
+
+    def _activate_replay_welds(self) -> None:
+        """把线缆焊成一根刚体。
+
+        spec 构建时已把每个 ``cableB_i``（i>=1）到 ``cableB_first`` 的休眠
+        weld 编译进模型；这里按放置完成后的实际位姿写各 weld 的
+        ``relpose``，再置 ``eq_active=1``。非回放回合由 ``mj_resetData``
+        依 ``eq_active0=0`` 自动保持休眠，物理与无约束完全一致。
+        """
+        eq_ids = self._replay_weld_eq_ids
+        if eq_ids.size == 0 or self._replay_weld_root_id < 0:
+            return
+        root = self._replay_weld_root_id
+        inv = self.data.xquat[root].copy()
+        inv[1:] *= -1.0
+        rel_p = np.zeros(3)
+        rel_q = np.zeros(4)
+        for eq_id, body_id in zip(eq_ids, self._replay_weld_body_ids):
+            mujoco.mju_rotVecQuat(
+                rel_p,
+                self.data.xpos[body_id] - self.data.xpos[root],
+                inv,
+            )
+            mujoco.mju_mulQuat(rel_q, inv, self.data.xquat[body_id])
+            eq_data = self.model.eq_data[eq_id]
+            eq_data[0:3] = 0.0
+            eq_data[3:6] = rel_p
+            eq_data[6:10] = rel_q
+            eq_data[10] = 1.0
+        self.data.eq_active[eq_ids] = 1.0
+        mujoco.mj_forward(self.model, self.data)
+
+    def _replay_index(self) -> int:
+        if self._replay_horizon <= 0:
+            return 0
+        return min(
+            int(self._replay_elapsed / self._replay_dt),
+            self._replay_horizon - 1,
+        )
+
     def reset(
         self,
         *,
@@ -1265,7 +1561,7 @@ class CableGraspEnv:
         self.data.ctrl[:8] = self.ready_ctrl
         mujoco.mj_forward(self.model, self.data)
 
-        uses_rigid_motion = self.config.motion_profile_version in RIGID_MOTION_PROFILES
+        uses_rigid_motion = self.config.motion_profile_version in RIGID_STYLE_PROFILES
         uses_curved_initial_shape = (
             self.config.motion_profile_version == "factorized_v2"
             or self.config.motion_profile_version == "factorized_hidden_velocity_v1"
@@ -1293,15 +1589,53 @@ class CableGraspEnv:
             self.spatial_phase = 0.0
             self.target_body_id = self.cable_ids[len(self.cable_ids) // 2]
 
+        if self._uses_replay_motion:
+            # 先确定回放条目与追踪节点，再用库中记录的初始摆位放置线缆；
+            # 选择过程只使用独立 Generator，不消耗 self.rng，保证同 seed 下
+            # 与形变场景的初始曲线/目标索引抽签序列完全一致。
+            self._prepare_replay_entry()
+            if self._uses_initial_shape_bank:
+                # 回放+复杂构型：冻结形状取自同一回放条目的中间帧快照，
+                # 运动仍按 t=0 起完整回放（delta 相对量，与快照来源帧无关）。
+                self._prepare_initial_shape(entry=self._replay_entry)
+        elif self._uses_initial_shape_bank:
+            # 同回放路径：条目/时刻的抽取只用独立 Generator，不扰动 self.rng。
+            self._prepare_initial_shape()
+        else:
+            self._initial_shape_entry = None
+            self._initial_shape_source_seed = None
+
         if uses_curved_initial_shape:
             # 所有新实验场景共享随机弯曲初始分布；相同seed可配对比较。
-            if uses_rigid_motion:
+            if self._uses_l12_motion:
                 dy = RIGID_MOTION_START_Y - float(base_com_xy[1])
-            self.initial_cable_translation[:] = [dx, dy]
+                desired_com_xy = base_com_xy + np.array([dx, dy])
+                self.initial_cable_translation[:] = [dx, dy]
+            elif self._uses_replay_motion:
+                # 采用源回合实际落位，保证配对 seed 下与形变场景逐点一致。
+                desired_com_xy = self._replay_placed_com.copy()
+                self.initial_cable_translation[:] = (
+                    desired_com_xy - base_com_xy
+                )
+            elif self._uses_initial_shape_bank:
+                # 采用快照时刻的源回合实际质心，配对 seed 下形状与位置
+                # 均与形变场景中间帧逐点一致。
+                desired_com_xy = self._initial_shape_com.copy()
+                self.initial_cable_translation[:] = (
+                    desired_com_xy - base_com_xy
+                )
+            else:
+                desired_com_xy = base_com_xy + np.array([dx, dy])
+                self.initial_cable_translation[:] = [dx, dy]
             self._set_curved_initial_shape(
-                desired_com_xy=base_com_xy + np.array([dx, dy]),
+                desired_com_xy=desired_com_xy,
                 randomize=randomize,
-                check_rigid_motion_sweep=uses_rigid_motion,
+                check_rigid_motion_sweep=self._uses_l12_motion,
+                tangents_override=(
+                    self._initial_shape_tangents
+                    if self._uses_initial_shape_bank
+                    else None
+                ),
             )
         else:
             # 长线缆OOD的初始端点仍放在桌面内，避免长度变化被初始坠桌混淆。
@@ -1345,6 +1679,13 @@ class CableGraspEnv:
         self._rigid_reference_com_xy[:] = np.average(
             self._rigid_reference_xy, axis=0, weights=self.cable_mass
         )
+        if self._uses_replay_motion:
+            self._activate_replay_welds()
+            self._replay_anchor_tracked = self._rigid_reference_xy[
+                self._replay_tracked_index
+            ].copy()
+            self._replay_anchor_yaw = 0.0
+            self._replay_anchor_index = 0
         profile_bytes = b"".join((
             profile_header,
             self._stochastic_shape_frequency.tobytes(),
@@ -1354,6 +1695,10 @@ class CableGraspEnv:
             self._rigid_reference_xy.tobytes(),
             self._rigid_initial_shape_family.encode("ascii"),
             np.asarray([self._rigid_motion_rotation_sign]).tobytes(),
+            (
+                f"{self.config.replay_bank}|{self._replay_entry_seed}|"
+                f"{self._replay_tracked_index}"
+            ).encode("ascii") if self._uses_replay_motion else b"",
         ))
         self.motion_profile_hash = hashlib.sha256(profile_bytes).hexdigest()
 
@@ -1369,6 +1714,7 @@ class CableGraspEnv:
         self.ever_confirmed_grasp = False
         self.rigid_motion_released = False
         self.rigid_motion_suspended = False
+        self._replay_elapsed = 0.0
         self.last_termination_reason = None
         self._last_contact_count = 0
         self._last_shape_acceleration[:] = 0.0
@@ -1535,6 +1881,11 @@ class CableGraspEnv:
         control_dt = float(
             self.model.opt.timestep * max(1, self.config.frame_skip)
         )
+        if self._uses_replay_motion:
+            # 与库源场景的机械臂解锁时刻对齐：shape 源立即释放，
+            # rigid/combined 源沿用 0.8 s 延迟。
+            if self._replay_source_motion_mode == "shape":
+                return 0.0
         return RIGID_MOTION_START_TIME + control_dt
 
     def _limit_robot_action(self, requested_action: np.ndarray) -> np.ndarray:
@@ -1880,7 +2231,7 @@ class CableGraspEnv:
         motion_limit_denominator = max(1, self._motion_limit_steps)
         physics_step_denominator = max(1, self._physics_steps)
         rms = lambda values: float(np.sqrt(np.mean(np.square(values))))
-        uses_rigid_motion = self.config.motion_profile_version in RIGID_MOTION_PROFILES
+        uses_rigid_motion = self.config.motion_profile_version in RIGID_STYLE_PROFILES
         arm_motion_start_time = self._arm_motion_start_time()
         return {
             "trial": self.trial_index,
@@ -1934,10 +2285,43 @@ class CableGraspEnv:
             "rigid_initial_shape_family": self._rigid_initial_shape_family,
             "rigid_motion_rotation_sign": self._rigid_motion_rotation_sign,
             "rigid_motion_rotation_total_rad": (
-                self._rigid_motion_rotation_target(
-                    RIGID_MOTION_START_TIME + self._rigid_motion_duration()
+                (
+                    float(self._replay_yaw[-1])
+                    if self._uses_replay_motion
+                    else self._rigid_motion_rotation_target(
+                        RIGID_MOTION_START_TIME + self._rigid_motion_duration()
+                    )
                 ) if uses_rigid_motion else None
             ),
+            "replay_bank": (
+                self.config.replay_bank if self._uses_replay_motion else None
+            ),
+            "replay_entry_index": (
+                self._replay_entry if self._uses_replay_motion else None
+            ),
+            "replay_entry_seed": (
+                self._replay_entry_seed if self._uses_replay_motion else None
+            ),
+            "replay_tracked_index": (
+                self._replay_tracked_index if self._uses_replay_motion else None
+            ),
+            "replay_elapsed": (
+                float(self._replay_elapsed) if self._uses_replay_motion else None
+            ),
+            "replay_source_motion_mode": (
+                self._replay_source_motion_mode
+                if self._uses_replay_motion else None
+            ),
+            "initial_shape_bank": (
+                self.config.initial_shape_bank
+                if self._uses_initial_shape_bank else None
+            ),
+            "initial_shape_entry": self._initial_shape_entry,
+            "initial_shape_step": (
+                self._initial_shape_step
+                if self._initial_shape_entry is not None else None
+            ),
+            "initial_shape_source_seed": self._initial_shape_source_seed,
             "cable_length_scale": self.config.cable_length_scale,
             "cable_density_scale": self.config.cable_density_scale,
             "cable_stiffness_scale": self.config.cable_stiffness_scale,
@@ -2134,15 +2518,25 @@ class CableGraspEnv:
         )
 
     def _update_rigid_motion_suspension_state(self) -> None:
-        """Suspend L1/L2 drive only while a confirmed grasp remains active."""
+        """Suspend rigid-style drive while a confirmed grasp remains active.
+
+        Covers L1/L2 sweeps and ``rigid_replay_v1``: during a confirmed grasp
+        the whole-object drive and the replay clock pause together, and on
+        release the reference resumes from where it paused instead of
+        catching up.
+        """
         self.rigid_motion_suspended = bool(
-            self.config.motion_profile_version in RIGID_MOTION_PROFILES
+            self.config.motion_profile_version in RIGID_STYLE_PROFILES
             and self.grasp_confirmed
         )
+        was_suspended = getattr(self, "_replay_was_suspended", False)
         if self.rigid_motion_suspended:
             # Preserve the old field as an "ever released" diagnostic so
             # existing episode logs remain comparable.
             self.rigid_motion_released = True
+        elif was_suspended and self._uses_replay_motion:
+            self._replay_reanchor()
+        self._replay_was_suspended = self.rigid_motion_suspended
 
     def _update_physical_grasp_state(self, gripper_closed: bool) -> None:
         """只根据内指垫接触、法向力和开口更新抓取状态。"""
@@ -2377,6 +2771,7 @@ class CableGraspEnv:
                 tangents *= curve_sign
             rotation_sign = float(self.rng.choice((-1.0, 1.0)))
 
+        tangents = tangents + math.radians(self.config.initial_cable_yaw_deg)
         self._rigid_initial_shape_family = family
         self._rigid_motion_rotation_sign = rotation_sign
         self._rigid_initial_tangent_angles[:] = tangents
@@ -2388,10 +2783,26 @@ class CableGraspEnv:
         desired_com_xy: np.ndarray,
         randomize: bool,
         check_rigid_motion_sweep: bool,
+        tangents_override: np.ndarray | None = None,
     ) -> None:
-        """直接设置球关节得到弯曲构型，并确保所需扫掠范围位于桌内。"""
+        """直接设置球关节得到弯曲构型，并确保所需扫掠范围位于桌内。
 
-        tangents = self._sample_initial_tangents(randomize)
+        ``tangents_override`` 非空时跳过参数化形状采样，直接使用给定的
+        各段平面朝向角（如轨迹库中间帧构型）。
+        """
+
+        if tangents_override is None:
+            tangents = self._sample_initial_tangents(randomize)
+        else:
+            tangents = np.asarray(tangents_override, dtype=float)
+            if tangents.shape != (len(self.cable_ids) - 1,):
+                raise ValueError(
+                    "tangents_override must contain node_count-1 angles, "
+                    f"got {tangents.shape}"
+                )
+            self._rigid_initial_shape_family = "bank"
+            self._rigid_motion_rotation_sign = 1.0
+            self._rigid_initial_tangent_angles[: tangents.size] = tangents
         root_quaternion = self.data.qpos[
             self.cable_free_qadr + 3:self.cable_free_qadr + 7
         ]
@@ -2452,6 +2863,24 @@ class CableGraspEnv:
         ] = 0.0
         mujoco.mj_forward(self.model, self.data)
 
+    def _cable_table_contact_mask(self) -> np.ndarray:
+        """返回与桌面实际接触的线缆节点掩码（用上一步求解的接触对）。"""
+
+        mask = np.zeros(len(self.cable_ids), dtype=bool)
+        table_geom = self.table_geom_id
+        for contact in self.data.contact[: self.data.ncon]:
+            cable_geom = -1
+            if int(contact.geom1) == table_geom:
+                cable_geom = int(contact.geom2)
+            elif int(contact.geom2) == table_geom:
+                cable_geom = int(contact.geom1)
+            if cable_geom < 0:
+                continue
+            body = int(self.model.geom_bodyid[cable_geom])
+            if body in self.cable_set:
+                mask[self.cable_index[body]] = True
+        return mask
+
     def _apply_cable_disturbance(self) -> None:
         """按场景组合静止、整体运动和局部形变三个可审计分量。"""
 
@@ -2490,6 +2919,19 @@ class CableGraspEnv:
                     shape_hold = self._rigid_shape_hold_acceleration(
                         elapsed_time, velocity_xy
                     )
+                if self._uses_replay_motion:
+                    # 回放时钟随真实驱动同步前进；悬挂期间暂停，语义与
+                    # L1/L2 的进度式路径一致（抓取松开后续走而非补时）。
+                    self._replay_elapsed += float(self.model.opt.timestep)
+
+        if (
+            self.config.rigid_motion_contact_only
+            and self.config.motion_mode in {"rigid", "combined"}
+        ):
+            grounded = self._cable_table_contact_mask()
+            translation[~grounded] = 0.0
+            rotation[~grounded] = 0.0
+            shape_hold[~grounded] = 0.0
 
         intended = shape + translation + rotation + shape_hold
 
@@ -2634,6 +3076,9 @@ class CableGraspEnv:
         burst.
         """
 
+        if self._uses_replay_motion:
+            return self._replay_motion_acceleration(velocity_xy)
+
         current_xy = self.data.xpos[self.cable_ids, :2]
         current_com = np.average(current_xy, axis=0, weights=self.cable_mass)
         current_velocity = np.average(
@@ -2685,7 +3130,116 @@ class CableGraspEnv:
             )
         ) / max(planar_inertia, 1e-12))
         angular_acceleration = (
-            32.0 * (desired_yaw - current_yaw)
+            32.0 * _wrap_angle(desired_yaw - current_yaw)
+            + 9.0 * (desired_yaw_rate - current_yaw_rate)
+        )
+        angular_acceleration = float(np.clip(
+            angular_acceleration, -18.0, 18.0
+        ))
+        positions = self.data.xpos[self.cable_ids]
+        center = np.average(positions, axis=0, weights=self.cable_mass)
+        relative = positions - center
+        alpha = np.array([0.0, 0.0, angular_acceleration])
+        omega = np.array([0.0, 0.0, desired_yaw_rate])
+        rotation = (
+            np.cross(np.broadcast_to(alpha, relative.shape), relative)
+            + np.cross(
+                np.broadcast_to(omega, relative.shape),
+                np.cross(np.broadcast_to(omega, relative.shape), relative),
+            )
+        )
+        rotation -= np.average(rotation, axis=0, weights=self.cable_mass)
+        return translation, rotation
+
+    def _replay_reanchor(self) -> None:
+        """抓取松开后把回放参考重锚到线缆当前实际位姿。
+
+        悬挂期间回放时钟冻结，但夹爪可能已把线缆拖离暂停位姿；直接恢复
+        冻结参考会产生一段高速「追赶」运动。这里把参考轨迹平移/旋转到
+        当前位姿：后续只回放剩余的相对运动，追踪节点无跳变续走。
+        """
+        index = self._replay_index()
+        _, current_yaw = self._current_rigid_pose()
+        self._replay_anchor_tracked = self.data.xpos[
+            self.cable_ids[self._replay_tracked_index], :2
+        ].copy()
+        self._replay_anchor_yaw = float(current_yaw)
+        self._replay_anchor_index = index
+
+    def _replay_motion_acceleration(
+        self, velocity_xy: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """沿记录轨迹的时间索引 PD 伺服：COM 平移 + 绕 COM 的 yaw 旋转。
+
+        期望 yaw 为整缆 Kabsch 全局旋转增量（叠加锚点 yaw）；期望 COM 取
+        「锚点/落位参考 + 追踪节点的锚系相对位移 − 追踪节点的旋转偏移」，
+        使追踪节点本身精确落到记录轨迹，其余节点随刚体变换共动。抓取
+        松开后参考经 `_replay_reanchor` 重锚，无追赶段。
+        """
+
+        index = self._replay_index()
+        anchor_index = self._replay_anchor_index
+        anchor_yaw = self._replay_anchor_yaw
+        # 期望 yaw = 锚点 yaw + 自锚定帧以来的记录 yaw 增量（Kabsch 全局）。
+        desired_yaw = float(
+            anchor_yaw + self._replay_yaw[index] - self._replay_yaw[anchor_index]
+        )
+        desired_yaw_rate = float(self._replay_yaw_rate[index])
+        current_xy = self.data.xpos[self.cable_ids, :2]
+        current_com = np.average(current_xy, axis=0, weights=self.cable_mass)
+        current_velocity = np.average(
+            velocity_xy, axis=0, weights=self.cable_mass
+        )
+        # 追踪节点的期望位置 = 锚点位置 + 锚系旋转后的记录相对位移；期望
+        # COM = 期望追踪点 − 其旋转偏移（旋转分量不会被计两次）。
+        tracked_relative = (
+            self._rigid_reference_xy[self._replay_tracked_index]
+            - self._rigid_reference_com_xy
+        )
+        delta_rel = (
+            self._replay_delta[index] - self._replay_delta[anchor_index]
+        )
+        desired_tracked = self._replay_anchor_tracked + delta_rel @ (
+            self._planar_rotation(anchor_yaw)
+        )
+        desired_com = desired_tracked - tracked_relative @ (
+            self._planar_rotation(desired_yaw)
+        )
+        cosine, sine = math.cos(desired_yaw), math.sin(desired_yaw)
+        rotation_rate_correction = desired_yaw_rate * (
+            tracked_relative @ np.array([[-sine, cosine], [-cosine, -sine]])
+        )
+        desired_velocity = self._replay_vel[index] @ (
+            self._planar_rotation(anchor_yaw)
+        ) - rotation_rate_correction
+        acceleration_xy = (
+            self.config.rigid_path_position_gain * (desired_com - current_com)
+            + self.config.rigid_velocity_gain
+            * (desired_velocity - current_velocity)
+        )
+        norm = float(np.linalg.norm(acceleration_xy))
+        maximum = self.config.rigid_translation_max_acceleration
+        if norm > maximum:
+            acceleration_xy *= maximum / norm
+        translation = np.broadcast_to(
+            np.r_[acceleration_xy, 0.0], (len(self.cable_ids), 3)
+        ).copy()
+
+        _, current_yaw = self._current_rigid_pose()
+        velocity_relative = velocity_xy - current_velocity
+        current_relative_xy = current_xy - current_com
+        planar_inertia = float(np.sum(
+            self.cable_mass
+            * np.sum(current_relative_xy * current_relative_xy, axis=1)
+        ))
+        current_yaw_rate = float(np.sum(
+            self.cable_mass * (
+                current_relative_xy[:, 0] * velocity_relative[:, 1]
+                - current_relative_xy[:, 1] * velocity_relative[:, 0]
+            )
+        ) / max(planar_inertia, 1e-12))
+        angular_acceleration = (
+            32.0 * _wrap_angle(desired_yaw - current_yaw)
             + 9.0 * (desired_yaw_rate - current_yaw_rate)
         )
         angular_acceleration = float(np.clip(
@@ -2780,7 +3334,10 @@ class CableGraspEnv:
             * smooth_derivative
             * progress_rate
         )
-        return self._rigid_motion_rotation_from_progress(progress), yaw_rate
+        return (
+            self._rigid_motion_rotation_from_progress(progress),
+            yaw_rate,
+        )
 
     def _rigid_motion_target(self, time_value: float) -> np.ndarray:
         """返回同起终点、无折返的L1直线或L2三次曲线质心位移。"""
@@ -2809,6 +3366,8 @@ class CableGraspEnv:
         return self._rigid_motion_rotation_from_progress(progress)
 
     def _rigid_motion_duration(self) -> float:
+        if self._uses_replay_motion:
+            return self._replay_valid_steps * self._replay_dt
         speed = (
             self.config.rigid_motion_nominal_speed
             * self.config.motion_frequency_scale
@@ -2822,6 +3381,12 @@ class CableGraspEnv:
 
     @property
     def rigid_motion_nominal_finished(self) -> bool:
+        if self._uses_replay_motion:
+            return bool(
+                self._replay_valid_steps > 0
+                and self._replay_elapsed
+                >= (self._replay_valid_steps - 1) * self._replay_dt
+            )
         return bool(
             self.config.motion_profile_version in RIGID_MOTION_PROFILES
             and self.data.time
@@ -2838,6 +3403,14 @@ class CableGraspEnv:
     def rigid_motion_finished(self) -> bool:
         """Return whether the real cable COM crossed the L1/L2 exit line."""
 
+        if self._uses_replay_motion:
+            # 仅当被截断的源条目回放完有效段才视为“越线”：
+            # 满时长的条目表示源 episode 本身跑满时限，未越线。
+            return bool(
+                0 < self._replay_valid_steps < self._replay_horizon
+                and self._replay_elapsed
+                >= (self._replay_valid_steps - 1) * self._replay_dt
+            )
         return bool(
             self.config.motion_profile_version in RIGID_MOTION_PROFILES
             and self.rigid_motion_com_y >= self.config.rigid_motion_exit_y
@@ -2852,16 +3425,21 @@ class CableGraspEnv:
         current_com = np.average(current_xy, axis=0, weights=self.cable_mass)
         reference_relative = self._rigid_reference_xy - self._rigid_reference_com_xy
         com_velocity = np.average(velocity_xy, axis=0, weights=self.cable_mass)
-        current_offset = current_com - self._rigid_reference_com_xy
-        _, tangent, progress, progress_metric = self._rigid_motion_path_state(
-            current_offset
-        )
-        target_yaw, target_yaw_rate = self._rigid_motion_rotation_state(
-            progress, progress_metric, tangent, com_velocity,
-        )
-        if time_value < RIGID_MOTION_START_TIME:
-            target_yaw = 0.0
-            target_yaw_rate = 0.0
+        if self._uses_replay_motion:
+            index = self._replay_index()
+            target_yaw = float(self._replay_yaw[index])
+            target_yaw_rate = float(self._replay_yaw_rate[index])
+        else:
+            current_offset = current_com - self._rigid_reference_com_xy
+            _, tangent, progress, progress_metric = self._rigid_motion_path_state(
+                current_offset
+            )
+            target_yaw, target_yaw_rate = self._rigid_motion_rotation_state(
+                progress, progress_metric, tangent, com_velocity,
+            )
+            if time_value < RIGID_MOTION_START_TIME:
+                target_yaw = 0.0
+                target_yaw_rate = 0.0
         target_relative = reference_relative @ self._planar_rotation(target_yaw)
         current_relative = current_xy - current_com
         position_error = target_relative - current_relative
@@ -3210,6 +3788,24 @@ class CableGraspEnv:
                 float(plugin_config["twist"]) * config.cable_stiffness_scale
             )
             plugin_spec.config = plugin_config
+
+        # rigid_replay_v1 用的休眠刚化约束：把每根 cableB_i（i>=1）焊到
+        # cableB_first。所有场景共用同一编译拓扑；active=False 使非回放
+        # 回合的物理与无约束完全一致，回放回合在 reset 中按放置位姿激活。
+        cable_body_names = sorted(
+            body.name
+            for body in spec.bodies
+            if body.name.startswith("cableB")
+            and body.name != "cableB_first"
+        )
+        for body_name in cable_body_names:
+            weld = spec.add_equality()
+            weld.type = mujoco.mjtEq.mjEQ_WELD
+            weld.objtype = mujoco.mjtObj.mjOBJ_BODY
+            weld.name = f"replay_rigidify_{body_name}"
+            weld.name1 = "cableB_first"
+            weld.name2 = body_name
+            weld.active = False
         return spec.compile()
 
     def _cable_bodies(self) -> list[int]:

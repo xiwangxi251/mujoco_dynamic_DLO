@@ -247,6 +247,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         rl_config: RLConfig | None = None,
         geometric_safety_enabled: bool | None = None,
         table_finger_collision_filter_enabled: bool = True,
+        frame_skip: int | None = None,
     ):
         super().__init__()
         self.rl_config = rl_config or RLConfig()
@@ -289,6 +290,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 )
             first_scenario = self._scenario_configs[0]
             first_overrides = first_scenario.to_env_overrides()
+            if frame_skip is not None:
+                first_overrides["frame_skip"] = int(frame_skip)
             first_overrides["disturbance_strength"] = (
                 first_scenario.disturbance_strength
                 * self._final_disturbance_scale

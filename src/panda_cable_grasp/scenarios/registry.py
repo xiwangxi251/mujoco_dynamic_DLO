@@ -140,6 +140,12 @@ class ScenarioConfig:
     frequency_scale: float = 1.0
     shape_motion_scale: float = SHAPE_MOTION_SCALE
 
+    # rigid_replay_v1 场景专用的轨迹库名；非回放场景必须为 None。
+    replay_bank: str | None = None
+    # static 场景专用的初始形状库名（与回放库同格式）：reset 时按 seed
+    # 取条目、在有效区间采一个中间帧构型作为初始线缆形状。
+    initial_shape_bank: str | None = None
+
     cable_length_scale: float = 1.0
     cable_length_ood: bool = False
     cable_material_profile: str = "nominal"
@@ -191,26 +197,62 @@ class ScenarioConfig:
             "factorized_v2",
             "rigid_level1_single_pass_v2",
             "rigid_level2_single_pass_v2",
+            "rigid_replay_v1",
         }
         if self.motion_profile_version not in allowed_profiles:
             raise ValueError(
                 "unsupported registered motion_profile_version: "
                 f"{self.motion_profile_version!r}"
             )
-        uses_rigid_trajectory = self.motion_profile_version.startswith("rigid_level")
+        uses_rigid_trajectory = self.motion_profile_version in {
+            "rigid_level1_single_pass_v2",
+            "rigid_level2_single_pass_v2",
+            "rigid_replay_v1",
+        }
         if uses_rigid_trajectory and self.motion_type not in {
             MotionType.RIGID, MotionType.COMBINED,
         }:
             raise ValueError(
-                "Level-1/Level-2 trajectories require rigid or combined motion"
+                "Level-1/Level-2/replay trajectories require rigid or "
+                "combined motion"
             )
         if (
             self.motion_type in {MotionType.RIGID, MotionType.COMBINED}
             and not uses_rigid_trajectory
         ):
             raise ValueError(
-                "rigid and combined scenarios must explicitly select Level-1 or Level-2"
+                "rigid and combined scenarios must explicitly select "
+                "Level-1/Level-2 or the replay profile"
             )
+        if self.motion_profile_version == "rigid_replay_v1":
+            if self.replay_bank is None or not _NAME_PATTERN.fullmatch(
+                self.replay_bank
+            ):
+                raise ValueError(
+                    "rigid_replay_v1 scenarios require a lowercase "
+                    "replay_bank name"
+                )
+        elif self.replay_bank is not None:
+            raise ValueError(
+                "replay_bank is only valid with the rigid_replay_v1 profile"
+            )
+        if self.initial_shape_bank is not None:
+            if not _NAME_PATTERN.fullmatch(self.initial_shape_bank):
+                raise ValueError(
+                    "initial_shape_bank must be a lowercase identifier"
+                )
+            if self.motion_profile_version == "rigid_replay_v1":
+                if self.initial_shape_bank != self.replay_bank:
+                    raise ValueError(
+                        "initial_shape_bank with rigid_replay_v1 must equal "
+                        "replay_bank so the frozen shape snapshot and the "
+                        "replayed motion share one source episode"
+                    )
+            elif self.motion_type is not MotionType.STATIC:
+                raise ValueError(
+                    "initial_shape_bank is only valid for static or "
+                    "rigid_replay_v1 scenarios"
+                )
         if not isinstance(self.cable_material_profile, str) or not _NAME_PATTERN.fullmatch(
             self.cable_material_profile
         ):
@@ -451,6 +493,12 @@ class ScenarioConfig:
                 "cable_friction_scale",
             ):
                 payload.pop(value_name, None)
+        # 回放库字段在默认值时从身份中剔除，保证既有场景的
+        # scenario_id/scenario_hash 不因新增字段而改变。
+        if payload.get("replay_bank") is None:
+            payload.pop("replay_bank", None)
+        if payload.get("initial_shape_bank") is None:
+            payload.pop("initial_shape_bank", None)
         return payload
 
     @property
@@ -491,6 +539,8 @@ class ScenarioConfig:
             "disturbance_strength": self.disturbance_strength,
             "motion_mode": self.motion_type.value,
             "motion_profile_version": self.motion_profile_version,
+            "replay_bank": self.replay_bank,
+            "initial_shape_bank": self.initial_shape_bank,
             "motion_regularity": self.regularity.value,
             "motion_frequency_scale": self.frequency_scale,
             "shape_motion_scale": self.shape_motion_scale,
@@ -712,6 +762,105 @@ def _registered_scenarios() -> list[ScenarioConfig]:
                     ),
                     tags=("main_grid", f"rigid_{trajectory}"),
                 ))
+
+    # 轨迹回放式随机整体运动对照：线缆保持初始形状，COM 与 yaw 跟随轨迹库
+    # 中某个材料节点的平面轨迹。库由对应源场景的无机器人自由演化录制，
+    # 因此配对 seed 下回放刚体的目标点运动学与形变场景逐点一致。
+    for source, bank in (
+        ("shape", "replay_src_shape_nominal_v1"),
+        ("combined", "replay_src_combined_l1_v1"),
+    ):
+        scenarios.append(_scenario(
+            f"id_rigid_replay_{source}_nominal",
+            ScenarioSplit.ID,
+            MotionType.RIGID,
+            amplitude=FactorLevel.NOMINAL,
+            frequency=FactorLevel.NOMINAL,
+            motion_profile_version="rigid_replay_v1",
+            replay_bank=bank,
+            description=(
+                f"Shape-frozen cable replaying a mid-cable material point "
+                f"trajectory recorded from the {source} scene; random "
+                f"global motion matched to deformation intensity."
+            ),
+            tags=("main_grid", "rigid_replay"),
+        ))
+
+    # 复杂初始形状静态场景：线缆按形变源轨迹库中配对 seed 的某个中间帧
+    # 构型初始化，之后无驱动；与 id_shape_nominal_current 同 seed 配对。
+    scenarios.append(_scenario(
+        "id_static_midshape_v1",
+        ScenarioSplit.ID,
+        MotionType.STATIC,
+        regularity=MotionRegularity.REGULAR,
+        initial_shape_bank="replay_src_shape_nominal_v1",
+        description=(
+            "Static scene whose initial cable shape is a mid-episode "
+            "snapshot sampled from the shape-deformation bank; seed-paired "
+            "with id_shape_nominal_current."
+        ),
+        tags=("motion_axis", "initial_shape"),
+    ))
+
+    # 25Hz learned-policy protocol variant: same midshape-initialisation
+    # semantics, bank recorded at control_dt=0.04 (frame_skip=20) so policy
+    # CLIs that pin the 25Hz cadence stay protocol-consistent.
+    scenarios.append(_scenario(
+        "id_static_midshape_25hz_v1",
+        ScenarioSplit.ID,
+        MotionType.STATIC,
+        regularity=MotionRegularity.REGULAR,
+        initial_shape_bank="replay_src_shape_nominal_25hz_v1",
+        description=(
+            "25Hz-control variant of id_static_midshape_v1 for "
+            "learned-policy CLIs pinned at frame_skip=20; seed-paired "
+            "with id_shape_nominal_current."
+        ),
+        tags=("motion_axis", "initial_shape"),
+    ))
+
+    # 25Hz learned-policy protocol variant: same replay semantics, bank
+    # recorded at control_dt=0.04 (frame_skip=20) so policy CLIs that pin
+    # the 25Hz cadence stay protocol-consistent.
+    scenarios.append(_scenario(
+        "id_rigid_replay_shape_nominal_25hz",
+        ScenarioSplit.ID,
+        MotionType.RIGID,
+        amplitude=FactorLevel.NOMINAL,
+        frequency=FactorLevel.NOMINAL,
+        motion_profile_version="rigid_replay_v1",
+        replay_bank="replay_src_shape_nominal_25hz_v1",
+        description=(
+            "Shape-frozen cable replaying a mid-cable material point "
+            "trajectory recorded from the shape scene at 25Hz control "
+            "(frame_skip=20); seed-paired with the learned-policy eval "
+            "seed bases."
+        ),
+        tags=("rigid_replay", "policy_eval"),
+    ))
+
+    # 复杂构型回放：冻结形状取自配对条目中间帧快照（与 id_static_midshape_v1
+    # 同种子同帧），刚体运动仍从 t=0 起沿配对条目完整回放。
+    for suffix, bank in (
+        ("v1", "replay_src_shape_nominal_v1"),
+        ("25hz", "replay_src_shape_nominal_25hz_v1"),
+    ):
+        scenarios.append(_scenario(
+            f"id_rigid_replay_midshape_{suffix}",
+            ScenarioSplit.ID,
+            MotionType.RIGID,
+            amplitude=FactorLevel.NOMINAL,
+            frequency=FactorLevel.NOMINAL,
+            motion_profile_version="rigid_replay_v1",
+            replay_bank=bank,
+            initial_shape_bank=bank,
+            description=(
+                "Midshape-frozen cable replaying the paired shape-source "
+                "entry from t=0; initial configuration is the same "
+                "mid-episode snapshot used by id_static_midshape_v1."
+            ),
+            tags=("rigid_replay", "initial_shape"),
+        ))
 
     scenarios.extend([
         _scenario(

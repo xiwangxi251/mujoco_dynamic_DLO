@@ -69,6 +69,7 @@ class ScenarioRegistryTests(unittest.TestCase):
             item.motion_profile_version in {
                 "rigid_level1_single_pass_v2",
                 "rigid_level2_single_pass_v2",
+                "rigid_replay_v1",
             }
             for item in rigid_scenarios
         ))
