@@ -14,6 +14,8 @@ import torch
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from torch import nn
 
+from ..perception.rendering import GripperVisibilityToggle
+
 
 @dataclass(frozen=True)
 class PointCloudObservationConfig:
@@ -28,6 +30,23 @@ class PointCloudObservationConfig:
     position_scale_m: float = 0.50
     hsv_lower: tuple[int, int, int] = (112, 180, 80)
     hsv_upper: tuple[int, int, int] = (130, 255, 255)
+    # normal：正常渲染；gripper_hidden：夹爪视觉组整体关闭的对抗事实渲染；
+    # mixed：每回合在两者间随机（训练增广，使两种观测都在分布内）。
+    render_mode: str = "normal"
+    # >0 时从观测云中删除距目标段中心该半径（米）内的所有点，
+    # 模拟「目标接触区域被前景遮挡」的部分可观测干预。0 = 关闭。
+    target_mask_radius_m: float = 0.0
+    # 深度相机噪声模型（深度域注入，反投影之前生效）：
+    #   depth_noise_std_at_1m：轴向高斯噪声系数 k，sigma = k * z^2（米），
+    #     对应结构光/双目相机的视差量化特性（Nguyen 2012 / Khoshelham 模型）
+    #   noise_episode_bias：sigma 的多大比例作为回合内固定偏置（模拟
+    #     传感器的固定模式噪声；剩余部分逐帧独立重采）
+    #   pixel_dropout_p：每个像素独立缺失返回的概率（holes）
+    #   frame_drop_p：每次计划采集整帧丢弃的概率（云保持上一帧不变）
+    depth_noise_std_at_1m: float = 0.0
+    noise_episode_bias: float = 0.5
+    pixel_dropout_p: float = 0.0
+    frame_drop_p: float = 0.0
 
     def __post_init__(self) -> None:
         if self.point_count < 32:
@@ -38,6 +57,20 @@ class PointCloudObservationConfig:
             raise ValueError("camera cadence and delay must be non-negative")
         if self.voxel_size_m <= 0.0 or self.position_scale_m <= 0.0:
             raise ValueError("point-cloud scales must be positive")
+        if self.render_mode not in {"normal", "gripper_hidden", "mixed"}:
+            raise ValueError(
+                "render_mode must be 'normal', 'gripper_hidden' or 'mixed'"
+            )
+        if not 0.0 <= self.target_mask_radius_m < 0.5:
+            raise ValueError("target_mask_radius_m must be in [0, 0.5)")
+        if not 0.0 <= self.depth_noise_std_at_1m < 1.0:
+            raise ValueError("depth_noise_std_at_1m must be in [0, 1)")
+        if not 0.0 <= self.noise_episode_bias <= 1.0:
+            raise ValueError("noise_episode_bias must be in [0, 1]")
+        if not 0.0 <= self.pixel_dropout_p < 1.0:
+            raise ValueError("pixel_dropout_p must be in [0, 1)")
+        if not 0.0 <= self.frame_drop_p < 1.0:
+            raise ValueError("frame_drop_p must be in [0, 1)")
 
 
 def camera_matrix(width: int, height: int, fovy_degrees: float) -> np.ndarray:
@@ -142,6 +175,14 @@ class DLOPointCloudObservation(gym.Wrapper):
         self._renderer = mujoco.Renderer(
             base.model, height=self.config.height, width=self.config.width
         )
+        self._gripper_visibility = GripperVisibilityToggle(base.model)
+        # 独立的渲染模式 Generator：mixed 增广抽签不消耗环境 rng，
+        # 不破坏配对 seed 下的物理抽签序列。
+        self._render_rng = np.random.default_rng(
+            (0 if base.config.seed is None else int(base.config.seed))
+            ^ 0x6A11C
+        )
+        self._active_render_mode = self.config.render_mode
         self._step_index = 0
         self._pending: deque[tuple[int, np.ndarray, float]] = deque()
         self._delivered_points = np.zeros(
@@ -151,6 +192,12 @@ class DLOPointCloudObservation(gym.Wrapper):
         self.last_capture_ms = 0.0
         self.last_raw_point_count = 0
         self.last_voxel_point_count = 0
+        self.last_masked_count = 0
+        # 深度噪声专用 Generator：按回合 episode_seed 播种——同 seed 的
+        # 配对格子（deform/replay）吃到逐位相同的噪声序列，噪声本身
+        # 不构成混杂变量；与 _render_rng 相互独立。
+        self._noise_rng = np.random.default_rng(0)
+        self._noise_bias: np.ndarray | None = None
         self.observation_space = gym.spaces.Dict(
             {
                 "points": gym.spaces.Box(
@@ -167,14 +214,28 @@ class DLOPointCloudObservation(gym.Wrapper):
 
     def _capture(self) -> tuple[np.ndarray, float]:
         started = perf_counter()
-        self._renderer.disable_depth_rendering()
-        self._renderer.update_scene(self._base.data, camera=self._camera_name)
-        rgb = self._renderer.render().copy()
-        self._renderer.enable_depth_rendering()
-        self._renderer.update_scene(self._base.data, camera=self._camera_name)
-        depth = self._renderer.render().copy()
-        self._renderer.disable_depth_rendering()
 
+        def _grab() -> tuple[np.ndarray, np.ndarray]:
+            self._renderer.disable_depth_rendering()
+            self._renderer.update_scene(
+                self._base.data, camera=self._camera_name
+            )
+            rgb = self._renderer.render().copy()
+            self._renderer.enable_depth_rendering()
+            self._renderer.update_scene(
+                self._base.data, camera=self._camera_name
+            )
+            depth = self._renderer.render().copy()
+            self._renderer.disable_depth_rendering()
+            return rgb, depth
+
+        if self._active_render_mode == "gripper_hidden":
+            with self._gripper_visibility.hidden():
+                rgb, depth = _grab()
+        else:
+            rgb, depth = _grab()
+
+        depth = self._corrupt_depth(depth)
         mask = segment_hsv(rgb, self.config.hsv_lower, self.config.hsv_upper)
         # Reject pixels whose depth is substantially behind another masked
         # sample in the same local cable neighbourhood.  These are raster
@@ -197,6 +258,14 @@ class DLOPointCloudObservation(gym.Wrapper):
             camera_points @ optical_to_world.T
             + self._base.data.cam_xpos[self._camera_id]
         )
+        if self.config.target_mask_radius_m > 0.0 and len(world_points):
+            target = np.asarray(self._base.target_position(), dtype=np.float64)
+            keep = (
+                np.linalg.norm(world_points - target, axis=1)
+                > self.config.target_mask_radius_m
+            )
+            world_points = world_points[keep]
+        self.last_masked_count = int(len(world_points))
         hand_position = self._base.hand_position.copy()
         hand_rotation = np.asarray(
             self._base.data.xmat[self._base.hand_id], dtype=np.float64
@@ -209,7 +278,45 @@ class DLOPointCloudObservation(gym.Wrapper):
         self.last_capture_ms = 1000.0 * (perf_counter() - started)
         return np.clip(points, -10.0, 10.0), fraction
 
+    def _corrupt_depth(self, depth: np.ndarray) -> np.ndarray:
+        """Inject depth-sensor noise in the depth domain, before backprojection.
+
+        模型组成（均只在有限深度像素上生效）：
+        - 轴向高斯噪声 sigma = k*z^2（结构光/双目视差量化的标准模型）；
+        - 回合内固定的逐像素偏置（noise_episode_bias 比例），模拟传感器
+          固定模式噪声——纯逐帧 iid 噪声会被策略时间平均掉，偏乐观；
+        - 逐像素独立缺失返回（holes → inf，与真实无效深度同路径）。
+        """
+        cfg = self.config
+        if cfg.depth_noise_std_at_1m <= 0.0 and cfg.pixel_dropout_p <= 0.0:
+            return depth
+        out = depth.astype(np.float64, copy=True)
+        finite = np.isfinite(out)
+        if cfg.depth_noise_std_at_1m > 0.0 and finite.any():
+            sigma = cfg.depth_noise_std_at_1m * np.square(out[finite])
+            if self._noise_bias is None:
+                self._noise_bias = np.zeros_like(out)
+                self._noise_bias[finite] = self._noise_rng.normal(
+                    0.0, cfg.noise_episode_bias * sigma
+                )
+            jitter = self._noise_rng.normal(
+                0.0, (1.0 - cfg.noise_episode_bias) * sigma
+            )
+            noisy = out[finite] + self._noise_bias[finite] + jitter
+            out[finite] = np.clip(noisy, 1e-4, None)
+        if cfg.pixel_dropout_p > 0.0:
+            drop = self._noise_rng.random(out.shape) < cfg.pixel_dropout_p
+            out[drop] = np.inf
+        return out.astype(np.float32)
+
     def _queue_capture(self, *, immediate: bool = False) -> None:
+        # 整帧丢帧：传感器本次采集失败，交付云保持上一帧不变。
+        if (
+            not immediate
+            and self.config.frame_drop_p > 0.0
+            and self._noise_rng.random() < self.config.frame_drop_p
+        ):
+            return
         points, fraction = self._capture()
         available_step = (
             self._step_index
@@ -236,6 +343,21 @@ class DLOPointCloudObservation(gym.Wrapper):
 
     def reset(self, **kwargs):
         state_observation, info = self.env.reset(**kwargs)
+        if self.config.render_mode == "mixed":
+            self._active_render_mode = (
+                "gripper_hidden"
+                if int(self._render_rng.integers(0, 2)) == 1
+                else "normal"
+            )
+        else:
+            self._active_render_mode = self.config.render_mode
+        # 每回合重播噪声种子：episode_seed 决定本回合的噪声流，
+        # 配对评估里 deform/replay 两格用同一 seed → 相同噪声轨迹。
+        episode_seed = getattr(self._base, "episode_seed", None)
+        self._noise_rng = np.random.default_rng(
+            (0 if episode_seed is None else int(episode_seed)) ^ 0x9E3779
+        )
+        self._noise_bias = None
         self._step_index = 0
         self._pending.clear()
         self._queue_capture(immediate=True)
@@ -266,6 +388,10 @@ class DLOPointCloudObservation(gym.Wrapper):
             "pointcloud_raw_count": self.last_raw_point_count,
             "pointcloud_voxel_count": self.last_voxel_point_count,
             "pointcloud_unique_fraction": self._delivered_fraction,
+            "pointcloud_masked_count": self.last_masked_count,
+            "pointcloud_gripper_hidden": int(
+                self._active_render_mode == "gripper_hidden"
+            ),
         }
 
     def set_training_scenario_distribution(

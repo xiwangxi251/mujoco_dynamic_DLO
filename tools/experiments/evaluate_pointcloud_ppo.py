@@ -61,6 +61,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers-per-scenario", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20270915)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--scenarios",
+        default=None,
+        help="comma-separated scenario list; defaults to SCENARIOS",
+    )
+    parser.add_argument(
+        "--render-mode",
+        choices=("normal", "gripper_hidden", "mixed"),
+        default="mixed",
+        help="pointcloud gripper render mode; use mixed to match training",
+    )
     parser.add_argument("--disable-table-finger-collision-filter", action="store_true")
     return parser.parse_args()
 
@@ -75,10 +86,16 @@ def main() -> None:
         camera_update_steps=5,
         sensor_delay_steps=3,
         voxel_size_m=0.002,
+        render_mode=args.render_mode,
+    )
+    scenarios = (
+        tuple(s.strip() for s in args.scenarios.split(",") if s.strip())
+        if args.scenarios
+        else SCENARIOS
     )
     worker_scenarios = tuple(
         scenario
-        for scenario in SCENARIOS
+        for scenario in scenarios
         for _ in range(args.workers_per_scenario)
     )
     factories = [
@@ -94,10 +111,10 @@ def main() -> None:
     model = PPO.load(args.model, device=args.device)
     observations = env.reset()
     records: dict[str, list[dict[str, float | int | bool]]] = {
-        scenario: [] for scenario in SCENARIOS
+        scenario: [] for scenario in scenarios
     }
     completed = 0
-    target = args.episodes * len(SCENARIOS)
+    target = args.episodes * len(scenarios)
     try:
         while completed < target:
             actions, _ = model.predict(observations, deterministic=True)
@@ -111,6 +128,8 @@ def main() -> None:
                 info = infos[rank]
                 record = {
                     "episode": len(records[scenario]) + 1,
+                    "episode_seed": info.get("episode_seed"),
+                    "replay_entry_seed": info.get("replay_entry_seed"),
                     "success": bool(info.get("success", False)),
                     "strict_success": bool(info.get("strict_success", False)),
                     "pinch": bool(info.get("ever_pinched", False)),
@@ -138,7 +157,7 @@ def main() -> None:
         "loaded_lift",
         "grasp",
     )
-    for scenario in SCENARIOS:
+    for scenario in scenarios:
         episodes = records[scenario]
         row: dict[str, str | int | float] = {
             "scenario": scenario,
