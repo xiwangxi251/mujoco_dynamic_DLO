@@ -72,6 +72,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prediction-horizon", type=int)
     parser.add_argument("--action-horizon", type=int)
     parser.add_argument("--inference-steps", type=int)
+    parser.add_argument("--image-height", type=int)
+    parser.add_argument("--image-width", type=int)
+    parser.add_argument("--crop-height", type=int)
+    parser.add_argument("--crop-width", type=int)
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=20260804)
@@ -105,6 +109,7 @@ def _config_from_args(args: argparse.Namespace):
     for key in (
         "epochs", "batch_size", "learning_rate", "observation_horizon",
         "prediction_horizon", "action_horizon", "inference_steps", "num_workers",
+        "image_height", "image_width", "crop_height", "crop_width",
     ):
         value = getattr(args, key)
         if value is not None:

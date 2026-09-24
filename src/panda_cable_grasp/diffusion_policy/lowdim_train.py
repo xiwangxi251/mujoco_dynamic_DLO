@@ -41,6 +41,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
+        "--resume", type=Path,
+        help="initialize model and EMA weights from a previous checkpoint",
+    )
+    parser.add_argument(
         "--action-cache", type=Path,
         help="LeRobot action cache for raw privileged NPZ input; not needed for NERO success-prefix input",
     )
@@ -241,7 +245,18 @@ def train(args: argparse.Namespace) -> Path:
 
     device = torch.device(args.device)
     model = LowDimDiffusionPolicy(config).to(device)
+    resume_payload = None
+    if args.resume is not None:
+        resume_payload = torch.load(args.resume, map_location=device, weights_only=False)
+        if resume_payload.get("format") != "panda_cable_lowdim_diffusion_policy_v1":
+            raise ValueError(f"unsupported resume checkpoint: {args.resume}")
+        model.load_state_dict(resume_payload["model"])
     ema = ExponentialMovingAverage(model)
+    if resume_payload is not None and resume_payload.get("ema_model") is not None:
+        ema.shadow = {
+            name: value.detach().clone().to(device)
+            for name, value in resume_payload["ema_model"].items()
+        }
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )

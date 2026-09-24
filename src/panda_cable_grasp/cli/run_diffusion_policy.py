@@ -42,6 +42,15 @@ def parse_args() -> argparse.Namespace:
         "--headless", action="store_true",
         help="accepted for CLI compatibility; evaluation is always offscreen",
     )
+    parser.add_argument(
+        "--rigid-speed", type=float, default=None,
+        help="override rigid_motion_nominal_speed (m/s); 0 freezes the sweep "
+             "while keeping the rigid start-line initialization",
+    )
+    parser.add_argument(
+        "--rigid-contact-only", action="store_true",
+        help="apply rigid-motion drive only to cable nodes touching the table",
+    )
     parser.add_argument("--no-recording", action="store_true")
     args = parser.parse_args()
     if not args.model.is_file():
@@ -72,14 +81,16 @@ def run(args: argparse.Namespace) -> Path:
     config = env_config_for_scenario(
         scenario, seed=args.seed, episode_seconds=args.episode_seconds
     )
-    config = EnvConfig(
-        **{
-            **vars(config),
-            "frame_skip": 20,
-            "dynamicvla_cameras_enabled": True,
-            "robot": args.robot,
-        }
-    )
+    overrides = {
+        "frame_skip": 20,
+        "dynamicvla_cameras_enabled": True,
+        "robot": args.robot,
+    }
+    if args.rigid_speed is not None:
+        overrides["rigid_motion_nominal_speed"] = args.rigid_speed
+    if args.rigid_contact_only:
+        overrides["rigid_motion_contact_only"] = True
+    config = EnvConfig(**{**vars(config), **overrides})
     env = CableGraspEnv(config)
     run_name = args.run_name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
     run_dir = args.video_dir.expanduser().resolve() / run_name
@@ -195,6 +206,8 @@ def run(args: argparse.Namespace) -> Path:
             "state": "observation.state.end_effector.pos + quat(wxyz)",
         },
         "action": "absolute_xyz_quaternion_wxyz_gripper_through_dynamicvla_ik",
+        "rigid_motion_nominal_speed": config.rigid_motion_nominal_speed,
+        "rigid_motion_contact_only": config.rigid_motion_contact_only,
         "diffusion_inference_steps": policy.config.inference_steps,
         "robot": env.robot,
         "compiled_model": str(compiled_model.resolve()),
