@@ -15,3 +15,7 @@ benchmark_runs/
 dynamicvla_model_outputs/
 .venv/
 /outputs/
+logs/
+tmp_upload/
+*.bak_*
+nul
