@@ -66,6 +66,8 @@ def run_headless(args: argparse.Namespace) -> None:
         episode_seconds=args.episode_seconds,
         scenario_workers=args.scenario_workers,
         envs_per_scenario=args.envs_per_scenario,
+        strict_vertical_gripper=args.strict_vertical_gripper,
+        strict_vertical_tolerance=args.strict_vertical_tolerance,
         workers=args.workers,
         recording=True,
         video_fps=args.video_fps,
@@ -196,6 +198,18 @@ def parse_args() -> argparse.Namespace:
         help="headless benchmark output root",
     )
     parser.add_argument("--run-name")
+    parser.add_argument(
+        "--strict-vertical-gripper",
+        action="store_true",
+        help="halt translation and prioritize orientation when tilt exceeds "
+        "the strict tolerance (prevents IK wrist-flip on edge targets)",
+    )
+    parser.add_argument(
+        "--strict-vertical-tolerance",
+        type=float,
+        default=0.35,
+        help="tilt threshold in radians for --strict-vertical-gripper",
+    )
     parser.add_argument("--video-fps", type=float, default=DEFAULT_VIDEO_FPS)
     parser.add_argument("--scenario-workers", type=int, default=1)
     parser.add_argument("--envs-per-scenario", type=int, default=1)

@@ -133,6 +133,9 @@ def _scripted_policy_config(options: Any) -> PolicyConfig:
 
     kwargs: dict[str, Any] = {
         "strict_vertical_gripper": bool(option("strict_vertical_gripper", False)),
+        "strict_vertical_tolerance": float(
+            option("strict_vertical_tolerance", 0.35)
+        ),
     }
     for name in ("prediction_horizon", "approach_prediction_horizon"):
         value = option(name)
