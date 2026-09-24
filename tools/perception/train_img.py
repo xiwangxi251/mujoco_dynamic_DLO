@@ -100,7 +100,7 @@ def hist_occ_channels(hist_pts, ds):
 
 def corrupt_prev(
     pm: torch.Tensor, has_prev: torch.Tensor,
-    flip_p: float = 0.25, shift: int = 3, drop_p: float = 0.05,
+    flip_p: float = 0.15, shift: int = 3, drop_p: float = 0.05,
 ) -> torch.Tensor:
     """Training-time corruption of prev (mask,s,z) maps: simulates
     self-feedback error so the model cannot blindly copy history.

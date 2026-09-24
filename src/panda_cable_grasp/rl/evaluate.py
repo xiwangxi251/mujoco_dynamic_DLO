@@ -856,12 +856,14 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         scenario_names=args.scenario_names,
         dynamicvla_cameras_enabled=True,
         geometric_safety_enabled=args.geometric_safety,
+        frame_skip=getattr(args, "frame_skip", None),
         rl_config=RLConfig(
             singularity_avoidance_enabled=(
                 not args.disable_singularity_avoidance
             )
         ),
     )
+
 
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
     output_dir = args.video_dir / run_name
@@ -1290,12 +1292,14 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         scenario_names=args.scenario_names,
         dynamicvla_cameras_enabled=True,
         geometric_safety_enabled=args.geometric_safety,
+        frame_skip=getattr(args, "frame_skip", None),
         rl_config=RLConfig(
             singularity_avoidance_enabled=(
                 not args.disable_singularity_avoidance
             )
         ),
     )
+
     observation, info = env.reset(seed=args.seed)
     episode = 1
     episode_return = 0.0
@@ -1396,6 +1400,12 @@ def parse_args() -> argparse.Namespace:
             "disable the soft task-space IK singularity/joint-limit guard "
             "without changing episode termination"
         ),
+    )
+    parser.add_argument(
+        "--frame-skip",
+        type=int,
+        default=None,
+        help="override env frame_skip (control substeps) for replay scenarios",
     )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument(

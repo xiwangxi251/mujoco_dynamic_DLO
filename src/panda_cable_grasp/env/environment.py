@@ -317,16 +317,21 @@ class EnvConfig:
     # 传送带模式：整体运动的驱动力只作用于与桌面接触的线缆节点，
     # 被夹起/悬空的节点不再受虚拟体积力驱动（视觉上更像传送带带动）。
     rigid_motion_contact_only: bool = False
+    # 初始线缆朝向偏置（度）：0=模型默认（缆主轴沿世界X轴），90=横向（沿Y）。
+    # 作用于初始形状生成；L1/L2 驱动的 yaw 伺服在 spawn 朝向之上叠加
+    # 其 24° 旋转剖面，即缆全程保持偏置后的横向进入工作区。
+    initial_cable_yaw_deg: float = 0.0
 
     # rigid_replay_v1：轨迹库名解析为 <replay_bank_dir>/<replay_bank>.npz；
-    # 库中按 seed 索引的无机器人自由演化轨迹提供整缆刚性运动参考。
+    # 回放线缆保持初始形状，COM 与 yaw 跟随所选材料节点的记录轨迹。
     replay_bank: str | None = None
     replay_bank_dir: str | None = None   # None -> output_path("motion_banks")
     replay_seed_fallback: str = "resample"  # resample / error：seed 不在库中时的行为
 
     # initial_shape_bank：从同格式轨迹库取一个中间帧构型作为本回合
-    # 初始线缆形状（场景内无驱动）。与 rigid_replay_v1 的 replay_bank
-    # 互斥；initial_shape_time_range 为快照时刻在有效步数内的采样比例。
+    # 初始线缆形状（场景内无驱动）。与 rigid_replay_v1 联用时必须等于
+    # replay_bank（midshape 回放：冻结快照与回放运动同源）；
+    # initial_shape_time_range 为快照时刻在有效步数内的采样比例。
     initial_shape_bank: str | None = None
     initial_shape_time_range: tuple[float, float] = (0.30, 0.70)
 
@@ -518,9 +523,14 @@ class EnvConfig:
                 "replay_seed_fallback must be 'resample' or 'error'"
             )
         if self.initial_shape_bank is not None:
-            if uses_replay:
+            if (
+                self.motion_profile_version == REPLAY_MOTION_PROFILE
+                and self.initial_shape_bank != self.replay_bank
+            ):
                 raise ValueError(
-                    "initial_shape_bank conflicts with rigid_replay_v1"
+                    "initial_shape_bank with rigid_replay_v1 must equal "
+                    "replay_bank so the frozen shape snapshot and the "
+                    "replayed motion come from the same source episode"
                 )
             if self.n_objects != 1 or self.object_family != "cable":
                 raise ValueError(
@@ -1565,6 +1575,9 @@ class CableGraspEnv:
         self._physics_steps = 0
         self._velocity_guard_steps = 0
         self._actual_velocity_exceedance_steps = 0
+        self._physics_velocity_limit_steps = 0
+        self._physics_velocity_fence_steps = 0
+        self._physics_velocity_fence_dof_steps = 0
         self._max_abs_actual_arm_velocity = np.zeros(7)
         self._max_abs_pre_limit_arm_velocity = np.zeros(7)
         self._max_actual_hand_linear_speed = 0.0
@@ -1671,20 +1684,32 @@ class CableGraspEnv:
         bank.check_compatible(np.asarray(self.cable_ids), control_dt)
         return bank
 
-    def _prepare_initial_shape(self) -> None:
+    def _prepare_initial_shape(
+        self, entry: int | None = None,
+    ) -> None:
         """从形变轨迹库取一个中间帧构型作为本回合初始形状。
 
         显式 seed 命中库时与同 seed 源回合配对；未命中按
         ``replay_seed_fallback`` 重抽或报错。快照时刻在有效区间的
         ``initial_shape_time_range`` 比例内由独立 Generator 采样，
         不消耗 ``self.rng``，保证与配对场景共享同一抽签序列。
+        ``entry`` 非空时直接使用给定条目（midshape 回放用来把冻结
+        快照钉到与回放运动同一源条目）。
         """
         bank = self._load_initial_shape_bank()
-        entry = (
-            None
-            if self.episode_seed is None
-            else bank.index_for_seed(self.episode_seed)
-        )
+        if entry is not None:
+            entry = int(entry)
+            if not 0 <= entry < bank.entry_count:
+                raise IndexError(
+                    f"initial shape entry {entry} out of range for bank "
+                    f"{self.config.initial_shape_bank!r}"
+                )
+        else:
+            entry = (
+                None
+                if self.episode_seed is None
+                else bank.index_for_seed(self.episode_seed)
+            )
         if entry is None:
             if (
                 self.episode_seed is not None
@@ -1810,6 +1835,10 @@ class CableGraspEnv:
             # 选择过程只使用独立 Generator，不消耗 self.rng，保证同 seed 下
             # 与形变场景的初始曲线/目标索引抽签序列完全一致。
             self._prepare_replay_entry()
+            if self._uses_initial_shape_bank:
+                # 回放+复杂构型：冻结形状取自同一回放条目的中间帧快照，
+                # 运动仍按 t=0 起完整回放（delta 相对量，与快照来源帧无关）。
+                self._prepare_initial_shape(entry=self._replay_entry)
         elif self._uses_initial_shape_bank:
             # 同回放路径：条目/时刻的抽取只用独立 Generator，不扰动 self.rng。
             self._prepare_initial_shape()
@@ -2000,6 +2029,9 @@ class CableGraspEnv:
         self._physics_steps = 0
         self._velocity_guard_steps = 0
         self._actual_velocity_exceedance_steps = 0
+        self._physics_velocity_limit_steps = 0
+        self._physics_velocity_fence_steps = 0
+        self._physics_velocity_fence_dof_steps = 0
         self._geometric_safety_filter_count = 0
         self._geometric_safety_fence_steps = 0
         self._geometric_safety_filter.total_probe_count = 0
@@ -2675,6 +2707,17 @@ class CableGraspEnv:
                 self._actual_velocity_exceedance_steps
                 / physics_step_denominator
             ),
+            "physics_velocity_limiter_ratio": (
+                self._physics_velocity_limit_steps
+                / physics_step_denominator
+            ),
+            "physics_velocity_fence_ratio": (
+                self._physics_velocity_fence_steps
+                / physics_step_denominator
+            ),
+            "physics_velocity_fence_dof_steps": (
+                self._physics_velocity_fence_dof_steps
+            ),
             "geometric_safety_enabled": self.config.geometric_safety_enabled,
             "geometric_safety_geom_count": len(self.geometric_safety_geom_ids),
             "geometric_safety_filter_count": self._geometric_safety_filter_count,
@@ -3096,6 +3139,11 @@ class CableGraspEnv:
             obj.rotation_sign = rotation_sign
             obj.initial_tangent_angles = tangents
         else:
+            # 单线缆路径：可选的整体朝向偏置（initial_cable_yaw_deg），
+            # 多对象场景不套用——各对象朝向由布局/步态航向决定。
+            tangents = tangents + math.radians(
+                self.config.initial_cable_yaw_deg
+            )
             self._rigid_initial_shape_family = family
             self._rigid_motion_rotation_sign = rotation_sign
             self._rigid_initial_tangent_angles[:tangents.size] = tangents

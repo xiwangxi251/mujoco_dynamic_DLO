@@ -267,9 +267,17 @@ class ScenarioConfig:
                 raise ValueError(
                     "initial_shape_bank must be a lowercase identifier"
                 )
-            if self.motion_type is not MotionType.STATIC:
+            if self.motion_profile_version == "rigid_replay_v1":
+                if self.initial_shape_bank != self.replay_bank:
+                    raise ValueError(
+                        "initial_shape_bank with rigid_replay_v1 must equal "
+                        "replay_bank so the frozen shape snapshot and the "
+                        "replayed motion share one source episode"
+                    )
+            elif self.motion_type is not MotionType.STATIC:
                 raise ValueError(
-                    "initial_shape_bank is only valid for static scenarios"
+                    "initial_shape_bank is only valid for static or "
+                    "rigid_replay_v1 scenarios"
                 )
         if not isinstance(self.cable_material_profile, str) or not _NAME_PATTERN.fullmatch(
             self.cable_material_profile
@@ -909,6 +917,23 @@ def _registered_scenarios() -> list[ScenarioConfig]:
         tags=("motion_axis", "initial_shape"),
     ))
 
+    # 25Hz learned-policy protocol variant: same midshape-initialisation
+    # semantics, bank recorded at control_dt=0.04 (frame_skip=20) so policy
+    # CLIs that pin the 25Hz cadence stay protocol-consistent.
+    scenarios.append(_scenario(
+        "id_static_midshape_25hz_v1",
+        ScenarioSplit.ID,
+        MotionType.STATIC,
+        regularity=MotionRegularity.REGULAR,
+        initial_shape_bank="replay_src_shape_nominal_25hz_v1",
+        description=(
+            "25Hz-control variant of id_static_midshape_v1 for "
+            "learned-policy CLIs pinned at frame_skip=20; seed-paired "
+            "with id_shape_nominal_current."
+        ),
+        tags=("motion_axis", "initial_shape"),
+    ))
+
     # 25Hz learned-policy protocol variant: same replay semantics, bank
     # recorded at control_dt=0.04 (frame_skip=20) so policy CLIs that pin
     # the 25Hz cadence stay protocol-consistent.
@@ -928,6 +953,29 @@ def _registered_scenarios() -> list[ScenarioConfig]:
         ),
         tags=("rigid_replay", "policy_eval"),
     ))
+
+    # 复杂构型回放：冻结形状取自配对条目中间帧快照（与 id_static_midshape_v1
+    # 同种子同帧），刚体运动仍从 t=0 起沿配对条目完整回放。
+    for suffix, bank in (
+        ("v1", "replay_src_shape_nominal_v1"),
+        ("25hz", "replay_src_shape_nominal_25hz_v1"),
+    ):
+        scenarios.append(_scenario(
+            f"id_rigid_replay_midshape_{suffix}",
+            ScenarioSplit.ID,
+            MotionType.RIGID,
+            amplitude=FactorLevel.NOMINAL,
+            frequency=FactorLevel.NOMINAL,
+            motion_profile_version="rigid_replay_v1",
+            replay_bank=bank,
+            initial_shape_bank=bank,
+            description=(
+                "Midshape-frozen cable replaying the paired shape-source "
+                "entry from t=0; initial configuration is the same "
+                "mid-episode snapshot used by id_static_midshape_v1."
+            ),
+            tags=("rigid_replay", "initial_shape"),
+        ))
 
     scenarios.extend([
         _scenario(

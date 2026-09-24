@@ -408,6 +408,66 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
+    def test_low_level_guard_does_not_derate_dynamicvla_limit(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1007)
+            action = env.ready_ctrl.copy()
+            action[0] += 0.2
+            env.data.qvel[env.arm_dof_adr[0]] = (
+                0.99 * env._arm_velocity_limits[0]
+            )
+            original_jacobian = env._hand_jacobian
+            env._hand_jacobian = lambda: (
+                np.zeros((3, env.model.nv)),
+                np.zeros((3, env.model.nv)),
+            )
+            try:
+                guarded, active = env._velocity_guarded_action(action)
+            finally:
+                env._hand_jacobian = original_jacobian
+            self.assertFalse(active)
+            self.assertGreater(
+                guarded[0], env.data.qpos[env.arm_qpos_adr[0]]
+            )
+        finally:
+            del env
+
+    def test_low_level_guard_brakes_on_cartesian_speed(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.config.hand_cartesian_velocity_limit_enabled = True
+            env.reset(randomize=False, seed=1008)
+            action = env.ready_ctrl.copy()
+            action[:7] += 0.05
+            original_velocity = np.zeros(7)
+            original_velocity[4] = env._arm_velocity_limits[4] * 0.70
+            env.data.qvel[env.arm_dof_adr] = original_velocity
+
+            original_jacobian = env._hand_jacobian
+            env._hand_jacobian = lambda: (
+                np.zeros((3, env.model.nv)),
+                np.vstack((
+                    np.zeros(env.model.nv),
+                    np.zeros(env.model.nv),
+                    np.eye(1, env.model.nv, env.arm_dof_adr[4])[0] * 2.0,
+                )),
+            )
+            try:
+                guarded, active = env._velocity_guarded_action(action)
+            finally:
+                env._hand_jacobian = original_jacobian
+
+            self.assertTrue(active)
+            self.assertTrue(np.array_equal(
+                guarded[:7], env.data.qpos[env.arm_qpos_adr]
+            ))
+            self.assertTrue(np.array_equal(
+                env.data.qvel[env.arm_dof_adr], original_velocity
+            ))
+        finally:
+            del env
+
     def test_unconfirmed_grasp_tolerates_brief_candidate_dropout(self) -> None:
         env = self.make("id_static")
         try:

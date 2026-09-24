@@ -41,6 +41,7 @@ ALL_SCENARIOS = (
     "id_rigid_l1_nominal",
     "id_shape_nominal_current",
     "id_combined_l1_nominal",
+    "id_rigid_replay_shape_nominal",
 )
 VARIANTS = ("scripted", "expert")
 BASE_NOMINAL = 0.20
