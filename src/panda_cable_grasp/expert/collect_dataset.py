@@ -350,6 +350,14 @@ def _collect_attempt(
         "policy_result": policy.result,
         "termination_reason": termination_reason or "",
         "strict_success": policy.result == "success",
+        # Dataset acceptance: the policy state machine itself must finish with a
+        # success verdict, in a single attempt (no failed-attempt retries).
+        "clean_demo": bool(
+            policy.finished
+            and policy.result == "success"
+            and int(getattr(policy, "retry_count", 0)) == 0
+            and int(getattr(policy, "attempt_failure_count", 0)) == 0
+        ),
         **policy.expert_info(),
     })
     metadata = {
@@ -362,6 +370,7 @@ def _collect_attempt(
         "final_info": info,
         "policy_result": policy.result,
         "termination_reason": termination_reason,
+        "clean_demo": row["clean_demo"],
         "motion_profile_hash": env.motion_profile_hash,
         "expert": policy.expert_info(),
         "camera_rig": {
@@ -568,7 +577,7 @@ def _collect_scenario_worker(
                 scenario_dir=scenario_dir,
             )
             row["worker_id"] = job.worker_id
-            if row["strict_success"]:
+            if row["clean_demo"]:
                 successes += 1
                 _save_successful_episode(
                     scenario_dir=scenario_dir,

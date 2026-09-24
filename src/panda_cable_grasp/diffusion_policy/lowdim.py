@@ -167,6 +167,10 @@ def _replay_nero_success_prefix_features(
         )
 
     scenario_name = str(entry["scenario"])
+    if scenario_name == "id_rigid_replay_midshape_v1":
+        scenario_name = "id_rigid_replay_midshape_25hz"
+    elif scenario_name == "id_rigid_replay_shape_nominal":
+        scenario_name = "id_rigid_replay_shape_nominal_25hz"
     seed = int(entry["seed"])
     env_config = env_config_for_scenario(
         get_scenario(scenario_name),

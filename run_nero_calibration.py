@@ -41,6 +41,7 @@ ALL_SCENARIOS = (
     "id_rigid_l1_nominal",
     "id_shape_nominal_current",
     "id_combined_l1_nominal",
+    "id_rigid_replay_shape_nominal",
 )
 VARIANTS = ("scripted", "expert")
 BASE_NOMINAL = 0.20
@@ -363,6 +364,7 @@ def run_episode(
             recorder.capture_initial()
         steps = 0
         termination_reason: str | None = None
+        truncated = False
         tracking_error_sum = 0.0
         tracking_error_count = 0
         max_tracking_error = 0.0
@@ -387,6 +389,17 @@ def run_episode(
                     )
                 policy.finished = True
         expert_info = policy.expert_info() if hasattr(policy, "expert_info") else {}
+        retry_count = int(getattr(policy, "retry_count", 0))
+        attempt_failure_count = int(getattr(policy, "attempt_failure_count", 0))
+        # env.ever_success only latches the physical predicate; a dataset-worthy
+        # demonstration additionally requires the policy state machine to have
+        # completed with a success verdict, no truncation, and a single attempt.
+        policy_success = bool(
+            policy.finished and policy.result == "success" and not truncated
+        )
+        clean_demo = bool(
+            policy_success and retry_count == 0 and attempt_failure_count == 0
+        )
         row = {
             "calibration": label,
             "base_x": float(base_x),
@@ -396,7 +409,9 @@ def run_episode(
             "scenario": scenario_name,
             "variant": variant,
             "seed": seed,
-            "success": bool(env.ever_success),
+            "success": policy_success,
+            "env_ever_success": bool(env.ever_success),
+            "clean_demo": clean_demo,
             "outcome": outcome(env),
             "ever_bilateral_candidate": bool(env.ever_bilateral_candidate),
             "ever_confirmed_grasp": bool(env.ever_confirmed_grasp),
@@ -416,7 +431,7 @@ def run_episode(
             **expert_info,
         }
         if recorder is not None:
-            if trajectory_only and success_only and not bool(row["success"]):
+            if trajectory_only and success_only and not bool(row["clean_demo"]):
                 # Trajectory samples stay in memory until the outcome is known;
                 # failed attempts therefore do not incur NPZ write/delete I/O.
                 recorder.discard()
@@ -444,7 +459,7 @@ def run_episode(
                     "trajectory": str(artifacts.trajectory.resolve()),
                     "video_metadata": str(artifacts.metadata.resolve()),
                 })
-                if success_only and not bool(row["success"]):
+                if success_only and not bool(row["clean_demo"]):
                     # Keep the attempt outcome in episodes.csv, but do not make
                     # failed attempts part of the trajectory/video dataset.
                     for field in (
@@ -463,10 +478,59 @@ def run_episode(
         env.close()
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade legacy rows whose ``success`` field meant ``env.ever_success``.
+
+    Dataset acceptance is the strict policy verdict: the state machine finished
+    with ``result == "success"``, without truncation, in a single attempt.
+    """
+
+    if "env_ever_success" not in row:
+        row["env_ever_success"] = _as_bool(row.get("success"))
+    else:
+        row["env_ever_success"] = _as_bool(row["env_ever_success"])
+    if "success" not in row or "clean_demo" not in row:
+        policy_success = (
+            str(row.get("policy_result") or "") == "success"
+            and not str(row.get("termination_reason") or "").strip()
+        )
+        row["success"] = policy_success
+        row["clean_demo"] = bool(
+            policy_success
+            and _as_int(row.get("retry_count")) == 0
+            and _as_int(row.get("attempt_failure_count")) == 0
+        )
+    else:
+        row["success"] = _as_bool(row["success"])
+        row["clean_demo"] = _as_bool(row["clean_demo"])
+    return row
+
+
 def load_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    bool_fields = {"success", "ever_bilateral_candidate", "ever_confirmed_grasp"}
+    bool_fields = {
+        "success",
+        "env_ever_success",
+        "clean_demo",
+        "ever_bilateral_candidate",
+        "ever_confirmed_grasp",
+    }
     rows: list[dict[str, Any]] = []
     with path.open("r", newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
@@ -476,7 +540,7 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
             for field in ("seed",):
                 if field in row:
                     row[field] = int(row[field])
-            rows.append(row)
+            rows.append(_normalize_row(row))
     return rows
 
 
@@ -508,9 +572,11 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     for row in rows:
         outcomes[str(row["outcome"])] = outcomes.get(str(row["outcome"]), 0) + 1
     successes = sum(bool(row["success"]) for row in rows)
+    clean_demos = sum(bool(row.get("clean_demo", False)) for row in rows)
     return {
         "episodes": len(rows),
         "successes": successes,
+        "clean_demos": clean_demos,
         "success_rate": successes / len(rows) if rows else 0.0,
         "bilateral_candidates": sum(
             bool(row["ever_bilateral_candidate"]) for row in rows
@@ -544,7 +610,7 @@ def run_cell(job: dict[str, Any]) -> dict[str, Any]:
     else:
         attempt_limit = int(max_attempts)
         target_successes = int(target_successes)
-    successful_rows = sum(bool(row.get("success", False)) for row in rows)
+    successful_rows = sum(bool(row.get("clean_demo", False)) for row in rows)
     for offset in range(attempt_limit):
         if target_successes is not None and successful_rows >= target_successes:
             break
@@ -577,7 +643,7 @@ def run_cell(job: dict[str, Any]) -> dict[str, Any]:
             bool(job.get("trajectory_only", False)),
         )
         rows.append(row)
-        if bool(row.get("success", False)):
+        if bool(row.get("clean_demo", False)):
             successful_rows += 1
         append_checkpoint(checkpoint, row)
     rows.sort(key=lambda row: int(row["seed"]))

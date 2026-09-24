@@ -133,6 +133,9 @@ def _scripted_policy_config(options: Any) -> PolicyConfig:
 
     kwargs: dict[str, Any] = {
         "strict_vertical_gripper": bool(option("strict_vertical_gripper", False)),
+        "strict_vertical_tolerance": float(
+            option("strict_vertical_tolerance", 0.35)
+        ),
     }
     for name in ("prediction_horizon", "approach_prediction_horizon"):
         value = option(name)
@@ -383,15 +386,6 @@ def _base_row(
         )),
         "max_pre_limit_hand_angular_speed": float(info.get(
             "max_pre_limit_hand_angular_speed", 0.0
-        )),
-        "physics_velocity_limiter_ratio": float(info.get(
-            "physics_velocity_limiter_ratio", 0.0
-        )),
-        "physics_velocity_fence_ratio": float(info.get(
-            "physics_velocity_fence_ratio", 0.0
-        )),
-        "physics_velocity_fence_dof_steps": int(info.get(
-            "physics_velocity_fence_dof_steps", 0
         )),
     }
     row["task_failure_type"] = classify_task_outcome(

@@ -72,6 +72,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prediction-horizon", type=int)
     parser.add_argument("--action-horizon", type=int)
     parser.add_argument("--inference-steps", type=int)
+    parser.add_argument("--image-height", type=int)
+    parser.add_argument("--image-width", type=int)
+    parser.add_argument("--crop-height", type=int)
+    parser.add_argument("--crop-width", type=int)
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=20260804)
@@ -105,6 +109,7 @@ def _config_from_args(args: argparse.Namespace):
     for key in (
         "epochs", "batch_size", "learning_rate", "observation_horizon",
         "prediction_horizon", "action_horizon", "inference_steps", "num_workers",
+        "image_height", "image_width", "crop_height", "crop_width",
     ):
         value = getattr(args, key)
         if value is not None:
@@ -292,8 +297,8 @@ def train(args: argparse.Namespace) -> Path:
             "action_low": train_dataset.action_low.tolist(),
             "action_high": train_dataset.action_high.tolist(),
             "action_source": "dynamicvla_parquet" if uses_dynamicvla_data else args.action_source,
-            "state_format": getattr(train_dataset, "state_format", "absolute_xyz_quaternion_wxyz"),
-            "action_format": getattr(train_dataset, "action_format", "absolute_xyz_quaternion_wxyz_gripper"),
+            "state_format": getattr(train_dataset, "state_format", "dynamicvla_absolute_xyz_euler_xyz"),
+            "action_format": getattr(train_dataset, "action_format", "dynamicvla_chunk_delta_xyz_euler_xyz_gripper"),
             "gripper_threshold": args.gripper_threshold,
             "epoch": epoch,
             "global_step": global_step,
@@ -396,8 +401,8 @@ def train(args: argparse.Namespace) -> Path:
             "gripper_threshold": args.gripper_threshold,
             "max_steps": args.max_steps,
             "resume_checkpoint": None if args.resume is None else str(args.resume.resolve()),
-            "state_format": getattr(train_dataset, "state_format", "absolute_xyz_quaternion_wxyz"),
-            "action_format": getattr(train_dataset, "action_format", "absolute_xyz_quaternion_wxyz_gripper_minus1_plus1"),
+            "state_format": getattr(train_dataset, "state_format", "dynamicvla_absolute_xyz_euler_xyz"),
+            "action_format": getattr(train_dataset, "action_format", "dynamicvla_chunk_delta_xyz_euler_xyz_gripper"),
             "camera_keys": [
                 "observation.images.opst_cam",
                 "observation.images.wrist_cam",

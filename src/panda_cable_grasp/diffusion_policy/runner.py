@@ -135,6 +135,7 @@ class DiffusionPolicyRunner:
         # Environment quaternions are wxyz; DynamicVLA parquet states use
         # Euler xyz.  Keep the model-side representation identical to training.
         euler = Rotation.from_quat(quaternion[[1, 2, 3, 0]]).as_euler("xyz")
+        euler[[0, 2]] = np.mod(euler[[0, 2]], 2.0 * np.pi)
         return np.concatenate((position, euler)).astype(np.float32)
 
     def _append_observation(self, observation: dict[str, Any]) -> None:
