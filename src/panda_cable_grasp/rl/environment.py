@@ -514,9 +514,23 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             )
         return result
 
+    def _target_object_slice(self) -> slice:
+        """当前抓取目标对象在扁平 cable_ids 中的节点切片。
+
+        多对象场景的观测与最近段搜索都限定在目标对象内，避免跨对象
+        边界插值产生不存在的幻影节点/切线。
+        """
+
+        env = self.base_env
+        objects = getattr(env, "_objects", None)
+        if objects is not None and len(objects) > 1:
+            return env._object_slices[env._target_object]
+        return slice(0, len(env.cable_ids))
+
     def _sample_cable_state(self) -> tuple[np.ndarray, np.ndarray]:
-        positions = self.data.xpos[self.base_env.cable_ids].copy()
-        velocities = self._cable_body_velocities()
+        node_slice = self._target_object_slice()
+        positions = self.data.xpos[self.base_env.cable_ids].copy()[node_slice]
+        velocities = self._cable_body_velocities()[node_slice]
         return (
             self._arc_length_samples(
                 positions, positions, self.rl_config.cable_sample_count
@@ -530,7 +544,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self, point: np.ndarray,
     ) -> tuple[np.ndarray, float, np.ndarray, int, float]:
         """Return the closest point and a smooth tangent on the cable middle."""
-        positions = self.data.xpos[self.base_env.cable_ids]
+        node_slice = self._target_object_slice()
+        positions = self.data.xpos[self.base_env.cable_ids][node_slice]
         node_count = len(positions)
         margin = max(
             1, int(np.floor(node_count * self.rl_config.graspable_end_fraction))
@@ -548,7 +563,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         projected = starts + alpha[:, None] * vectors
         distances = np.linalg.norm(projected - point, axis=1)
         selected = int(np.argmin(distances))
-        segment_index = int(segment_indices[selected])
+        local_index = int(segment_indices[selected])
+        segment_index = local_index + node_slice.start
         selected_alpha = float(alpha[selected])
 
         node_tangents = np.empty_like(positions)
@@ -556,8 +572,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         node_tangents[-1] = positions[-1] - positions[-2]
         node_tangents[1:-1] = positions[2:] - positions[:-2]
         tangent = (
-            (1.0 - selected_alpha) * node_tangents[segment_index]
-            + selected_alpha * node_tangents[segment_index + 1]
+            (1.0 - selected_alpha) * node_tangents[local_index]
+            + selected_alpha * node_tangents[local_index + 1]
         )
         tangent_norm = float(np.linalg.norm(tangent))
         if tangent_norm <= 1e-9:

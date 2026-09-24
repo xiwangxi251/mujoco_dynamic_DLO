@@ -44,6 +44,15 @@ class MotionRegularity(str, Enum):
     REGULAR = "regular"
     QUASIPERIODIC = "quasiperiodic"
     STOCHASTIC = "stochastic"
+    # 单模态行波：空间周期波沿材料坐标传播，时间-空间均严格周期；
+    # 接触摩擦下会产生净输送（类蠕动输运）。
+    TRAVELING_WAVE = "traveling_wave"
+    # 单模态驻波：空间节点/腹点固定的正弦模态随时间同步振荡，
+    # 对称结构无净输送，是 regularity 轴上"完全可预测"的端点实现。
+    STANDING_WAVE = "standing_wave"
+    # 位置伺服正弦驻波：PD 伺服直接把线缆形状驱动到解析正弦目标
+    # 曲线，几何上严格周期，是"正弦规律形状运动"的最直接实现。
+    SINE_SERVO = "sine_servo"
 
 
 class ScenarioSplit(str, Enum):
@@ -136,9 +145,17 @@ class ScenarioConfig:
     frequency_level: FactorLevel = FactorLevel.NOMINAL
     regularity: MotionRegularity = MotionRegularity.QUASIPERIODIC
     motion_profile_version: str = "factorized_v2"
+    # rigid_replay_v1 场景专用的轨迹库名；非回放场景必须为 None。
+    replay_bank: str | None = None
+    # static 场景专用的初始形状库名（与回放库同格式）：reset 时按 seed
+    # 取条目、在有效区间采一个中间帧构型作为初始线缆形状。
+    initial_shape_bank: str | None = None
     disturbance_strength: float = 1.50
     frequency_scale: float = 1.0
     shape_motion_scale: float = SHAPE_MOTION_SCALE
+    # 机械臂启动延迟（秒）：>0 时非 rigid/combined 场景的线缆先自由
+    # 运动该时长后才放开机械臂目标。默认 0 不改变既有场景行为。
+    arm_motion_start_delay: float = 0.0
 
     cable_length_scale: float = 1.0
     cable_length_ood: bool = False
@@ -148,6 +165,21 @@ class ScenarioConfig:
     cable_stiffness_scale: float = 1.0
     cable_damping_scale: float = 1.0
     cable_friction_scale: float = 1.0
+
+    # 操作对象场景。默认与既有单线缆场景完全一致；``object_families``
+    # 非空时逐对象指定族（长度须等于 n_objects），否则全体使用
+    # ``object_family``。步态缩放只作用于带步态的对象族。
+    object_family: str = "cable"
+    object_families: tuple[str, ...] = ()
+    n_objects: int = 1
+    multi_object_layout: str = "single"
+    conveyor_spacing: float = 0.55
+    conveyor_speed: float = 0.22
+    conveyor_direction_deg: float = 90.0
+    crossing_angle_deg: float = 90.0
+    gait_amplitude_scale: float = 1.0
+    gait_frequency_scale: float = 1.0
+    gait_swim_speed: float | None = None
 
     # Optional per-episode OOD ranges.  The concrete scalar fields above hold
     # the midpoint so the config remains directly usable by legacy callers;
@@ -191,26 +223,54 @@ class ScenarioConfig:
             "factorized_v2",
             "rigid_level1_single_pass_v2",
             "rigid_level2_single_pass_v2",
+            "rigid_replay_v1",
         }
         if self.motion_profile_version not in allowed_profiles:
             raise ValueError(
                 "unsupported registered motion_profile_version: "
                 f"{self.motion_profile_version!r}"
             )
-        uses_rigid_trajectory = self.motion_profile_version.startswith("rigid_level")
+        uses_rigid_trajectory = self.motion_profile_version in {
+            "rigid_level1_single_pass_v2",
+            "rigid_level2_single_pass_v2",
+            "rigid_replay_v1",
+        }
         if uses_rigid_trajectory and self.motion_type not in {
             MotionType.RIGID, MotionType.COMBINED,
         }:
             raise ValueError(
-                "Level-1/Level-2 trajectories require rigid or combined motion"
+                "Level-1/Level-2/replay trajectories require rigid or "
+                "combined motion"
             )
         if (
             self.motion_type in {MotionType.RIGID, MotionType.COMBINED}
             and not uses_rigid_trajectory
         ):
             raise ValueError(
-                "rigid and combined scenarios must explicitly select Level-1 or Level-2"
+                "rigid and combined scenarios must explicitly select "
+                "Level-1/Level-2 or the replay profile"
             )
+        if self.motion_profile_version == "rigid_replay_v1":
+            if self.replay_bank is None or not _NAME_PATTERN.fullmatch(
+                self.replay_bank
+            ):
+                raise ValueError(
+                    "rigid_replay_v1 scenarios require a lowercase "
+                    "replay_bank name"
+                )
+        elif self.replay_bank is not None:
+            raise ValueError(
+                "replay_bank is only valid with the rigid_replay_v1 profile"
+            )
+        if self.initial_shape_bank is not None:
+            if not _NAME_PATTERN.fullmatch(self.initial_shape_bank):
+                raise ValueError(
+                    "initial_shape_bank must be a lowercase identifier"
+                )
+            if self.motion_type is not MotionType.STATIC:
+                raise ValueError(
+                    "initial_shape_bank is only valid for static scenarios"
+                )
         if not isinstance(self.cable_material_profile, str) or not _NAME_PATTERN.fullmatch(
             self.cable_material_profile
         ):
@@ -414,6 +474,68 @@ class ScenarioConfig:
         if (self.cable_length_ood or self.cable_material_ood) and self.split is not ScenarioSplit.OOD:
             raise ValueError("cable length/material OOD is only valid in the OOD split")
 
+        # 操作对象场景校验（与 EnvConfig.__post_init__ 的约束一致）
+        from ..env.objects import OBJECT_FAMILIES
+        if self.object_family not in OBJECT_FAMILIES:
+            raise ValueError(
+                f"unsupported object_family: {self.object_family!r}"
+            )
+        if (
+            isinstance(self.n_objects, bool)
+            or not isinstance(self.n_objects, int)
+            or not 1 <= self.n_objects <= 4
+        ):
+            raise ValueError("n_objects must be an integer in [1, 4]")
+        if self.multi_object_layout not in {
+            "single", "conveyor", "parallel", "crossing",
+        }:
+            raise ValueError(
+                f"unsupported multi_object_layout: {self.multi_object_layout!r}"
+            )
+        if self.multi_object_layout == "single" and self.n_objects != 1:
+            raise ValueError("single layout requires n_objects=1")
+        if self.multi_object_layout != "single" and self.n_objects < 2:
+            raise ValueError("multi-object layouts require n_objects >= 2")
+        if self.multi_object_layout == "crossing" and self.n_objects != 2:
+            raise ValueError("crossing layout currently requires n_objects=2")
+        if isinstance(self.object_families, str):
+            raise TypeError("object_families must be an iterable of strings")
+        object_families = tuple(self.object_families)
+        if object_families:
+            if len(object_families) != self.n_objects:
+                raise ValueError(
+                    "object_families must be empty or contain n_objects entries"
+                )
+            unknown = [
+                family for family in object_families
+                if family not in OBJECT_FAMILIES
+            ]
+            if unknown:
+                raise ValueError(f"unknown object_families: {unknown!r}")
+        object.__setattr__(self, "object_families", object_families)
+        for name in (
+            "conveyor_spacing", "conveyor_speed", "conveyor_direction_deg",
+            "crossing_angle_deg", "gait_amplitude_scale",
+            "gait_frequency_scale",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TypeError(f"{name} must be a number")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        if self.conveyor_spacing <= 0.0:
+            raise ValueError("conveyor_spacing must be positive")
+        if self.conveyor_speed < 0.0:
+            raise ValueError("conveyor_speed must be non-negative")
+        if self.gait_amplitude_scale <= 0.0 or self.gait_frequency_scale <= 0.0:
+            raise ValueError("gait amplitude/frequency scales must be positive")
+        if self.gait_swim_speed is not None and (
+            not isinstance(self.gait_swim_speed, (int, float))
+            or isinstance(self.gait_swim_speed, bool)
+            or not math.isfinite(float(self.gait_swim_speed))
+        ):
+            raise ValueError("gait_swim_speed must be a finite number or None")
+
     @property
     def uses_rigid_motion(self) -> bool:
         return self.motion_type in (MotionType.RIGID, MotionType.COMBINED)
@@ -451,6 +573,27 @@ class ScenarioConfig:
                 "cable_friction_scale",
             ):
                 payload.pop(value_name, None)
+        # 对象场景字段在默认值时从身份中剔除，保证既有场景的
+        # scenario_id/scenario_hash 不因新增字段而改变。
+        object_defaults = {
+            "object_family": "cable",
+            "object_families": [],
+            "n_objects": 1,
+            "multi_object_layout": "single",
+            "conveyor_spacing": 0.55,
+            "conveyor_speed": 0.22,
+            "conveyor_direction_deg": 90.0,
+            "crossing_angle_deg": 90.0,
+            "gait_amplitude_scale": 1.0,
+            "gait_frequency_scale": 1.0,
+            "gait_swim_speed": None,
+            "replay_bank": None,
+            "initial_shape_bank": None,
+            "arm_motion_start_delay": 0.0,
+        }
+        for field_name, default_value in object_defaults.items():
+            if payload.get(field_name) == default_value:
+                payload.pop(field_name, None)
         return payload
 
     @property
@@ -485,12 +628,14 @@ class ScenarioConfig:
             separators=(",", ":"),
         )
 
-    def to_env_overrides(self) -> dict[str, str | float | bool]:
-        """返回可直接传给当前 ``EnvConfig`` 的纯标量行为字段。"""
+    def to_env_overrides(self) -> dict[str, Any]:
+        """返回可直接传给当前 ``EnvConfig`` 的行为字段。"""
         return {
             "disturbance_strength": self.disturbance_strength,
             "motion_mode": self.motion_type.value,
             "motion_profile_version": self.motion_profile_version,
+            "replay_bank": self.replay_bank,
+            "initial_shape_bank": self.initial_shape_bank,
             "motion_regularity": self.regularity.value,
             "motion_frequency_scale": self.frequency_scale,
             "shape_motion_scale": self.shape_motion_scale,
@@ -499,6 +644,18 @@ class ScenarioConfig:
             "cable_stiffness_scale": self.cable_stiffness_scale,
             "cable_damping_scale": self.cable_damping_scale,
             "cable_friction_scale": self.cable_friction_scale,
+            "object_family": self.object_family,
+            "object_families": self.object_families,
+            "n_objects": self.n_objects,
+            "multi_object_layout": self.multi_object_layout,
+            "conveyor_spacing": self.conveyor_spacing,
+            "conveyor_speed": self.conveyor_speed,
+            "conveyor_direction_deg": self.conveyor_direction_deg,
+            "crossing_angle_deg": self.crossing_angle_deg,
+            "gait_amplitude_scale": self.gait_amplitude_scale,
+            "gait_frequency_scale": self.gait_frequency_scale,
+            "gait_swim_speed": self.gait_swim_speed,
+            "arm_motion_start_delay": self.arm_motion_start_delay,
         }
 
     def sample_for_episode(self, seed: int) -> "ScenarioConfig":
@@ -713,6 +870,65 @@ def _registered_scenarios() -> list[ScenarioConfig]:
                     tags=("main_grid", f"rigid_{trajectory}"),
                 ))
 
+    # 轨迹回放式随机整体运动对照：线缆保持初始形状，COM 与 yaw 跟随轨迹库
+    # 中某个材料节点的平面轨迹。库由对应源场景的无机器人自由演化录制，
+    # 因此配对 seed 下回放刚体的目标点运动学与形变场景逐点一致。
+    for source, bank in (
+        ("shape", "replay_src_shape_nominal_v1"),
+        ("combined", "replay_src_combined_l1_v1"),
+    ):
+        scenarios.append(_scenario(
+            f"id_rigid_replay_{source}_nominal",
+            ScenarioSplit.ID,
+            MotionType.RIGID,
+            amplitude=FactorLevel.NOMINAL,
+            frequency=FactorLevel.NOMINAL,
+            motion_profile_version="rigid_replay_v1",
+            replay_bank=bank,
+            description=(
+                f"Shape-frozen cable replaying a mid-cable material point "
+                f"trajectory recorded from the {source} scene; random "
+                f"global motion matched to deformation intensity."
+            ),
+            tags=("main_grid", "rigid_replay"),
+        ))
+
+    # 复杂初始形状静态场景：线缆按形变源轨迹库中配对 seed 的某个中间帧
+    # 构型初始化，之后无驱动；与 id_shape_nominal_current 同 seed 配对。
+    scenarios.append(_scenario(
+        "id_static_midshape_v1",
+        ScenarioSplit.ID,
+        MotionType.STATIC,
+        regularity=MotionRegularity.REGULAR,
+        initial_shape_bank="replay_src_shape_nominal_v1",
+        description=(
+            "Static scene whose initial cable shape is a mid-episode "
+            "snapshot sampled from the shape-deformation bank; seed-paired "
+            "with id_shape_nominal_current."
+        ),
+        tags=("motion_axis", "initial_shape"),
+    ))
+
+    # 25Hz learned-policy protocol variant: same replay semantics, bank
+    # recorded at control_dt=0.04 (frame_skip=20) so policy CLIs that pin
+    # the 25Hz cadence stay protocol-consistent.
+    scenarios.append(_scenario(
+        "id_rigid_replay_shape_nominal_25hz",
+        ScenarioSplit.ID,
+        MotionType.RIGID,
+        amplitude=FactorLevel.NOMINAL,
+        frequency=FactorLevel.NOMINAL,
+        motion_profile_version="rigid_replay_v1",
+        replay_bank="replay_src_shape_nominal_25hz_v1",
+        description=(
+            "Shape-frozen cable replaying a mid-cable material point "
+            "trajectory recorded from the shape scene at 25Hz control "
+            "(frame_skip=20); seed-paired with the learned-policy eval "
+            "seed bases."
+        ),
+        tags=("rigid_replay", "policy_eval"),
+    ))
+
     scenarios.extend([
         _scenario(
             "dev_shape_amplitude_low", ScenarioSplit.DEV, MotionType.SHAPE,
@@ -743,6 +959,200 @@ def _registered_scenarios() -> list[ScenarioConfig]:
             regularity=MotionRegularity.REGULAR,
             description="Regular shape-only development scene.",
             tags=("regularity_sweep",),
+        ),
+        _scenario(
+            "dev_shape_standing_wave", ScenarioSplit.DEV, MotionType.SHAPE,
+            regularity=MotionRegularity.STANDING_WAVE,
+            description=(
+                "Single-mode standing-wave shape motion; strictly "
+                "periodic with fixed nodes/antinodes and no net "
+                "transport."
+            ),
+            tags=("regularity_sweep",),
+        ),
+        _scenario(
+            "dev_shape_sine", ScenarioSplit.DEV, MotionType.SHAPE,
+            regularity=MotionRegularity.SINE_SERVO,
+            arm_motion_start_delay=1.5,
+            description=(
+                "Position-servoed standing sine wave; the cable geometry "
+                "itself tracks an analytic sinusoidal curve oscillating "
+                "with a strict 1.4 s period. The arm is released 1.5 s "
+                "after episode start so the cable is already mid-swing."
+            ),
+            tags=("regularity_sweep",),
+        ),
+        _scenario(
+            "dev_shape_traveling_wave", ScenarioSplit.DEV, MotionType.SHAPE,
+            regularity=MotionRegularity.TRAVELING_WAVE,
+            description=(
+                "Single-mode traveling-wave shape motion; strictly "
+                "periodic wave propagating along the material "
+                "coordinate (produces net transport under friction)."
+            ),
+            tags=("regularity_sweep",),
+        ),
+    ])
+
+    # ---- 可变形态操作对象与多对象 DEV 场景 ----
+    # 生物对象由文献中的运动学模型驱动（carangiform/anguilliform/
+    # serpenoid/peristaltic 行波模板 + PD 伺服）；多对象场景用车道
+    # 进度伺服实现传送带/平行车道/交叉车道。
+    scenarios.extend([
+        _scenario(
+            "dev_fish_swim", ScenarioSplit.DEV, MotionType.SHAPE,
+            amplitude=FactorLevel.LOW,
+            object_family="fish",
+            gait_swim_speed=0.0,
+            gait_frequency_scale=1.0,
+            gait_amplitude_scale=1.4,
+            description=(
+                "Carangiform fish: posterior-dominant traveling wave "
+                "with out-of-water tail flop, mostly in place."
+            ),
+            tags=("object_family", "gait"),
+        ),
+        _scenario(
+            "dev_loach_wriggle", ScenarioSplit.DEV, MotionType.SHAPE,
+            amplitude=FactorLevel.LOW,
+            object_family="loach",
+            description=(
+                "Anguilliform loach: whole-body traveling wave, "
+                "mostly in-place wriggle."
+            ),
+            tags=("object_family", "gait"),
+        ),
+        _scenario(
+            "dev_snake_serpent", ScenarioSplit.DEV, MotionType.SHAPE,
+            amplitude=FactorLevel.LOW,
+            object_family="snake",
+            gait_swim_speed=0.0,
+            description=(
+                "Serpenoid snake: Hirose tangent-angle wave, "
+                "in-place serpentine motion."
+            ),
+            tags=("object_family", "gait"),
+        ),
+        _scenario(
+            "dev_worm_crawl", ScenarioSplit.DEV, MotionType.SHAPE,
+            amplitude=FactorLevel.LOW,
+            object_family="worm",
+            description="Peristaltic worm: axial contraction wave.",
+            tags=("object_family", "gait"),
+        ),
+        # ---- 非生物可变形态对象 ----
+        _scenario(
+            "dev_spring_pulse", ScenarioSplit.DEV, MotionType.SHAPE,
+            amplitude=FactorLevel.LOW,
+            object_family="spring",
+            gait_swim_speed=0.0,
+            description=(
+                "Slinky spring: axial compression pulse with visible "
+                "coil rings."
+            ),
+            tags=("object_family", "gait", "non_biological"),
+        ),
+        _scenario(
+            "dev_ribbon_wave", ScenarioSplit.DEV, MotionType.SHAPE,
+            amplitude=FactorLevel.LOW,
+            object_family="ribbon",
+            gait_swim_speed=0.0,
+            description=(
+                "Gymnastics ribbon: light flat strip with large waving "
+                "motion including vertical flick."
+            ),
+            tags=("object_family", "gait", "non_biological"),
+        ),
+        _scenario(
+            "dev_hose_swing", ScenarioSplit.DEV, MotionType.SHAPE,
+            amplitude=FactorLevel.LOW,
+            object_family="hose",
+            gait_swim_speed=0.0,
+            description=(
+                "Garden hose: heavy stiff tube with slow serpentine "
+                "swing and brass nozzle."
+            ),
+            tags=("object_family", "gait", "non_biological"),
+        ),
+        _scenario(
+            "dev_whip_lash", ScenarioSplit.DEV, MotionType.SHAPE,
+            amplitude=FactorLevel.LOW,
+            object_family="whip",
+            gait_swim_speed=0.0,
+            description=(
+                "Tapered whip: amplitude grows toward the tip "
+                "(crack-the-whip) with a stiff handle."
+            ),
+            tags=("object_family", "gait", "non_biological"),
+        ),
+        _scenario(
+            "dev_multi_conveyor3", ScenarioSplit.DEV, MotionType.COMBINED,
+            amplitude=FactorLevel.LOW,
+            motion_profile_version="rigid_level1_single_pass_v2",
+            n_objects=3, multi_object_layout="conveyor",
+            object_families=("cable", "cable", "cable"),
+            description=(
+                "Three shape-deforming cables queued on one conveyor lane."
+            ),
+            tags=("multi_object", "conveyor"),
+        ),
+        _scenario(
+            "dev_multi_conveyor3_rigid", ScenarioSplit.DEV, MotionType.RIGID,
+            amplitude=FactorLevel.LOW,
+            motion_profile_version="rigid_level1_single_pass_v2",
+            n_objects=3, multi_object_layout="conveyor",
+            object_families=("cable", "cable", "cable"),
+            description=(
+                "Three cables transported rigidly on a conveyor."
+            ),
+            tags=("multi_object", "conveyor"),
+        ),
+        _scenario(
+            "dev_multi_crossing2", ScenarioSplit.DEV, MotionType.COMBINED,
+            amplitude=FactorLevel.LOW,
+            motion_profile_version="rigid_level1_single_pass_v2",
+            n_objects=2, multi_object_layout="crossing",
+            object_families=("cable", "cable"),
+            crossing_angle_deg=90.0,
+            description=(
+                "Two cables on perpendicular lanes crossing at table center."
+            ),
+            tags=("multi_object", "crossing"),
+        ),
+        _scenario(
+            "dev_multi_parallel3", ScenarioSplit.DEV, MotionType.COMBINED,
+            amplitude=FactorLevel.LOW,
+            motion_profile_version="rigid_level1_single_pass_v2",
+            n_objects=3, multi_object_layout="parallel",
+            object_families=("cable", "cable", "cable"),
+            description=(
+                "Three cables on parallel lanes moving together."
+            ),
+            tags=("multi_object", "parallel"),
+        ),
+        _scenario(
+            "dev_multi_menagerie3", ScenarioSplit.DEV, MotionType.COMBINED,
+            amplitude=FactorLevel.LOW,
+            motion_profile_version="rigid_level1_single_pass_v2",
+            n_objects=3, multi_object_layout="conveyor",
+            object_families=("cable", "fish", "snake"),
+            description=(
+                "Conveyor carrying a cable, a struggling fish and a snake."
+            ),
+            tags=("multi_object", "conveyor", "object_family"),
+        ),
+        _scenario(
+            "dev_multi_menagerie4", ScenarioSplit.DEV, MotionType.COMBINED,
+            amplitude=FactorLevel.LOW,
+            motion_profile_version="rigid_level1_single_pass_v2",
+            n_objects=4, multi_object_layout="conveyor",
+            object_families=("spring", "fish", "ribbon", "snake"),
+            conveyor_spacing=0.55,
+            description=(
+                "Conveyor mixing biological and non-biological objects: "
+                "spring, fish, ribbon, snake."
+            ),
+            tags=("multi_object", "conveyor", "object_family", "non_biological"),
         ),
     ])
 
