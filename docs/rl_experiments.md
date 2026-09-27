@@ -62,6 +62,25 @@ PPO 内部成功是训练诊断指标，除公共任务当前成功外，还要�
 - **Secured grasp（稳定夹持）**：在 pinch 基础上，夹爪开度和线缆位置合格，线缆被抬升至少
   `3 cm`，且双指接触连续保持 `0.1 s`，奖励 `+4.0`。
 
+#### 高度带抬升奖励（当前默认）
+
+抬升塑形以被抓线缆 body 中心相对桌面的绝对高度为目标（桌面按 `table` 几何体
+`geom_xpos + geom_size` 实时求得上表面），默认目标区间为 `0.18–0.25 m`：
+
+- 低于下沿时，`reward_lift_progress = 40 ×` 下沿距离的可逆增量（上升为正、下降为负，
+  首次 pinch 只初始化势能，不把既有高度计入策略收益）；
+- 高于上沿时，`reward_overheight_progress = 20 ×` 超出距离的可逆增量，并叠加
+  `-0.05 × smoothstep(severity)` 的逐步惩罚（`severity = min(1, 超出/0.10 m)`，
+  每回合累计上限 `2.0`）；终端成功时若仍超出，再扣
+  `min(6.0, 20 × 超出)` 的一次性惩罚；
+- 两条 overheight 惩罚按 `--height-penalty-ramp-env-steps`（默认每 worker
+  `10_000` 步）线性升温，带内 lift 进度不升温；
+- strict-hold 进度奖励改为只在“严格合格且处于带内”的 `height_band_hold`
+  上累计，掉落后重新 pinch 会重置势能，避免掉落过程被记成奖励或惩罚；
+- `--disable-height-band-reward` 恢复旧的单侧 `0.12 m` 封顶 lift 势能行为；
+  评估 CSV 新增 `grasp_body_height_final_m`、`height_band_hold_final_s`、
+  `overheight_severity_final`、`overheight_step_penalty_total` 四列诊断。
+
 #### 最终成功奖励
 
 达到 PPO 最终成功条件时奖励 `+25.0`，并结束当前回合。

@@ -122,6 +122,10 @@ EPISODE_FIELDS = (
     "target_distance_min_m",
     "finger_aperture_final_m",
     "grasp_lift_delta_final_m",
+    "grasp_body_height_final_m",
+    "height_band_hold_final_s",
+    "overheight_severity_final",
+    "overheight_step_penalty_total",
     "grasp_lift_delta_peak_m",
     "pinch_session_lift_peak_m",
     "lift_attempt",
@@ -610,6 +614,7 @@ def print_episode(episode: int, episode_return: float, steps: int, info: dict) -
         f"ever_secured={info['ever_grasped']} "
         f"aperture={1000.0 * info['finger_aperture']:.1f}mm "
         f"lift_delta={1000.0 * info['grasp_lift_delta']:.1f}mm "
+        f"grasp_height={info.get('grasp_body_height_above_table', 0.0):.3f}m "
         f"strict_hold={info['strict_success_hold']:.2f}s "
         f"lifted_fraction={info['lifted_fraction']:.2f} max_z={info['max_z']:.3f}m "
         f"sing_guard={info.get('ik_singularity_guard_count', 0)} "
@@ -765,6 +770,18 @@ def _episode_row(
         "finger_aperture_final_m": _finite_or_none(final_info.get("finger_aperture")),
         "grasp_lift_delta_final_m": _finite_or_none(
             final_info.get("grasp_lift_delta")
+        ),
+        "grasp_body_height_final_m": _finite_or_none(
+            final_info.get("grasp_body_height_above_table")
+        ),
+        "height_band_hold_final_s": _finite_or_none(
+            final_info.get("height_band_hold")
+        ),
+        "overheight_severity_final": _finite_or_none(
+            final_info.get("overheight_severity")
+        ),
+        "overheight_step_penalty_total": _finite_or_none(
+            final_info.get("overheight_step_penalty_total")
         ),
         "grasp_lift_delta_peak_m": diagnostics.peak_grasp_lift_delta,
         "pinch_session_lift_peak_m": _finite_or_none(

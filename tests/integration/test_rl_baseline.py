@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from panda_cable_grasp.rl.environment import RLCableGraspEnv
+from panda_cable_grasp.rl.environment import RLCableGraspEnv, RLConfig
 from panda_cable_grasp.rl.train import (
     MotionCurriculumCallback,
     RL_L1_CURRICULUM_STAGES,
@@ -215,19 +215,32 @@ class RLBaselineContractTests(unittest.TestCase):
         grasp_status = {
             "pinch_confirmed": True,
             "secured_grasp": False,
-            "grasp_lift_delta": 0.04,
+            "grasp_lift_delta": 0.01,
+            "grasp_body_height_above_table": 0.01,
             "strict_success_hold": 0.0,
+            "height_band_hold": 0.0,
         }
+        # Acquiring a cable initializes the potential and does not claim its
+        # pre-existing height as policy progress.
+        _, acquired = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        self.assertEqual(acquired["reward_lift_progress"], 0.0)
+
+        grasp_status["grasp_lift_delta"] = 0.04
+        grasp_status["grasp_body_height_above_table"] = 0.04
         _, rising = self.env._reward(
             np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
         )
 
         grasp_status["grasp_lift_delta"] = 0.01
+        grasp_status["grasp_body_height_above_table"] = 0.01
         _, falling = self.env._reward(
             np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
         )
 
         grasp_status["grasp_lift_delta"] = 0.04
+        grasp_status["grasp_body_height_above_table"] = 0.04
         _, rising_again = self.env._reward(
             np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
         )
@@ -240,6 +253,326 @@ class RLBaselineContractTests(unittest.TestCase):
             + rising_again["reward_lift_progress"],
             rising["reward_lift_progress"],
         )
+
+    def test_height_band_penalizes_overshoot_and_rewards_recovery(self) -> None:
+        self.env.reset(seed=32)
+        self.env._total_env_steps = (
+            self.env.rl_config.height_penalty_ramp_env_steps
+        )
+        grasp_status = {
+            "pinch_confirmed": True,
+            "secured_grasp": True,
+            "grasp_lift_delta": 0.20,
+            "grasp_body_height_above_table": 0.24,
+            "strict_success_hold": 0.0,
+            "height_band_hold": 0.0,
+        }
+        self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+
+        grasp_status["grasp_body_height_above_table"] = 0.30
+        _, rising_too_high = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+        self.assertLess(rising_too_high["reward_overheight_progress"], 0.0)
+        self.assertLess(rising_too_high["reward_overheight_step"], 0.0)
+
+        grasp_status["grasp_body_height_above_table"] = 0.24
+        _, recovering = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+        self.assertGreater(recovering["reward_overheight_progress"], 0.0)
+        self.assertEqual(recovering["reward_overheight_step"], 0.0)
+
+        grasp_status["grasp_body_height_above_table"] = 0.30
+        _, terminal = self.env._reward(
+            np.zeros(5), True, {"lifted_fraction": 0.3}, grasp_status
+        )
+        self.assertLess(terminal["reward_success_overheight"], 0.0)
+        self.assertGreater(terminal["reward_success"], 0.0)
+
+    def test_height_band_config_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            RLConfig(height_band_low_m=0.25, height_band_high_m=0.18)
+        with self.assertRaises(ValueError):
+            RLConfig(height_band_low_m=0.0)
+        with self.assertRaises(ValueError):
+            RLConfig(overheight_full_scale_m=0.0)
+        with self.assertRaises(ValueError):
+            RLConfig(reward_overheight_progress=-1.0)
+        with self.assertRaises(ValueError):
+            RLConfig(reward_overheight_step=0.1)
+        with self.assertRaises(ValueError):
+            RLConfig(overheight_step_penalty_cap=-1.0)
+        with self.assertRaises(ValueError):
+            RLConfig(success_overheight_penalty_per_m=-1.0)
+        with self.assertRaises(ValueError):
+            RLConfig(success_overheight_penalty_cap=-1.0)
+        with self.assertRaises(ValueError):
+            RLConfig(height_penalty_ramp_env_steps=-1)
+
+    def test_height_band_ramp_scales_overheight_but_not_lift_progress(self) -> None:
+        self.env.reset(seed=34)
+        ramp = self.env.rl_config.height_penalty_ramp_env_steps
+        grasp_status = {
+            "pinch_confirmed": True,
+            "secured_grasp": False,
+            "grasp_lift_delta": 0.10,
+            "grasp_body_height_above_table": 0.10,
+            "strict_success_hold": 0.0,
+            "height_band_hold": 0.0,
+        }
+
+        # Below-band progress is a plain reversible potential, active from
+        # step zero; only the overheight terms are ramped.
+        self.env._total_env_steps = 0
+        self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        grasp_status["grasp_body_height_above_table"] = 0.14
+        _, lifting = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        self.assertAlmostEqual(
+            lifting["reward_lift_progress"],
+            self.env.rl_config.reward_lift_progress * 0.04,
+        )
+
+        # At ramp start the overheight potential and step penalty are fully
+        # suppressed even when the cable is held above the band.
+        self.env.reset(seed=35)
+        self.env._total_env_steps = 0
+        grasp_status["grasp_body_height_above_table"] = 0.24
+        self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        grasp_status["grasp_body_height_above_table"] = 0.30
+        _, unscaled = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        self.assertEqual(unscaled["reward_overheight_progress"], 0.0)
+        self.assertEqual(unscaled["reward_overheight_step"], 0.0)
+        self.assertEqual(self.env._overheight_step_penalty_total, 0.0)
+
+        # Half ramp halves the overheight step penalty magnitude.
+        self.env.reset(seed=36)
+        self.env._total_env_steps = ramp // 2
+        grasp_status["grasp_body_height_above_table"] = 0.24
+        self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        grasp_status["grasp_body_height_above_table"] = 0.35
+        _, half = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+        )
+        self.assertAlmostEqual(
+            half["reward_overheight_step"],
+            self.env.rl_config.reward_overheight_step * 0.5,
+        )
+
+    def test_height_band_state_resets_between_episodes(self) -> None:
+        self.env.reset(seed=37)
+        self.env._total_env_steps = (
+            self.env.rl_config.height_penalty_ramp_env_steps
+        )
+        grasp_status = {
+            "pinch_confirmed": True,
+            "secured_grasp": True,
+            "grasp_lift_delta": 0.20,
+            "grasp_body_height_above_table": 0.30,
+            "strict_success_hold": 0.0,
+            "height_band_hold": 0.5,
+        }
+        self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+        self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+        self.assertGreater(self.env._overheight_step_penalty_total, 0.0)
+        self.assertIsNotNone(self.env._overheight_distance_previous)
+
+        self.env.reset(seed=38)
+        self.assertEqual(self.env._height_band_hold, 0.0)
+        self.assertIsNone(self.env._height_below_distance_previous)
+        self.assertIsNone(self.env._overheight_distance_previous)
+        self.assertEqual(self.env._overheight_step_penalty_total, 0.0)
+        self.assertEqual(self.env._last_height_penalty_scale, 0.0)
+        self.assertEqual(self.env._last_overheight_severity, 0.0)
+        self.assertEqual(self.env._last_grasp_body_height_above_table, 0.0)
+        # The ramp counts global per-worker steps and is not episode scoped.
+        self.assertEqual(
+            self.env._total_env_steps,
+            self.env.rl_config.height_penalty_ramp_env_steps,
+        )
+
+    def test_height_band_overheight_cycle_nets_zero_and_is_capped(self) -> None:
+        self.env.reset(seed=39)
+        self.env._total_env_steps = (
+            self.env.rl_config.height_penalty_ramp_env_steps
+        )
+        grasp_status = {
+            "pinch_confirmed": True,
+            "secured_grasp": True,
+            "grasp_lift_delta": 0.20,
+            "grasp_body_height_above_table": 0.30,
+            "strict_success_hold": 0.0,
+            "height_band_hold": 0.0,
+        }
+        self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+
+        # Oscillating above the band cannot farm progress reward: the
+        # potential telescopes, so a closed cycle nets zero.
+        cycle_total = 0.0
+        for height in (0.32, 0.30, 0.32, 0.30):
+            grasp_status["grasp_body_height_above_table"] = height
+            _, components = self.env._reward(
+                np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+            )
+            cycle_total += components["reward_overheight_progress"]
+        self.assertAlmostEqual(cycle_total, 0.0)
+
+        # Repeated overheight steps hit the bounded cap and then stop.
+        grasp_status["grasp_body_height_above_table"] = 0.40
+        for _ in range(200):
+            _, components = self.env._reward(
+                np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+            )
+        self.assertAlmostEqual(
+            self.env._overheight_step_penalty_total,
+            self.env.rl_config.overheight_step_penalty_cap,
+        )
+        self.assertEqual(components["reward_overheight_step"], 0.0)
+
+    def test_height_band_drop_regrasp_and_in_band_motion_do_not_double_count(
+        self,
+    ) -> None:
+        self.env.reset(seed=40)
+        self.env._total_env_steps = (
+            self.env.rl_config.height_penalty_ramp_env_steps
+        )
+        grasp_status = {
+            "pinch_confirmed": True,
+            "secured_grasp": True,
+            "grasp_lift_delta": 0.20,
+            "grasp_body_height_above_table": 0.24,
+            "strict_success_hold": 0.0,
+            "height_band_hold": 0.0,
+        }
+        self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+
+        # Moving inside the band earns neither lift nor overheight progress.
+        grasp_status["grasp_body_height_above_table"] = 0.20
+        _, in_band = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+        self.assertEqual(in_band["reward_lift_progress"], 0.0)
+        self.assertEqual(in_band["reward_overheight_progress"], 0.0)
+        self.assertEqual(in_band["reward_overheight_step"], 0.0)
+
+        # A drop resets the potential: the fall earns no penalty and the
+        # re-grasp claims no pre-existing height.
+        dropped = dict(
+            grasp_status,
+            pinch_confirmed=False,
+            secured_grasp=False,
+            grasp_body_height_above_table=0.05,
+        )
+        _, dropped_components = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, dropped
+        )
+        self.assertEqual(dropped_components["reward_lift_progress"], 0.0)
+        self.assertEqual(dropped_components["reward_overheight_progress"], 0.0)
+        self.assertEqual(dropped_components["reward_overheight_step"], 0.0)
+
+        regrasped = dict(dropped, pinch_confirmed=True)
+        _, reacquired = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, regrasped
+        )
+        self.assertEqual(reacquired["reward_lift_progress"], 0.0)
+        self.assertEqual(reacquired["reward_overheight_progress"], 0.0)
+        regrasped["grasp_body_height_above_table"] = 0.12
+        _, lifted = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.0}, regrasped
+        )
+        self.assertAlmostEqual(
+            lifted["reward_lift_progress"],
+            self.env.rl_config.reward_lift_progress * 0.07,
+        )
+
+    def test_height_band_disabled_restores_legacy_lift_reward(self) -> None:
+        legacy_env = RLCableGraspEnv(
+            seed=41,
+            episode_seconds=0.20,
+            rl_config=RLConfig(height_band_reward_enabled=False),
+        )
+        try:
+            legacy_env.reset(seed=41)
+            legacy_env._total_env_steps = (
+                legacy_env.rl_config.height_penalty_ramp_env_steps
+            )
+            grasp_status = {
+                "pinch_confirmed": True,
+                "secured_grasp": False,
+                "grasp_lift_delta": 0.04,
+                "grasp_body_height_above_table": 0.34,
+                "strict_success_hold": 0.4,
+                "height_band_hold": 0.0,
+            }
+            _, components = legacy_env._reward(
+                np.zeros(5), False, {"lifted_fraction": 0.0}, grasp_status
+            )
+            # The legacy one-sided potential credits the capped lift on the
+            # acquiring step and ignores absolute tabletop height entirely.
+            self.assertAlmostEqual(
+                components["reward_lift_progress"],
+                legacy_env.rl_config.reward_lift_progress * 0.04,
+            )
+            self.assertEqual(components["reward_overheight_progress"], 0.0)
+            self.assertEqual(components["reward_overheight_step"], 0.0)
+            self.assertEqual(components["reward_success_overheight"], 0.0)
+            self.assertEqual(legacy_env._last_height_penalty_scale, 0.0)
+            # Strict-hold credit follows the raw strict timer, not the band.
+            self.assertGreater(components["reward_strict_hold"], 0.0)
+
+            grasp_status["strict_success_hold"] = 0.0
+            _, terminal = legacy_env._reward(
+                np.zeros(5), True, {"lifted_fraction": 0.0}, grasp_status
+            )
+            self.assertEqual(terminal["reward_success_overheight"], 0.0)
+        finally:
+            legacy_env.close()
+
+    def test_height_band_hold_drives_strict_hold_credit_when_enabled(self) -> None:
+        self.env.reset(seed=42)
+        self.env._total_env_steps = (
+            self.env.rl_config.height_penalty_ramp_env_steps
+        )
+        grasp_status = {
+            "pinch_confirmed": True,
+            "secured_grasp": True,
+            "grasp_lift_delta": 0.30,
+            "grasp_body_height_above_table": 0.34,
+            "strict_success_hold": 0.4,
+            "height_band_hold": 0.0,
+        }
+        _, above_band = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+        # Out-of-band strict hold earns no shaping credit under the band rule.
+        self.assertEqual(above_band["reward_strict_hold"], 0.0)
+
+        grasp_status["grasp_body_height_above_table"] = 0.22
+        grasp_status["height_band_hold"] = 0.4
+        _, in_band = self.env._reward(
+            np.zeros(5), False, {"lifted_fraction": 0.3}, grasp_status
+        )
+        self.assertGreater(in_band["reward_strict_hold"], 0.0)
 
     def test_aligned_pinch_reward_only_fires_on_pinch_transition(self) -> None:
         self.env.reset(seed=27)
