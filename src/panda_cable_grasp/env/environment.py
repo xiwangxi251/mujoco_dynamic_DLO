@@ -2124,6 +2124,10 @@ class CableGraspEnv:
 
             # 任务成功所要求的几何条件检查
             last_qualification = self._success_qualification(gripper_closed)
+            # Optional task predicate changes scoring only, never contact or motion.
+            task_filter = getattr(self, "task_success_filter", None)
+            if task_filter is not None:
+                last_qualification = bool(task_filter(last_qualification))
             if last_qualification:
                 self.success_hold += self.model.opt.timestep
             else:

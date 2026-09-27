@@ -149,6 +149,10 @@ def linear_schedule(
 def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
     """Build one immutable-by-convention reward/action configuration per env."""
     return RLConfig(
+        target_node_task=getattr(args, "target_node_task", False),
+        target_u_min=getattr(args, "target_u_min", 1.0 / 6.0),
+        target_u_max=getattr(args, "target_u_max", 5.0 / 6.0),
+        target_node_tolerance=getattr(args, "target_node_tolerance", 2),
         singularity_avoidance_enabled=(
             not args.disable_singularity_avoidance
         ),
@@ -724,6 +728,12 @@ class StrictSuccessEvalCallback(BaseCallback):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO for dynamic cable grasping")
+    parser.add_argument("--target-node-task", action="store_true")
+    parser.add_argument("--target-u-min", type=float, default=1.0 / 6.0)
+    parser.add_argument("--target-u-max", type=float, default=5.0 / 6.0)
+    parser.add_argument("--target-node-tolerance", type=int, default=2)
+    parser.add_argument("--warm-start", type=Path, default=None,
+                        help="expand a compatible state99 PPO into a fresh target-node109 PPO")
     parser.add_argument("--timesteps", type=int, default=2_000_000)
     parser.add_argument(
         "--workers", type=int, default=12,
@@ -1138,6 +1148,13 @@ def parse_args() -> argparse.Namespace:
             "evaluation frequency must be non-negative; episode counts and "
             "--eval-workers must be positive"
         )
+    if args.target_node_task and args.observation_mode != "state":
+        parser.error("target-node task currently requires state observations")
+    if args.warm_start is not None:
+        if args.resume is not None or not args.target_node_task:
+            parser.error("--warm-start requires --target-node-task and cannot be combined with --resume")
+        if not args.warm_start.is_file():
+            parser.error("--warm-start checkpoint does not exist")
     if args.resume is not None:
         resume_with_zip = Path(f"{args.resume}.zip")
         if not args.resume.is_file() and not resume_with_zip.is_file():
@@ -1183,6 +1200,7 @@ def main() -> None:
         ),
     )
 
+    warm_start_record = None
     if args.resume is None:
         starting_timesteps = 0
         learning_rate_initial = args.learning_rate_initial
@@ -1270,13 +1288,17 @@ def main() -> None:
         model.learning_rate = learning_rate
         model.lr_schedule = learning_rate
 
+    if args.warm_start is not None:
+        from .target_node import warm_start_policy
+        warm_start_record = warm_start_policy(model, args.warm_start)
     checkpoint_callback = CheckpointCallback(
         save_freq=max(1, args.checkpoint_steps // args.workers),
         save_path=str(args.output / "checkpoints"),
         name_prefix="ppo_cable",
     )
     metrics_path = args.output / "training_metrics.csv"
-    metrics_callback = TrainingMetricsCallback(metrics_path, window=100)
+    metrics_callback = TrainingMetricsCallback(metrics_path, window=100,
+                                               goal_task=args.target_node_task)
     callback_items: list[BaseCallback] = [
         checkpoint_callback,
         metrics_callback,
@@ -1325,6 +1347,9 @@ def main() -> None:
         "rl_interface_version": action_interface_version(args.action_mode),
         "action_mode": args.action_mode,
         "observation_mode": args.observation_mode,
+        "observation_interface_version": "target_node_state_v1" if args.target_node_task else "baseline_state_v1",
+        "target_node_task": args.target_node_task,
+        "warm_start": warm_start_record,
         "arm_acceleration_limit_enabled": True,
         "geometric_safety_enabled": args.geometric_safety,
         "table_finger_collision_filter_enabled": (
@@ -1461,6 +1486,12 @@ def main() -> None:
             "IK with uniform joint-velocity scaling"
         ),
     }
+    if args.target_node_task:
+        configuration["rl_success_definition"] = (
+            "shared physical lift/retention qualification AND material node error "
+            "within target_node_tolerance continuously for success_hold_seconds at physics substeps"
+        )
+        configuration["observation"] = "state99 plus target material u, TCP-relative position/velocity and tangent: 109-D"
     (args.output / "training_config.json").write_text(
         json.dumps(configuration, ensure_ascii=False, indent=2), encoding="utf-8"
     )

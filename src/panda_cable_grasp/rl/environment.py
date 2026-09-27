@@ -27,6 +27,10 @@ class RLConfig:
     """RL接口参数，不改变底层线缆物理。"""
 
     cable_sample_count: int = 14
+    target_node_task: bool = False
+    target_u_min: float = 1.0 / 6.0
+    target_u_max: float = 5.0 / 6.0
+    target_node_tolerance: int = 2
     cable_position_scale: float = 0.50
     cable_velocity_scale: float = 1.0
     translation_delta_scale: float = 0.010
@@ -122,6 +126,15 @@ class RLConfig:
     safety_penalty_ramp_env_steps: int = 5_000
 
     def __post_init__(self) -> None:
+        if not isinstance(self.target_node_task, bool):
+            raise ValueError("target_node_task must be boolean")
+        if not (np.isfinite(self.target_u_min) and np.isfinite(self.target_u_max)
+                and 0.0 <= self.target_u_min <= self.target_u_max <= 1.0):
+            raise ValueError("target u bounds must satisfy 0 <= min <= max <= 1")
+        if (isinstance(self.target_node_tolerance, bool)
+                or not isinstance(self.target_node_tolerance, int)
+                or self.target_node_tolerance < 0):
+            raise ValueError("target_node_tolerance must be a nonnegative integer")
         if self.cable_sample_count != 14:
             raise ValueError("cable_sample_count must be 14 for the 99-D baseline")
         for name in (
@@ -284,6 +297,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
     ):
         super().__init__()
         self.rl_config = rl_config or RLConfig()
+        self.goal = None
         self._scenario_configs: tuple[ScenarioConfig, ...] = tuple(
             get_scenario(name) for name in (scenario_names or ())
         )
@@ -366,10 +380,18 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         # guard for this configuration; do not add the newer Cartesian cap.
         self.base_env.config.hand_cartesian_velocity_limit_enabled = False
         self.action_mode = TASK_SPACE_ACTION_MODE
+        if self.rl_config.target_node_task:
+            from .target_node import TargetNodeTask
+            self.goal = TargetNodeTask(self, seed)
         self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(5,), dtype=np.float32)
         self.observation_space = gym.spaces.Box(
-            -10.0, 10.0, shape=(len(self.OBSERVATION_NAMES),), dtype=np.float32
+            -10.0, 10.0,
+            shape=(len(self.OBSERVATION_NAMES) + (10 if self.goal else 0),),
+            dtype=np.float32
         )
+        if self.goal is not None:
+            from .target_node import GOAL_OBSERVATION_NAMES
+            self.OBSERVATION_NAMES = self.OBSERVATION_NAMES + GOAL_OBSERVATION_NAMES
         self._previous_distance = 0.0
         self._episode_return = 0.0
         self._episode_steps = 0
@@ -587,6 +609,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self, point: np.ndarray,
     ) -> tuple[np.ndarray, float, np.ndarray, int, float]:
         """Return the closest point and a smooth tangent on the cable middle."""
+        if self.goal is not None:
+            return self.goal.nearest(point)
         node_slice = self._target_object_slice()
         positions = self.data.xpos[self.base_env.cable_ids][node_slice]
         node_count = len(positions)
@@ -667,6 +691,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             ),
             np.array([2.0 * aperture / maximum_aperture - 1.0]),
         ]).astype(np.float32)
+        if self.goal is not None:
+            observation = np.concatenate([observation, self.goal.observation()]).astype(np.float32)
         return np.clip(observation, -10.0, 10.0)
 
     @staticmethod
@@ -1108,6 +1134,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             and self.data.xpos[body_id, 2] > 0.14
             and float(info["lifted_fraction"]) >= 0.18
             and distance <= self.base_env.config.max_pad_distance
+            and (self.goal is None or self.goal.matches())
         )
         if strict_qualification:
             self._strict_success_hold += action_seconds
@@ -1308,8 +1335,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         nearest_point, distance, tangent, segment_index, _ = (
             self._nearest_graspable_segment(self._grasp_center_position())
         )
-        pinch_confirmed = bool(grasp_status["pinch_confirmed"])
-        pregrasp = not pinch_confirmed
+        physical_pinch = bool(grasp_status["pinch_confirmed"])
+        goal_match = self.goal is None or self.goal.matches()
+        pinch_confirmed = physical_pinch and goal_match
+        pregrasp = not physical_pinch
         progress = self._previous_distance - distance if pregrasp else 0.0
         self._previous_distance = distance
 
@@ -1371,6 +1400,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
 
         pairs = self.base_env._finger_contact_pairs()
         contacting_fingers = len({finger for _, finger in pairs})
+        if self.goal is not None:
+            contacting_fingers = len({finger for body, finger in pairs
+                if abs(self.base_env.cable_index[body] - self.goal.index)
+                <= self.rl_config.target_node_tolerance})
         new_contact_count = max(0, contacting_fingers - self._max_contacting_fingers)
         self._max_contacting_fingers = max(
             self._max_contacting_fingers, contacting_fingers
@@ -1379,7 +1412,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         secured_grasp = bool(grasp_status["secured_grasp"])
         new_pinch = pinch_confirmed and not self._pinch_rewarded
         pinch_transition = bool(
-            pinch_confirmed and not self._previous_pinch_confirmed
+            pinch_confirmed and not (self.goal.previous_match if self.goal
+                                    else self._previous_pinch_confirmed)
         )
         self._aligned_pinch_event = bool(
             pinch_transition
@@ -1394,9 +1428,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._aligned_pinch_rewarded = bool(
             self._aligned_pinch_rewarded or self._aligned_pinch_event
         )
-        new_secured = secured_grasp and not self._secured_rewarded
+        new_secured = secured_grasp and goal_match and not self._secured_rewarded
         self._pinch_rewarded = self._pinch_rewarded or pinch_confirmed
-        self._secured_rewarded = self._secured_rewarded or secured_grasp
+        self._secured_rewarded = self._secured_rewarded or (secured_grasp and goal_match)
 
         # Keep the historical lift high-water only as a diagnostic.  The new
         # reward is a reversible potential around a useful absolute height
@@ -1529,9 +1563,11 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         # 明确主动张爪另有一次较重惩罚，避免先制造低成本滑脱后免费张爪。
         penalize_active_open = bool(
             active_open and not self._active_open_penalty_applied
+            and (self.goal is None or self.goal.previous_secured)
         )
         penalize_contact_loss = bool(
             physical_slip and not self._contact_loss_penalty_applied
+            and (self.goal is None or self.goal.previous_secured)
         )
         if penalize_active_open:
             self._active_open_penalty_applied = True
@@ -1540,7 +1576,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         penalize_physical_slip = bool(penalize_contact_loss and physical_slip)
 
         strict_progress = float(np.clip(
-            strict_hold_seconds / self.base_env.config.success_hold_seconds,
+            (strict_hold_seconds if goal_match else 0.0) / self.base_env.config.success_hold_seconds,
             0.0,
             1.0,
         ))
@@ -1624,6 +1660,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             ),
             **safety_components,
         }
+        if self.goal is not None:
+            self.goal.finish_reward(components, grasp_status)
         return float(sum(components.values())), components
 
     def _safety_reward_components(self) -> dict[str, float]:
@@ -1729,6 +1767,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         # 底层环境只使用自己的 Generator；把显式 seed 透传到底层，既保证并行
         # 环境中的场景可复现，也让评估 CSV/manifest 能准确记录该轮场景。
         _, info = self.base_env.reset(randomize=True, seed=seed)
+        if self.goal is not None:
+            self.goal.reset(seed, options)
         self._episode_return = 0.0
         self._episode_steps = 0
         self._table_safety_penalty_total = 0.0
@@ -2032,6 +2072,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         result["policy_internal_success"] = strict_success
         result["task_success"] = task_success
         result["success"] = task_success
+        if self.goal is not None:
+            result.update(self.goal.info())
         return result
 
     def set_disturbance_strength(self, strength: float) -> None:

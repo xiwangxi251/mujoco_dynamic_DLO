@@ -20,9 +20,11 @@ class TrainingMetricsCallback(BaseCallback):
         *,
         window: int = 100,
         print_every_episodes: int = 20,
+        goal_task: bool = False,
     ):
         super().__init__(verbose=0)
         self.csv_path = Path(csv_path)
+        self.goal_task = goal_task
         self.window = window
         self.print_every_episodes = print_every_episodes
         self.success_window: deque[float] = deque(maxlen=window)
@@ -77,6 +79,12 @@ class TrainingMetricsCallback(BaseCallback):
             "strict_success", "ever_pinched", "ever_aligned_pinch", "lift_attempt",
             "loaded_lift",
         }
+        if self.goal_task:
+            fieldnames.extend([
+                "goal_node_index", "goal_node_error", "goal_success",
+                "any_node_success", "wrong_target_grasp_count",
+            ])
+            required_v3_fields.update(fieldnames[-5:])
         if (
             file_exists
             and previous_rows
@@ -176,6 +184,10 @@ class TrainingMetricsCallback(BaseCallback):
                 "episode_return": episode_return,
                 "episode_length": episode_length,
                 "lifted_fraction": lifted_fraction,
+                **({key: info.get(key) for key in (
+                    "goal_node_index", "goal_node_error", "goal_success",
+                    "any_node_success", "wrong_target_grasp_count",
+                )} if self.goal_task else {}),
             })
             self._file.flush()
 

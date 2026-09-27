@@ -155,6 +155,9 @@ EPISODE_FIELDS = (
     "geometric_safety_termination",
     "policy_inference_mean_ms",
     "policy_inference_p95_ms",
+    "goal_node_index", "goal_material_u", "goal_node_tolerance",
+    "actual_grasp_node_index", "goal_node_error", "goal_match",
+    "goal_success", "any_node_success", "wrong_target_grasp_count",
 )
 RL_INTERFACE_VERSION = "baseline_v4"
 
@@ -180,6 +183,29 @@ def checkpoint_action_mode(checkpoint: Path) -> str:
         with config_path.open("r", encoding="utf-8") as source:
             return str(json.load(source).get("action_mode", "task_space"))
     return "task_space"
+
+
+def evaluation_rl_config(args) -> RLConfig:
+    """Restore goal-task parameters from the checkpoint's own manifest."""
+    from dataclasses import fields
+    saved = {}
+    checkpoint = Path(args.model).resolve()
+    for directory in (checkpoint.parent, *checkpoint.parents):
+        config_path = directory / "training_config.json"
+        if config_path.is_file():
+            saved = json.loads(config_path.read_text(encoding="utf-8")).get("rl_config", {})
+            break
+    if saved.get("target_node_task", False):
+        allowed = {field.name for field in fields(RLConfig)}
+        return RLConfig(**{key: value for key, value in saved.items() if key in allowed})
+    if getattr(args, "target_node_index", None) is not None:
+        raise ValueError("--target-node-index requires a target-node checkpoint")
+    return RLConfig(singularity_avoidance_enabled=not args.disable_singularity_avoidance)
+
+
+def configure_target_evaluation(env, args):
+    if env.goal is not None:
+        env.goal.fixed_index = getattr(args, "target_node_index", None)
 
 
 def resolve_scenario_names(
@@ -530,6 +556,11 @@ def _manifest(
         "checkpoint": _file_record(args.model),
         "environment": {
             "rl_interface_version": action_interface_version(args.action_mode),
+            "observation_interface_version": "target_node_state_v1" if env.goal else "baseline_state_v1",
+            "task_definition": (
+                "continuous physical lift/hold AND requested material node tolerance"
+                if env.goal else "any-node physical lift/hold"
+            ),
             "action_mode": args.action_mode,
             "robot": env.base_env.robot,
             "source_xml": _file_record(XML_PATH),
@@ -679,6 +710,11 @@ def _episode_row(
         "policy_internal_success": policy_internal_success,
         "policy_failure_type": policy_failure_type,
         "task_success": task_success,
+        **{key: final_info.get(key) for key in (
+            "goal_node_index", "goal_material_u", "goal_node_tolerance",
+            "actual_grasp_node_index", "goal_node_error", "goal_match",
+            "goal_success", "any_node_success", "wrong_target_grasp_count",
+        )},
         "task_failure_type": task_failure_type,
         "terminated": terminated,
         "truncated": truncated,
@@ -874,12 +910,9 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         dynamicvla_cameras_enabled=True,
         geometric_safety_enabled=args.geometric_safety,
         frame_skip=getattr(args, "frame_skip", None),
-        rl_config=RLConfig(
-            singularity_avoidance_enabled=(
-                not args.disable_singularity_avoidance
-            )
-        ),
+        rl_config=evaluation_rl_config(args),
     )
+    configure_target_evaluation(env, args)
 
 
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
@@ -1255,6 +1288,16 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
             ),
         }
         manifest["status"] = "completed"
+        if env.goal is not None:
+            with csv_path.open(newline="", encoding="utf-8") as source:
+                goal_rows = list(csv.DictReader(source))
+            summary["goal_success_rate"] = task_successes / args.episodes
+            summary["any_node_success_rate"] = sum(
+                row["any_node_success"].lower() == "true" for row in goal_rows
+            ) / args.episodes
+            summary["wrong_target_grasp_episode_rate"] = sum(
+                int(row["wrong_target_grasp_count"] or 0) > 0 for row in goal_rows
+            ) / args.episodes
         manifest["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
         manifest["summary"] = summary
         _write_json(manifest_path, manifest)
@@ -1310,12 +1353,9 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         dynamicvla_cameras_enabled=True,
         geometric_safety_enabled=args.geometric_safety,
         frame_skip=getattr(args, "frame_skip", None),
-        rl_config=RLConfig(
-            singularity_avoidance_enabled=(
-                not args.disable_singularity_avoidance
-            )
-        ),
+        rl_config=evaluation_rl_config(args),
     )
+    configure_target_evaluation(env, args)
 
     observation, info = env.reset(seed=args.seed)
     episode = 1
@@ -1387,6 +1427,8 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--target-node-index", type=int, default=None,
+                        help="force a material node in a target-node checkpoint evaluation")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)
@@ -1506,6 +1548,9 @@ def main() -> None:
             "clip_range": 0.2,
         },
     )
+    expected_size = 109 if evaluation_rl_config(arguments).target_node_task else 99
+    if getattr(policy.observation_space, "shape", None) is not None and policy.observation_space.shape != (expected_size,):
+        raise SystemExit("checkpoint observation shape disagrees with its saved target-task configuration")
     if arguments.headless:
         run_headless(arguments, policy)
     else:
