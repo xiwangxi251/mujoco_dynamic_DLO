@@ -1453,12 +1453,12 @@ def main() -> None:
         "observation_names": (
             {"points": [args.pointcloud_points, 3], "proprio": [16]}
             if args.observation_mode == "pointcloud"
-            else list(RLCableGraspEnv.OBSERVATION_NAMES)
+            else list(check_candidate.unwrapped.OBSERVATION_NAMES)
         ),
         "observation_dimension": (
             args.pointcloud_points * 3 + 16
             if args.observation_mode == "pointcloud"
-            else len(RLCableGraspEnv.OBSERVATION_NAMES)
+            else int(check_candidate.observation_space.shape[0])
         ),
         "action_names": list(check_candidate.unwrapped.ACTION_NAMES),
         "rl_config": asdict(rl_config_from_args(args)),
