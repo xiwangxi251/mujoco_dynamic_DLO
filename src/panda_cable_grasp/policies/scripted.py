@@ -38,6 +38,13 @@ class PolicyConfig:
     approach_prediction_horizon: float = 0.30
     close_prediction_horizon: float = 0.12
     target_filter_alpha: float = 0.10
+    # Optional target-point ablation.  The default retains the historical
+    # middle-node baseline; middle_angle selects a nearby material node whose
+    # tangent crosses the planned jaw-closing axis at a favorable angle.
+    # middle_geometry also favors a long straight, isolated, reachable section.
+    target_selection_mode: str = "middle"
+    target_middle_fraction: float = 0.20
+    target_min_crossing_angle_deg: float = 60.0
     intercept_x_limits: tuple[float, float] = (0.30, 0.82)
     intercept_y_limits: tuple[float, float] = (-0.43, 0.43)
     intercept_z_limits: tuple[float, float] = (0.010, 0.18)
@@ -49,6 +56,16 @@ class PolicyConfig:
     approach_tilt_tolerance: float = math.radians(25.0)
     intercept_tilt_limit: float = math.radians(35.0)
     intercept_singularity_limit: float = 0.045
+    # INTERCEPT exceeding intercept_tilt_limit used to abort the whole attempt.
+    # A retry re-homes vertically and restarts APPROACH, which costs most of a
+    # 15 s budget and, in modes that keep the same material segment, can loop
+    # until timeout.  With realignment enabled the hand instead holds position
+    # while orientation runs as the primary IK task, and only the far larger
+    # abort limit still discards the attempt.  Off by default so previously
+    # frozen runs stay bit-identical.
+    intercept_tilt_realign: bool = False
+    intercept_tilt_realign_timeout: float = 1.2
+    intercept_tilt_abort_limit: float = math.radians(75.0)
     # APPROACH远离目标时优先追赶位置；进入目标上方后再恢复完整姿态权重。
     # 最终速度仍由环境端统一限幅，较长的IK目标时域只避免策略命令过弱。
     approach_fast_distance: float = 0.12
@@ -97,8 +114,54 @@ class PolicyConfig:
     intercept_timeout: float = 9.0
     close_timeout: float = 0.8
     close_hard_timeout: float = 3.0
+    close_invalid_contact_timeout: float = 1.6
     close_capture_distance: float = 0.018
     close_contact_grace: float = 0.35
+    # middle_geometry locks one material segment when descent starts and then
+    # refuses to close unless the nearest point still belongs to that segment,
+    # so a hand resting on an adjacent fold never triggers closure.  The bound
+    # was hard-coded; exposing it leaves frozen runs bit-identical while making
+    # the fold-adjacency guard measurable rather than assumed.
+    intercept_segment_tolerance: int = 4
+    # A folded cable puts two material-distant strands inside the pad travel at
+    # once.  Two 28 mm strands need >= 56 mm of aperture, so the 40 mm grasp
+    # gate can never confirm and the episode is lost before the fingers move.
+    # The isotropic table-plane clearance used by middle_geometry scores a
+    # harmless neighbour offset along the jaw's long axis the same as a fatal
+    # one sitting in the closing gap.  These options replace it with clearance
+    # measured along the world closing axis, which is what the pads sweep.
+    corridor_clearance: bool = False
+    # Material-coordinate separation above which a node counts as a different
+    # strand rather than as part of the segment being pinched.
+    corridor_index_gap: int = 6
+    # Half aperture plus one cable radius: a strand closer than this along the
+    # closing axis is trapped together with the intended one.
+    corridor_half_gap: float = 0.032
+    # Pad reach along the approach axis.  Nodes deeper than this cannot be
+    # pinched regardless of their lateral offset.
+    corridor_depth: float = 0.060
+    # Pad half length along the jaw's long axis.  A strand beyond it passes
+    # between the fingers instead of being trapped, so it must not veto an
+    # otherwise clean grasp site.
+    corridor_span: float = 0.050
+    # Score weight; large enough to dominate bend and midpoint preferences.
+    corridor_weight: float = 6.0
+    # The corridor test above runs once at settle time and excludes material
+    # neighbours, so it stays blind to a tight fold: there the two legs sit a
+    # few nodes apart in material coordinate yet tens of millimetres apart in
+    # space.  Re-measuring the pad box live, at the moment the fingers are
+    # about to close, is what the recorded episodes say works -- 96% of
+    # never-bilateral attempts are already blocked at jaw entry versus 46% of
+    # successful ones, while at hover the two groups are indistinguishable.
+    close_box_gate: bool = False
+    box_aperture_limit: float = 0.040
+    # Pad box half extents along the jaw's long axis and the approach axis.
+    box_lat_half: float = 0.030
+    box_dep_half: float = 0.030
+    # Drop already-attempted sites rather than merely penalising them: the soft
+    # -3.0 is smaller than a corridor bonus of up to +6.0, so a retry keeps
+    # walking back to the same clean-looking site.
+    retry_hard_blacklist: bool = False
     lift_seconds: float = 2.4
     lift_distance: float = 0.22
     minimum_post_lift_rise: float = 0.14
@@ -121,6 +184,7 @@ class PolicyConfig:
             "close_prediction_horizon",
             "approach_position_tolerance",
             "approach_tilt_tolerance", "intercept_tilt_limit",
+            "intercept_tilt_abort_limit", "intercept_tilt_realign_timeout",
             "intercept_singularity_limit", "approach_fast_distance",
             "approach_linear_velocity_limit", "intercept_linear_velocity_limit",
             "precision_linear_velocity_limit", "policy_joint_velocity_fraction",
@@ -136,6 +200,12 @@ class PolicyConfig:
             or not 0.0 < self.target_filter_alpha <= 1.0
         ):
             raise ValueError("target_filter_alpha must be in (0, 1]")
+        if self.target_selection_mode not in {"middle", "middle_angle", "middle_geometry"}:
+            raise ValueError("target_selection_mode must be middle, middle_angle, or middle_geometry")
+        if not 0.0 < self.target_middle_fraction < 0.5:
+            raise ValueError("target_middle_fraction must be in (0, 0.5)")
+        if not 0.0 <= self.target_min_crossing_angle_deg <= 90.0:
+            raise ValueError("target_min_crossing_angle_deg must be in [0, 90]")
         if not 0.0 < self.policy_joint_velocity_fraction <= 1.0:
             raise ValueError("policy_joint_velocity_fraction must be in (0, 1]")
         if not isinstance(self.strict_vertical_gripper, bool):
@@ -152,6 +222,35 @@ class PolicyConfig:
             raise ValueError("nero_weighted_pose_ik must be boolean")
         if not isinstance(self.nero_finger_tips_down, bool):
             raise ValueError("nero_finger_tips_down must be boolean")
+        if not isinstance(self.intercept_tilt_realign, bool):
+            raise ValueError("intercept_tilt_realign must be boolean")
+        if self.intercept_tilt_abort_limit < self.intercept_tilt_limit:
+            raise ValueError(
+                "intercept_tilt_abort_limit must be >= intercept_tilt_limit"
+            )
+        if (
+            not isinstance(self.intercept_segment_tolerance, int)
+            or isinstance(self.intercept_segment_tolerance, bool)
+            or self.intercept_segment_tolerance < 0
+        ):
+            raise ValueError(
+                "intercept_segment_tolerance must be a non-negative integer"
+            )
+        if not isinstance(self.corridor_clearance, bool):
+            raise ValueError("corridor_clearance must be boolean")
+        if (
+            not isinstance(self.corridor_index_gap, int)
+            or isinstance(self.corridor_index_gap, bool)
+            or self.corridor_index_gap < 1
+        ):
+            raise ValueError("corridor_index_gap must be a positive integer")
+        for name in (
+            "corridor_half_gap", "corridor_depth", "corridor_span",
+            "corridor_weight",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
         if not math.isfinite(self.nero_grasp_yaw_offset_deg):
             raise ValueError("nero_grasp_yaw_offset_deg must be finite")
         if (
@@ -201,10 +300,26 @@ class DynamicCableGraspPolicy:
         self.attempt_failure_count = 0
         self.last_attempt_failure: str | None = None
         self._retry_after_failure_observe = False
+        self.realign_count = 0
+        self._tilt_realign_active = False
+        self._realign_start_time: float | None = None
+        # CLOSE-gate triage counters.  Nothing here feeds back into control;
+        # they only record which of the three gates kept refusing to close, so
+        # a frozen run can be diagnosed without replaying every episode.
+        self.min_hand_cable_distance = float("inf")
+        self.min_distance_when_vertical_ok = float("inf")
+        self.close_gate_blocked_distance = 0
+        self.close_gate_blocked_vertical = 0
+        self.close_gate_blocked_segment = 0
+        self.max_segment_index_gap = 0
         self.finished = False
         self.result = "running"
         self.failure_diagnostics: dict | None = None
         self.filtered_target = np.zeros(3)
+        self.selected_target_body_id = self.env.target_body_id
+        self.selected_target_index = self._policy_node_ids().index(self.env.target_body_id)
+        self.selected_target_crossing_angle_deg = float("nan")
+        self.selected_target_corridor_clearance = float("nan")
         self.locked_segment_index: int | None = None
         self.locked_segment_alpha = 0.0
         self.locked_node_ids: list[int] | None = None
@@ -256,19 +371,218 @@ class DynamicCableGraspPolicy:
         simulator target. Vision-only subclasses override this hook so the
         shared phase machine never needs to read cable ground truth.
         """
-        return self.env.target_position()
+        return self.env.data.xpos[self.selected_target_body_id].copy()
+
+    def _corridor_clearance(
+        self,
+        positions: np.ndarray,
+        index: int,
+        closing: np.ndarray,
+        approach: np.ndarray,
+        lateral: np.ndarray,
+    ) -> float:
+        """Closing-axis offset to the nearest strand the pads could also trap.
+
+        The jaw sweeps a box, not a disc: a node only competes with the grasp
+        when it lies inside the pad reach along the approach axis and along the
+        jaw's long axis.  Material neighbours are excluded because they belong
+        to the segment being pinched rather than to a second strand.  Nodes
+        outside the box report the box depth so the caller can compare them
+        against ``corridor_half_gap`` without a separate flag.
+        """
+
+        gap = self.config.corridor_index_gap
+        far = np.abs(np.arange(len(positions)) - index) >= gap
+        if not bool(np.any(far)):
+            return self.config.corridor_depth
+        delta = positions - positions[index]
+        inside = (
+            far
+            & (np.abs(delta @ approach) <= self.config.corridor_depth)
+            & (np.abs(delta @ lateral) <= self.config.corridor_span)
+        )
+        if not bool(np.any(inside)):
+            return self.config.corridor_depth
+        return float(np.min(np.abs(delta[inside] @ closing)))
+
+    def _jaw_box_blocked(self) -> bool:
+        """Whether two strands inside the live pad box exceed the aperture.
+
+        Unlike :meth:`_corridor_clearance` this uses no material-coordinate
+        rule, because the fatal configuration is a tight fold whose legs are
+        adjacent in index but far apart in space.  The closing axis is bounded
+        by physics rather than by the box: a node can only be trapped while its
+        offset along that axis stays within half the aperture plus one cable
+        radius, so anything further away cannot be pinched and must not veto
+        the site.
+        """
+
+        aperture = self.config.box_aperture_limit
+        radius = float(self.env.cable_radius)
+        rotation = self.env.data.xmat[self.env.hand_id].reshape(3, 3)
+        pad = (self.env.data.xpos[self.env.hand_id]
+               + rotation @ self.env.GRASP_CENTER_LOCAL)
+        delta = self.env.data.xpos[self._policy_node_ids()] - pad
+        inside = (
+            (np.abs(delta @ (rotation @ self.env.gripper_closing_axis_local))
+             <= aperture / 2.0 + radius)
+            & (np.abs(delta @ (rotation @ self.env.gripper_lateral_axis_local))
+               <= self.config.box_lat_half)
+            & (np.abs(delta @ (rotation @ self.env.gripper_approach_axis_local))
+               <= self.config.box_dep_half)
+        )
+        if int(np.count_nonzero(inside)) < 2:
+            return False
+        closing = (delta @ (rotation @ self.env.gripper_closing_axis_local))[inside]
+        return bool(float(closing.max() - closing.min()) + 2.0 * radius > aperture)
+
+    def _choose_initial_target(self, desired_rotation: np.ndarray) -> None:
+        """Pick one near-middle node without changing the environment's task."""
+
+        node_ids = self._policy_node_ids()
+        self.selected_target_body_id = self.env.target_body_id
+        self.selected_target_index = node_ids.index(self.selected_target_body_id)
+        self.selected_target_crossing_angle_deg = float("nan")
+        self.selected_target_corridor_clearance = float("nan")
+        if self.config.target_selection_mode == "middle":
+            return
+
+        positions = self.env.data.xpos[node_ids, :2]
+        closing = (
+            desired_rotation @ self.env.gripper_closing_axis_local
+        )[:2]
+        closing /= max(float(np.linalg.norm(closing)), 1e-12)
+        middle = len(node_ids) // 2
+        geometry_mode = self.config.target_selection_mode == "middle_geometry"
+        # The corridor test needs the full 3D jaw frame; middle and
+        # middle_angle never score geometry so they keep the planar path.
+        corridor = bool(self.config.corridor_clearance and geometry_mode)
+        if corridor:
+            def unit(axis: np.ndarray) -> np.ndarray:
+                return axis / max(float(np.linalg.norm(axis)), 1e-12)
+
+            positions3 = self.env.data.xpos[node_ids]
+            closing3 = unit(
+                desired_rotation @ self.env.gripper_closing_axis_local
+            )
+            approach3 = unit(
+                desired_rotation @ self.env.gripper_approach_axis_local
+            )
+            lateral3 = unit(
+                desired_rotation @ self.env.gripper_lateral_axis_local
+            )
+        fraction = (max(self.config.target_middle_fraction, 0.30)
+                    if geometry_mode
+                    else self.config.target_middle_fraction)
+        radius = max(1, int(round(fraction * len(node_ids))))
+        candidates: list[tuple[int, float, float, float]] = []
+        for index in range(max(1, middle - radius), min(len(node_ids) - 1, middle + radius + 1)):
+            tangent = positions[index + 1] - positions[index - 1]
+            length = float(np.linalg.norm(tangent))
+            if length < 1e-8:
+                continue
+            tangent /= length
+            angle = math.degrees(math.acos(float(np.clip(
+                abs(np.dot(tangent, closing)), 0.0, 1.0
+            ))))
+            quality = 0.0
+            jaw_clearance = float("nan")
+            if geometry_mode:
+                span = min(3, index, len(node_ids) - 1 - index)
+                before = positions[index] - positions[index - span]
+                after = positions[index + span] - positions[index]
+                before /= max(float(np.linalg.norm(before)), 1e-12)
+                after /= max(float(np.linalg.norm(after)), 1e-12)
+                bend = math.degrees(math.acos(float(np.clip(
+                    np.dot(before, after), -1.0, 1.0
+                ))))
+                other = [j for j in range(len(node_ids)) if abs(j - index) >= 6]
+                clearance = (min(float(np.linalg.norm(positions[index] - positions[j]))
+                                 for j in other) if other else 0.12)
+                reach = float(np.linalg.norm(positions[index] - self.env.hand_position[:2]))
+                # A clear, locally straight section is more useful than one
+                # whose node happens to lie one step closer to the midpoint.
+                quality = (
+                    -2.0 * min(bend / 45.0, 2.0)
+                    + 1.0 * min(clearance / 0.10, 1.0)
+                    - 0.10 * abs(index - middle)
+                    - 1.5 * max(reach - 0.25, 0.0) / 0.10
+                )
+                if hasattr(self, "attempted_target_indices") and index in self.attempted_target_indices:
+                    quality -= 3.0
+                if corridor:
+                    jaw_clearance = self._corridor_clearance(
+                        positions3, index, closing3, approach3, lateral3
+                    )
+                    quality += self.config.corridor_weight * min(
+                        jaw_clearance / self.config.corridor_half_gap, 1.0
+                    )
+            candidates.append((index, angle, quality, jaw_clearance))
+        if not candidates:
+            return
+        if self.config.retry_hard_blacklist and self.attempted_target_indices:
+            fresh = [
+                candidate for candidate in candidates
+                if candidate[0] not in self.attempted_target_indices
+            ]
+            if fresh:
+                candidates = fresh
+        if corridor:
+            # A site whose closing corridor is blocked cannot be rescued by a
+            # better approach, so drop those sites outright whenever the window
+            # still offers at least one clean alternative.
+            clean = [
+                candidate for candidate in candidates
+                if candidate[3] >= self.config.corridor_half_gap
+            ]
+            if clean:
+                candidates = clean
+        favorable = [
+            candidate for candidate in candidates
+            if candidate[1] >= self.config.target_min_crossing_angle_deg
+        ]
+        if favorable:
+            # Among acceptable crossings, move as little as possible from the
+            # baseline midpoint.  Angle breaks equal-distance ties.
+            if geometry_mode:
+                index, angle, _, jaw_clearance = max(favorable, key=lambda item: (
+                    item[2], item[1], -abs(item[0] - middle), -item[0]
+                ))
+            else:
+                index, angle, _, jaw_clearance = min(favorable, key=lambda item: (
+                    abs(item[0] - middle), -item[1], item[0]
+                ))
+        else:
+            index, angle, _, jaw_clearance = max(candidates, key=lambda item: (
+                item[1], item[2], -abs(item[0] - middle), -item[0]
+            ))
+        self.selected_target_index = index
+        self.selected_target_body_id = node_ids[index]
+        self.selected_target_crossing_angle_deg = angle
+        self.selected_target_corridor_clearance = jaw_clearance
 
     def reset(self) -> None:
         self.phase = Phase.SETTLE
         self.phase_start = float(self.env.data.time)
         self.retry_count = 0
+        self.attempted_target_indices: set[int] = set()
         self.attempt_failure_count = 0
         self.last_attempt_failure = None
         self._retry_after_failure_observe = False
+        self.realign_count = 0
+        self._tilt_realign_active = False
+        self._realign_start_time = None
+        self.min_hand_cable_distance = float("inf")
+        self.min_distance_when_vertical_ok = float("inf")
+        self.close_gate_blocked_distance = 0
+        self.close_gate_blocked_vertical = 0
+        self.close_gate_blocked_segment = 0
+        self.close_gate_blocked_box = 0
+        self.max_segment_index_gap = 0
         self.finished = False
         self.result = "running"
         self.failure_diagnostics = None
-        self.filtered_target = self._initial_target()
+        self.filtered_target = np.zeros(3)
         self.locked_segment_index = None
         self.locked_segment_alpha = 0.0
         self.locked_node_ids = None
@@ -308,6 +622,8 @@ class DynamicCableGraspPolicy:
         self.desired_approach_axis = (
             desired_rotation @ self.env.gripper_approach_axis_local
         )
+        self._choose_initial_target(desired_rotation)
+        self.filtered_target = self._initial_target()
 
     @property
     def phase_time(self) -> float:
@@ -368,7 +684,10 @@ class DynamicCableGraspPolicy:
         override to track a selected cable segment instead.
         """
 
-        return self.env.target_position(), self.env.target_velocity()
+        return (
+            self.env.data.xpos[self.selected_target_body_id].copy(),
+            self.env.body_linear_velocity(self.selected_target_body_id),
+        )
 
     def _select_intercept_segment(self, point: np.ndarray) -> np.ndarray:
         """Choose the material segment locked when descent begins.
@@ -377,7 +696,27 @@ class DynamicCableGraspPolicy:
         to implement predictive segment selection.
         """
 
-        return self._lock_segment_near(point)
+        if self.config.target_selection_mode != "middle_geometry":
+            return self._lock_segment_near(point)
+        node_ids = self._policy_node_ids()
+        positions = self.env.data.xpos[node_ids]
+        lo = max(0, self.selected_target_index - 2)
+        hi = min(len(node_ids) - 2, self.selected_target_index + 1)
+        candidates = []
+        for index in range(lo, hi + 1):
+            vector = positions[index + 1] - positions[index]
+            alpha = float(np.clip(
+                np.dot(point - positions[index], vector)
+                / max(float(np.dot(vector, vector)), 1e-12), 0.0, 1.0
+            ))
+            candidate = positions[index] + alpha * vector
+            candidates.append((float(np.linalg.norm(candidate - point)), index, alpha, candidate))
+        _, index, alpha, nearest = min(candidates, key=lambda item: item[0])
+        self.locked_segment_index = index
+        self.locked_segment_alpha = alpha
+        self.locked_node_ids = node_ids
+        self.filtered_target = nearest.copy()
+        return nearest
 
     def _policy_node_ids(self) -> list[int]:
         """脚本策略当前关注的对象节点集合（多对象时为目标对象）。"""
@@ -476,6 +815,8 @@ class DynamicCableGraspPolicy:
 
         self.attempt_failure_count += 1
         self.last_attempt_failure = "failed_no_contact"
+        if self.config.target_selection_mode == "middle_geometry":
+            self.attempted_target_indices.add(self.selected_target_index)
         if self._retry_available():
             self.retry_count += 1
             self.result = "running"
@@ -483,6 +824,18 @@ class DynamicCableGraspPolicy:
             return self._ik_action(self.recover_start, self.env.gripper_open_ctrl)
         self.result = "failed_no_contact"
         self._transition(Phase.RELEASE)
+        return self._ik_action(hand, self.env.gripper_open_ctrl)
+
+    def _realign_tilt(self, hand: np.ndarray) -> np.ndarray:
+        """Hold position and recover the approach axis instead of retrying.
+
+        Requesting the current hand position makes the position error vanish, so
+        the orientation task can run as primary without the hand drifting away
+        from the segment it was descending on.
+        """
+
+        self.realign_count += 1
+        self._tilt_realign_active = True
         return self._ik_action(hand, self.env.gripper_open_ctrl)
 
     def _observe_grasp_break(
@@ -574,9 +927,20 @@ class DynamicCableGraspPolicy:
             or post_grasp_orientation_priority
             or intercept_orientation_priority
             or approach_orientation_priority
+            or self._tilt_realign_active
         )
-        if self.env.robot == "nero" and self.config.nero_weighted_pose_ik:
-            pose_weight = self.config.nero_pose_orientation_weight
+        # Re-alignment deliberately bypasses the downweighted pose solve: the
+        # position error is already zeroed, so a 0.35 orientation weight would
+        # only slow the tilt recovery this branch exists to perform.
+        if self.env.robot == "nero" and not self._tilt_realign_active and (
+            self.config.nero_weighted_pose_ik
+            or self.config.target_selection_mode == "middle_geometry"
+        ):
+            pose_weight = (
+                0.35 if self.config.target_selection_mode == "middle_geometry"
+                and not self.config.nero_weighted_pose_ik
+                else self.config.nero_pose_orientation_weight
+            )
             weighted_jacobian = np.vstack([
                 position_jacobian,
                 pose_weight * jacobian[3:],
@@ -780,6 +1144,7 @@ class DynamicCableGraspPolicy:
     def action(self) -> np.ndarray:
         """推进反应式状态机，并返回一个控制周期的动作。"""
         # 无论处于哪个阶段，策略只读取环境状态并返回动作，不直接修改线缆物理。
+        self._tilt_realign_active = False
         tilt_error = self._tilt_error()
         self.tilt_error_sum += tilt_error
         self.tilt_error_samples += 1
@@ -840,23 +1205,85 @@ class DynamicCableGraspPolicy:
             # 实际两指夹持中心直接追踪目标线缆段中心，不再使用旧虚拟点的z补偿。
             desired = target.copy()
             tilt_angle = self._tilt_error()
+            abort_limit = (
+                self.config.intercept_tilt_abort_limit
+                if self.config.intercept_tilt_realign
+                else self.config.intercept_tilt_limit
+            )
             if (
-                tilt_angle > self.config.intercept_tilt_limit
+                tilt_angle > abort_limit
                 or self._minimum_task_singular_value()
                 < self.config.intercept_singularity_limit
             ):
+                self._realign_start_time = None
                 return self._retry_from_unsafe_pose(hand)
-            nearest, nearest_distance, _, _ = self._nearest_cable_point(hand)
+            if (
+                self.config.intercept_tilt_realign
+                and tilt_angle > self.config.intercept_tilt_limit
+                and self.phase_time <= self.config.intercept_timeout
+            ):
+                now = float(self.env.data.time)
+                if self._realign_start_time is None:
+                    self._realign_start_time = now
+                elif (
+                    now - self._realign_start_time
+                    > self.config.intercept_tilt_realign_timeout
+                ):
+                    # The approach axis is not recoverable at this location, so
+                    # only now pay for a retry.
+                    self._realign_start_time = None
+                    return self._retry_from_unsafe_pose(hand)
+                return self._realign_tilt(hand)
+            self._realign_start_time = None
+            nearest, nearest_distance, nearest_index, _ = (
+                self._nearest_cable_point(hand)
+            )
             # 截获期间持续追踪进入该阶段时锁定的材料线段，避免在相邻弯折间
             # 跳变；但闭爪触发仍以任意真实线缆中心线进入夹持区域为准。
             vertical_ready = (
                 not self.config.strict_vertical_gripper
                 or tilt_angle < self.config.strict_vertical_tolerance
             )
+            intended_segment_ready = True
+            if (
+                self.config.target_selection_mode == "middle_geometry"
+                and self.locked_segment_index is not None
+            ):
+                intended_segment_ready = (
+                    abs(self._nearest_cable_point(hand)[2]
+                        - self.locked_segment_index)
+                    <= self.config.intercept_segment_tolerance
+                )
+            if vertical_ready:
+                self.min_distance_when_vertical_ok = min(
+                    self.min_distance_when_vertical_ok,
+                    float(nearest_distance),
+                )
+            self.min_hand_cable_distance = min(
+                self.min_hand_cable_distance, float(nearest_distance)
+            )
+            if self.locked_segment_index is not None:
+                self.max_segment_index_gap = max(
+                    self.max_segment_index_gap,
+                    abs(int(nearest_index) - int(self.locked_segment_index)),
+                )
+            if nearest_distance >= self._close_capture_distance():
+                self.close_gate_blocked_distance += 1
+            elif not vertical_ready:
+                self.close_gate_blocked_vertical += 1
+            elif not intended_segment_ready:
+                self.close_gate_blocked_segment += 1
             if (
                 nearest_distance < self._close_capture_distance()
                 and vertical_ready
+                and intended_segment_ready
             ):
+                if self.config.close_box_gate and self._jaw_box_blocked():
+                    # Two strands already sit inside the pad travel, so closing
+                    # here can only stall above the aperture.  Recovering costs
+                    # a second or two; a stalled close costs the episode.
+                    self.close_gate_blocked_box += 1
+                    return self._retry_from_unsafe_pose(hand)
                 desired = self._lock_segment_near(nearest)
                 self.filtered_target = desired.copy()
                 self._transition(Phase.CLOSE)
@@ -887,6 +1314,9 @@ class DynamicCableGraspPolicy:
                     close_contacts or self.env.grasp_state is not None
                 )
                 close_timed_out = (
+                    (self.config.target_selection_mode == "middle_geometry"
+                     and self.phase_time > self.config.close_invalid_contact_timeout)
+                    or
                     (
                         self.phase_time > self.config.close_hard_timeout
                         and not contact_evidence
@@ -911,6 +1341,10 @@ class DynamicCableGraspPolicy:
             blend = self._smoothstep(self.phase_time / 1.0)
             desired = (1.0 - blend) * self.recover_start + blend * self.recover_goal
             if self.phase_time > 1.0:
+                if self.config.target_selection_mode == "middle_geometry":
+                    self._choose_initial_target(self._nero_grasp_rotation(
+                        self.config.nero_grasp_yaw_offset_deg
+                    ) if self.env.robot == "nero" else self.VERTICAL_GRASP_ROTATION)
                 self.filtered_target = self._initial_target()
                 self._transition(Phase.APPROACH)
             return self._ik_action(desired, self.env.gripper_open_ctrl)
@@ -1005,10 +1439,18 @@ class DynamicCableGraspPolicy:
         self.finished = True
         return self._home_action()
 
-    def policy_info(self) -> dict[str, float | int | bool]:
+    def policy_info(self) -> dict[str, float | int | bool | None]:
         """Return orientation-ablation diagnostics for benchmark rows."""
 
         return {
+            "policy_selected_target_body_id": self.selected_target_body_id,
+            "policy_selected_target_index": self.selected_target_index,
+            "policy_selected_target_crossing_angle_deg": (
+                self.selected_target_crossing_angle_deg
+            ),
+            "policy_selected_target_corridor_clearance": (
+                self.selected_target_corridor_clearance
+            ),
             "strict_vertical_gripper": self.config.strict_vertical_gripper,
             "mean_tilt_error_rad": (
                 self.tilt_error_sum / max(self.tilt_error_samples, 1)
@@ -1022,6 +1464,27 @@ class DynamicCableGraspPolicy:
             "grasp_tilt_samples": self.grasp_tilt_error_samples,
             "policy_retry_count": self.retry_count,
             "policy_attempt_failure_count": self.attempt_failure_count,
+            "policy_tilt_realign_count": self.realign_count,
+            "policy_min_hand_cable_distance": (
+                None
+                if math.isinf(self.min_hand_cable_distance)
+                else float(self.min_hand_cable_distance)
+            ),
+            "policy_min_distance_when_vertical_ok": (
+                None
+                if math.isinf(self.min_distance_when_vertical_ok)
+                else float(self.min_distance_when_vertical_ok)
+            ),
+            "policy_close_gate_blocked_distance": (
+                self.close_gate_blocked_distance
+            ),
+            "policy_close_gate_blocked_vertical": (
+                self.close_gate_blocked_vertical
+            ),
+            "policy_close_gate_blocked_segment": (
+                self.close_gate_blocked_segment
+            ),
+            "policy_max_segment_index_gap": self.max_segment_index_gap,
         }
 
     def summary(self) -> str:

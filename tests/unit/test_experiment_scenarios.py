@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from unittest.mock import patch
 
 import mujoco
 import numpy as np
@@ -725,18 +726,59 @@ class EnvironmentScenarioTests(unittest.TestCase):
             policy.phase = Phase.APPROACH
             position = np.array([0.50, 0.00, 0.05])
             policy.filtered_target = position.copy()
-            env.target_position = lambda: position.copy()
-            env.target_velocity = lambda: np.array([0.30, 0.20, 0.00])
-            predicted = policy._predicted_segment()
-            expected_unfiltered_offset = np.array([0.09, 0.06, 0.0])
+            self.assertEqual(policy.selected_target_body_id, env.target_body_id)
+            env.data.xpos[env.target_body_id] = position
+            with patch.object(
+                env, "body_linear_velocity",
+                return_value=np.array([0.30, 0.20, 0.00]),
+            ) as velocity:
+                predicted = policy._predicted_segment()
+            velocity.assert_called_once_with(env.target_body_id)
             self.assertTrue(np.allclose(
                 predicted,
-                position + 0.10 * expected_unfiltered_offset,
+                np.array([0.509, 0.006, 0.05]),
                 rtol=0.0,
                 atol=1e-12,
             ))
         finally:
             del env
+
+    def test_prediction_uses_selected_node_position_and_velocity(self) -> None:
+        for mode in ("middle_angle", "middle_geometry"):
+            with self.subTest(target_selection_mode=mode):
+                env = self.make("id_static")
+                try:
+                    env.reset(randomize=False, seed=1010)
+                    policy = DynamicCableGraspPolicy(
+                        env, PolicyConfig(target_selection_mode=mode),
+                    )
+                    # Fix the selector's output to isolate prediction from its
+                    # geometry heuristic, using a node other than the task target.
+                    node_ids = policy._policy_node_ids()
+                    index = node_ids.index(env.target_body_id) + 1
+                    selected_body = node_ids[index]
+                    policy.selected_target_index = index
+                    policy.selected_target_body_id = selected_body
+                    policy.phase = Phase.APPROACH
+                    policy.filtered_target = np.array([0.60, 0.02, 0.06])
+                    env.data.xpos[selected_body] = [0.60, 0.02, 0.06]
+                    env.data.xpos[env.target_body_id] = [0.40, -0.10, 0.04]
+                    velocities = {
+                        selected_body: np.array([-0.20, -0.35, 0.00]),
+                        env.target_body_id: np.array([0.30, 0.20, 0.00]),
+                    }
+                    with patch.object(
+                        env, "body_linear_velocity",
+                        side_effect=lambda body: velocities[body].copy(),
+                    ) as velocity:
+                        predicted = policy._predicted_segment()
+                    velocity.assert_called_once_with(selected_body)
+                    self.assertTrue(np.allclose(
+                        predicted, np.array([0.594, 0.0095, 0.06]),
+                        rtol=0.0, atol=1e-12,
+                    ))
+                finally:
+                    del env
 
     def test_environment_rejects_nonfinite_actions(self) -> None:
         env = self.make("id_static")

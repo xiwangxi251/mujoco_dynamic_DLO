@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from datetime import datetime, timezone
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
@@ -123,6 +123,42 @@ def _recordable_config(config: EnvConfig, enabled: bool) -> EnvConfig:
     return replace(config, dynamicvla_cameras_enabled=enabled)
 
 
+def _coerce_scripted_option(name: str, raw: str) -> Any:
+    """Coerce one --scripted-option value to the declared PolicyConfig type."""
+
+    for field in fields(PolicyConfig):
+        if field.name != name:
+            continue
+        annotation = field.type if isinstance(field.type, str) else field.type.__name__
+        if annotation == "bool":
+            lowered = raw.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+            raise ValueError(f"--scripted-option {name} must be a boolean")
+        if annotation == "int":
+            return int(raw)
+        if annotation == "float":
+            return float(raw)
+        if annotation == "str":
+            return raw
+        raise ValueError(f"--scripted-option {name} has unsupported type {annotation}")
+    raise ValueError(f"unknown scripted policy option: {name}")
+
+
+def _parse_scripted_options(pairs: list[str] | None) -> dict[str, Any]:
+    """Turn repeated NAME=VALUE pairs into a typed PolicyConfig override map."""
+
+    overrides: dict[str, Any] = {}
+    for pair in pairs or []:
+        name, separator, raw = pair.partition("=")
+        if not separator:
+            raise ValueError(f"--scripted-option expects NAME=VALUE, got {pair!r}")
+        overrides[name.strip()] = _coerce_scripted_option(name.strip(), raw)
+    return overrides
+
+
 def _scripted_policy_config(options: Any) -> PolicyConfig:
     """Build the scripted policy config, keeping horizon overrides optional."""
 
@@ -136,11 +172,13 @@ def _scripted_policy_config(options: Any) -> PolicyConfig:
         "strict_vertical_tolerance": float(
             option("strict_vertical_tolerance", 0.35)
         ),
+        "target_selection_mode": str(option("scripted_target_selection", "middle")),
     }
     for name in ("prediction_horizon", "approach_prediction_horizon"):
         value = option(name)
         if value is not None:
             kwargs[name] = float(value)
+    kwargs.update(option("scripted_options") or {})
     return PolicyConfig(**kwargs)
 
 
@@ -241,6 +279,12 @@ def _base_row(
         ),
         "rigid_motion_released": bool(info.get("rigid_motion_released", False)),
         "termination_reason": info.get("termination_reason"),
+        "initial_shape_bank": initial_info.get("initial_shape_bank"),
+        "initial_shape_entry": initial_info.get("initial_shape_entry"),
+        "initial_shape_step": initial_info.get("initial_shape_step"),
+        "initial_shape_source_seed": initial_info.get(
+            "initial_shape_source_seed"
+        ),
         "cable_length_scale": float(initial_info.get("cable_length_scale", 1.0)),
         "cable_density_scale": float(initial_info.get("cable_density_scale", 1.0)),
         "cable_stiffness_scale": float(
@@ -868,6 +912,15 @@ def parse_args() -> argparse.Namespace:
         help="optional scripted-policy APPROACH prediction horizon in seconds",
     )
     parser.add_argument(
+        "--scripted-target-selection",
+        choices=("middle", "middle_angle", "middle_geometry"), default="middle",
+        help=(
+            "scripted target ablation: fixed midpoint, or closest near-middle "
+            "node with a favorable tangent-to-jaw crossing angle, or a "
+            "straight and isolated section near the middle"
+        ),
+    )
+    parser.add_argument(
         "--arm-actuator-gain-scale", type=float, default=1.0,
         help=(
             "diagnostic-only multiplicative scale for the first seven arm "
@@ -900,9 +953,23 @@ def parse_args() -> argparse.Namespace:
             "solve translation in its nullspace"
         ),
     )
+    parser.add_argument(
+        "--scripted-option",
+        action="append",
+        default=None,
+        metavar="NAME=VALUE",
+        help=(
+            "override a scripted PolicyConfig field, repeatable, e.g. "
+            "--scripted-option intercept_tilt_realign=true"
+        ),
+    )
     parser.add_argument("--output", type=Path, default=output_path("benchmarks"))
     args = parser.parse_args()
     args.methods = list(dict.fromkeys(args.methods))
+    try:
+        args.scripted_options = _parse_scripted_options(args.scripted_option)
+    except ValueError as error:
+        parser.error(str(error))
     arm_actuator_gain_scale = getattr(args, "arm_actuator_gain_scale", 1.0)
     positive = (
         args.episodes >= 1
@@ -1013,6 +1080,12 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                     ),
                     "approach_prediction_horizon": getattr(
                         args, "approach_prediction_horizon", None,
+                    ),
+                    "scripted_target_selection": getattr(
+                        args, "scripted_target_selection", "middle",
+                    ),
+                    "scripted_options": getattr(
+                        args, "scripted_options", None,
                     ),
                     "arm_actuator_gain_scale": getattr(
                         args, "arm_actuator_gain_scale", 1.0,
