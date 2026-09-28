@@ -98,7 +98,7 @@ L1 为较简单的单向轨迹，L2 为带横向变化的曲线轨迹。二者�
 - 对象场景：`object_family` / `object_families` / `n_objects` /
   `multi_object_layout` 把单线缆换成 9 个可变形对象族（含步态模板与 GLB
   蒙皮）或 conveyor/parallel/crossing 多对象布局；细节见
-  [可变形对象场景](experiments/deformable_object_scenes.md)。
+  [可变形对象场景](experiments/scenes/deformable_object_scenes.md)。
 - 评测侧另有 `strict_vertical_gripper` 协议选项（benchmark/run_grasp），
   约束抓取时夹爪接近竖直姿态，不属于环境配置。
 

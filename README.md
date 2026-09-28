@@ -114,7 +114,7 @@ panda-cable-diffusion-eval \
 该实现以 `[xyz, euler_xyz]` 状态和 `[dxyz, deuler_xyz, gripper]` 相对
 delta 动作块为契约（与 DynamicVLA 一致），预测 16 步动作块，每次执行
 8 步后重规划；执行端复用 DynamicVLA 的任务空间 IK 和安全限幅。详细说明见
-[`docs/diffusion_policy.md`](docs/diffusion_policy.md)。
+[`docs/experiments/policies/diffusion_policy.md`](docs/experiments/policies/diffusion_policy.md)。
 
 并行采集时，`--workers` 控制并行场景数，`--envs-per-scenario` 控制每个场景
 内部的独立 MuJoCo 环境数。采集器会实时显示 attempts/h、successes/h 和 ETA，并可用
@@ -173,13 +173,13 @@ panda_cable_grasp/
 ## 文档索引
 
 - [项目目标、整体规划、进度和问题](../docs/project_status.md)（仓库外，项目根 `docs/`）
+- [文档目录结构与导航](docs/README.md)
 - [环境端进度](docs/environment.md)
-- [Scripted 与 Expert 实验记录](docs/scripted_policy_experiments.md)
-- [RL 实验记录](docs/rl_experiments.md)
-- [DynamicVLA 实验记录](docs/dynamicvla_experiments.md)
+- [实验索引与实验记录](docs/experiments/README.md)（按 `policies/`、`perception/`、`scenes/` 分类）
+- [架构、评测、协议、部署参考](docs/reference/)
 
-架构、实验协议、统一评测和服务器部署等辅助说明位于 `docs/reference/`；实验索引和专项诊断
-位于 `docs/experiments/`。
+实验记录按类别存放于 `docs/experiments/policies/`（策略与端到端方法）、
+`docs/experiments/perception/`（感知）和 `docs/experiments/scenes/`（对象与场景）。
 
 文档分工：README 只负责安装和导航；本仓库 `docs/` 只保存实验结果类文档与代码参考；
 整体规划类文档（`project_status.md`、论文计划、仓库 AGENTS 约定等）位于仓库之外的

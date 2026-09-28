@@ -7,11 +7,11 @@
 - `ckt`：零样本权重，没有使用本项目的线缆数据进行微调；
 - `cable-four-scenarios-200-latest`：使用本项目采集的 200 条数据进行 Finetune。
 
-项目整体目标与问题见[项目状态](../../docs/project_status.md)，环境实现见[环境端进度](environment.md)。
+项目整体目标与问题见[项目状态](../../../../docs/project_status.md)，环境实现见[环境端进度](../../environment.md)。
 
 ## 1. 实验设置
 
-评测使用环境端定义的四个固定场景，具体场景说明见[环境端进度](environment.md)。
+评测使用环境端定义的四个固定场景，具体场景说明见[环境端进度](../../environment.md)。
 
 ```text
 instruction = Pick up the blue cable.
