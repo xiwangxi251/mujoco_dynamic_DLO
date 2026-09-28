@@ -1,8 +1,8 @@
 # 可变形态操作对象与多对象动态场景
 
 Status: implemented + locally smoke-tested (2026-09-20，v4 真 mesh 蒙皮：
-fish 族用 barramundi.glb 真实鱼模型带贴图)。演示视频在
-`docs/demo_media/dev_*.mp4`（NERO 机械臂）。
+fish 族用 barramundi.glb 真实鱼模型带贴图)。鱼类外观场景的演示视频在
+项目根 `videos/fish_appearance_demos/dev_*.mp4`（NERO 机械臂）。
 
 ## 目标
 

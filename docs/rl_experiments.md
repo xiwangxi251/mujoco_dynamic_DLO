@@ -345,5 +345,5 @@ rigid `15/0`、shape `6/2`、combined `4/0`，合计为 `29/3`，另有 48 个 t
 | `756c591` | 基于线缆插入深度的闭合门控 |
 | `3506f63` | 重平衡过早闭合奖励，防止始终张开塌缩 |
 
-当前目标和问题见[项目状态](project_status.md)，统一实验目录与评估约定见
+当前目标和问题见[项目状态](../../docs/project_status.md)，统一实验目录与评估约定见
 [实验协议](reference/experiment_protocol.md)，实验可信度和产物索引见[实验索引](experiments/README.md)。

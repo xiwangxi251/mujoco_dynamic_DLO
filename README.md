@@ -119,7 +119,7 @@ delta 动作块为契约（与 DynamicVLA 一致），预测 16 步动作块，�
 并行采集时，`--workers` 控制并行场景数，`--envs-per-scenario` 控制每个场景
 内部的独立 MuJoCo 环境数。采集器会实时显示 attempts/h、successes/h 和 ETA，并可用
 `--resume --run-name <名称>` 续跑中断任务。当前实验状态和各方法的实验文档入口见
-  [项目状态](docs/project_status.md)。
+  [项目状态](../docs/project_status.md)。
 
 这些命令由 `pyproject.toml` 注册。Python 代码应直接从
 `panda_cable_grasp` 包导入；旧的根目录转发脚本和
@@ -149,7 +149,7 @@ panda_cable_grasp/
 ```
 
 完整模块关系见[架构说明](docs/reference/architecture.md)，当前目标、路线、进度和问题见
-[项目状态](docs/project_status.md)。
+[项目状态](../docs/project_status.md)。
 
 ## 输出目录
 
@@ -172,7 +172,7 @@ panda_cable_grasp/
 
 ## 文档索引
 
-- [项目目标、整体规划、进度和问题](docs/project_status.md)
+- [项目目标、整体规划、进度和问题](../docs/project_status.md)（仓库外，项目根 `docs/`）
 - [环境端进度](docs/environment.md)
 - [Scripted 与 Expert 实验记录](docs/scripted_policy_experiments.md)
 - [RL 实验记录](docs/rl_experiments.md)
@@ -181,6 +181,8 @@ panda_cable_grasp/
 架构、实验协议、统一评测和服务器部署等辅助说明位于 `docs/reference/`；实验索引和专项诊断
 位于 `docs/experiments/`。
 
-文档分工：README 只负责安装和导航；`project_status.md` 维护当前事实；
+文档分工：README 只负责安装和导航；本仓库 `docs/` 只保存实验结果类文档与代码参考；
+整体规划类文档（`project_status.md`、论文计划、仓库 AGENTS 约定等）位于仓库之外的
+项目根 [`../docs/`](../docs/)（规划类在 [`../docs/plans/`](../docs/plans/)）；
 `experiment_protocol.md` 维护冻结规则；方法实验文档保留必要的过程和结果。过期内容通过
 Git 历史追溯，不在当前文档树中重复保存。
