@@ -473,6 +473,8 @@ class EnvironmentScenarioTests(unittest.TestCase):
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1007)
+            # This test isolates dropout timing from the geometry predicate.
+            env._physical_grasp_geometry_valid = lambda: True
             env.grasp_state = GraspState(
                 body_id=env.target_body_id,
                 candidate_time=float(env.data.time),
@@ -499,6 +501,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         try:
             env.reset(randomize=False, seed=1008)
             center_index = env.cable_index[env.target_body_id]
+            env._physical_grasp_geometry_valid = lambda: True
             offset_body_id = env.cable_ids[
                 center_index + env.config.confirmed_grasp_contact_index_radius
             ]
@@ -528,6 +531,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1009)
+            env._physical_grasp_geometry_valid = lambda: True
             center_index = env.cable_index[env.target_body_id]
             outside_body_id = env.cable_ids[
                 center_index
@@ -1286,10 +1290,13 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_active_open_resumes_rigid_motion(self) -> None:
+    def test_actual_release_resumes_rigid_motion(self) -> None:
         env = self.make("id_rigid_l1_nominal")
         try:
             env.reset(seed=48)
+            env.data.qpos[env.finger_qpos_adr] = 0.015
+            env._current_grasp_error = lambda: 0.01
+            env._physical_grasp_candidate = lambda: env.target_body_id
             env.grasp_state = GraspState(
                 body_id=env.target_body_id,
                 candidate_time=float(env.data.time),
@@ -1300,6 +1307,12 @@ class EnvironmentScenarioTests(unittest.TestCase):
             env._update_rigid_motion_suspension_state()
             self.assertTrue(env.rigid_motion_suspended)
 
+            env._update_physical_grasp_state(gripper_closed=False)
+            env._update_rigid_motion_suspension_state()
+            self.assertTrue(env.rigid_motion_suspended)
+            self.assertIsNone(env.last_grasp_break)
+            # An OPEN request keeps holding until the jaws actually separate.
+            env.data.qpos[env.finger_qpos_adr] = 0.025
             env._update_physical_grasp_state(gripper_closed=False)
             env._update_rigid_motion_suspension_state()
             self.assertFalse(env.rigid_motion_suspended)

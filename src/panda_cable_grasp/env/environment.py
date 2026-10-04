@@ -788,6 +788,9 @@ class GraspState:
     bilateral_confirmed: bool  
     last_bilateral_time: float 
     lost_contact_time: float  
+    open_intent_time: float | None = None
+    open_intent_aperture: float | None = None
+    open_intent_during_contact_loss: bool = False
 
 
 @dataclass
@@ -2823,12 +2826,13 @@ class CableGraspEnv:
             "success_now": self.success_now,
             "success": self.ever_success,
             "grasp_break_count": len(self.grasp_break_history),
+            "grasp_judgement_version": "physical_holding_v2",
             "active_open_break_count": sum(
-                event["reason"] == "gripper_command_open"
+                event.get("causal_class") == "active_open"
                 for event in self.grasp_break_history
             ),
             "physical_slip_break_count": sum(
-                event["reason"] == "lost_physical_pad_contact"
+                event.get("causal_class") == "physical_slip"
                 for event in self.grasp_break_history
             ),
             "active_open_after_confirmed_count": sum(
@@ -2908,10 +2912,16 @@ class CableGraspEnv:
         self._replay_anchor_index = index
 
     def _update_physical_grasp_state(self, gripper_closed: bool) -> None:
-        """只根据内指垫接触、法向力和开口更新抓取状态。"""
-        if not gripper_closed:
-            self._clear_grasp_with_reason("gripper_command_open")
-            return
+        """Physical evidence controls state; commands only annotate release intent."""
+        state = self.grasp_state
+        if state is not None:
+            if not gripper_closed and state.open_intent_time is None:
+                state.open_intent_time = float(self.data.time)
+                state.open_intent_aperture = self.finger_aperture
+                state.open_intent_during_contact_loss = state.lost_contact_time > 0.0
+            if not self._physical_grasp_geometry_valid():
+                self._clear_grasp_with_reason("physical_grasp_geometry_lost")
+                return
 
         candidate = self._physical_grasp_candidate()
         timestep = float(self.model.opt.timestep)
@@ -2941,6 +2951,10 @@ class CableGraspEnv:
             if self.grasp_state.bilateral_confirmed and raw_bilateral:
                 self.grasp_state.last_bilateral_time = float(self.data.time)
                 self.grasp_state.lost_contact_time = 0.0
+                if gripper_closed:
+                    self.grasp_state.open_intent_time = None
+                    self.grasp_state.open_intent_aperture = None
+                    self.grasp_state.open_intent_during_contact_loss = False
                 return
             self.grasp_state.lost_contact_time += timestep
             if (
@@ -2975,6 +2989,10 @@ class CableGraspEnv:
         state.body_id = body_id
         state.last_bilateral_time = float(self.data.time)
         state.lost_contact_time = 0.0
+        if gripper_closed:
+            state.open_intent_time = None
+            state.open_intent_aperture = None
+            state.open_intent_during_contact_loss = False
         if (
             not state.bilateral_confirmed
             and self.data.time - state.candidate_time >= self.config.grasp_confirm_seconds
@@ -3042,13 +3060,37 @@ class CableGraspEnv:
         _, body_id = min(candidates)
         return body_id
 
+    def _physical_grasp_geometry_valid(self) -> bool:
+        if self.grasp_state is None:
+            return False
+        object_index = self._object_of_body[self.grasp_state.body_id]
+        return bool(
+            self.finger_aperture <= self._objects[object_index].aperture_limit
+            and self._current_grasp_error() <= 1.5 * self.config.max_pad_distance
+        )
+
+    def _grasp_has_bilateral_pad_contact(self) -> bool:
+        """Require pad contacts near the held material segment, on one object."""
+        if self.grasp_state is None:
+            return False
+        center = self.cable_index[self.grasp_state.body_id]
+        object_index = self._node_object[center]
+        fingers = {
+            finger for body, finger in self._finger_contact_pairs()
+            if self._node_object[self.cable_index[body]] == object_index
+            and abs(self.cable_index[body] - center)
+            <= self.config.confirmed_grasp_contact_index_radius
+        }
+        return self.left_finger_id in fingers and self.right_finger_id in fingers
+
     def _success_qualification(self, gripper_closed: bool) -> bool:
-        """主要根据线缆是否被举起且仍随夹爪运动判断成功。"""
+        """Success uses current physical holding, independently of commands."""
 
         if (
-            not gripper_closed
-            or self.grasp_state is None
+            self.grasp_state is None
             or not self.grasp_confirmed
+            or not self._physical_grasp_geometry_valid()
+            or not self._grasp_has_bilateral_pad_contact()
         ):
             return False
         body_id = self.grasp_state.body_id
@@ -3087,8 +3129,22 @@ class CableGraspEnv:
                 if state.lost_contact_time > 0.0
                 else "active_open"
             )
-        elif reason == "lost_physical_pad_contact":
-            causal_class = "physical_slip"
+        elif reason in ("lost_physical_pad_contact", "physical_grasp_geometry_lost"):
+            # Classification follows a real loss. OPEN alone never creates one.
+            if state.open_intent_time is not None:
+                physically_opened = bool(
+                    state.open_intent_aperture is not None
+                    and self.finger_aperture > state.open_intent_aperture + 1e-6
+                    and self.finger_aperture
+                    > self._objects[self._object_of_body[state.body_id]].aperture_limit
+                )
+                causal_class = (
+                    "active_open"
+                    if physically_opened and not state.open_intent_during_contact_loss
+                    else "open_during_contact_loss"
+                )
+            else:
+                causal_class = "physical_slip"
         else:
             causal_class = "other"
         self.last_grasp_break = {
@@ -3106,6 +3162,9 @@ class CableGraspEnv:
             "grasp_error": float(grasp_error),
             "finger_aperture": self.finger_aperture,
             "gripper_ctrl": float(self.data.ctrl[self.gripper_actuator_id]),
+            "open_intent_time": state.open_intent_time,
+            "open_intent_aperture": state.open_intent_aperture,
+            "open_intent_during_contact_loss": state.open_intent_during_contact_loss,
             "ever_success": bool(self.ever_success),
             "success_hold": float(self.success_hold),
         }

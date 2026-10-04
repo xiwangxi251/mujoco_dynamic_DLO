@@ -1060,12 +1060,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             return self._last_grasp_status
 
         pinch_confirmed = bool(self.base_env.grasp_confirmed)
-        pairs = self.base_env._finger_contact_pairs()
-        contacting_fingers = {finger for _, finger in pairs}
-        raw_bilateral = bool(
-            self.base_env.left_finger_id in contacting_fingers
-            and self.base_env.right_finger_id in contacting_fingers
-        )
+        raw_bilateral = self.base_env._grasp_has_bilateral_pad_contact()
 
         if pinch_confirmed:
             self._locked_body_id = state.body_id
@@ -1103,11 +1098,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._secured_contact_loss_hold = 0.0
         elif (
             secured_was_confirmed
-            and self._gripper_closed
             and secured_geometry_valid
             and not raw_bilateral
         ):
-            # 训练态只吸收极短的碰撞求解抖动；主动张爪不会获得这段宽限。
+            # Physical contact jitter gets the same grace for any command.
             self._secured_contact_loss_hold += action_seconds
             if (
                 self._secured_contact_loss_hold
@@ -1553,7 +1547,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         self._cable_lift_credit_previous = capped_lifted_fraction
 
-        active_open, physical_slip, _ = (
+        active_open, physical_slip, ambiguous_release = (
             self._classify_secured_grasp_break()
         )
         stall_reward, failed_unloaded_reward = self._update_pinch_session(
@@ -1566,14 +1560,14 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             and (self.goal is None or self.goal.previous_secured)
         )
         penalize_contact_loss = bool(
-            physical_slip and not self._contact_loss_penalty_applied
+            (physical_slip or ambiguous_release) and not self._contact_loss_penalty_applied
             and (self.goal is None or self.goal.previous_secured)
         )
         if penalize_active_open:
             self._active_open_penalty_applied = True
         if penalize_contact_loss:
             self._contact_loss_penalty_applied = True
-        penalize_physical_slip = bool(penalize_contact_loss and physical_slip)
+        penalize_physical_slip = bool(penalize_contact_loss)
 
         strict_progress = float(np.clip(
             (strict_hold_seconds if goal_match else 0.0) / self.base_env.config.success_hold_seconds,
