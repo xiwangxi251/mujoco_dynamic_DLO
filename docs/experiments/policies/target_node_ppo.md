@@ -30,6 +30,9 @@ secured、举起和保持奖励受材料身份匹配约束。错误抓取的第�
 
 ## 训练
 
+工作区内目标采样、新六场景选择和七阶段课程已接入正式训练/评估入口，
+见 [工作区指定点训练](target_node_workspace_training.md)。该模式必须显式开启。
+
 2026-10-05：新运行可显式选择 `--controller-profile enhanced6_bounded_dls_v1`，
 并以 `--table-execution-guard` 开启碰桌保护；见 [正式执行入口](enhanced6_dev_migration_20261005.md)。
 历史训练继续按其冻结配置解释，不能将新执行层和判定用于重标原结果。

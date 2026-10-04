@@ -58,10 +58,17 @@ FAILURE_TYPES = (
     "secured_but_no_strict_success",
 )
 
+WORKSPACE_EPISODE_FIELDS = (
+    "requested_seed", "workspace_reset_attempts", "workspace_reset_rejections",
+    "workspace_prefix_seconds", "workspace_inside_fraction", "workspace_initial_goal_xyz",
+    "first_grasp_correct", "first_grasp_index",
+)
+
 EPISODE_FIELDS = (
     "episode",
     "seed",
     "actual_episode_seed",
+    *WORKSPACE_EPISODE_FIELDS,
     "scenario_name",
     "scenario_id",
     "scenario_split",
@@ -546,6 +553,12 @@ def _manifest(
             ),
             "legacy_opt_in": args.scenario_names is None,
         },
+        "workspace_conditioning": (None if env._workspace is None else {
+            "mask": env._workspace.manifest(),
+            "entry_seconds": env._workspace_entry_seconds,
+            "reset_attempts": env._workspace_reset_attempts,
+            "evaluation_population": "episodes with an eligible workspace goal; not an unconditional benchmark",
+        }),
         "episode_seed_rule": {
             "first_seed": args.seed,
             "count": args.episodes,
@@ -677,7 +690,10 @@ def _episode_row(
     break_events: list[dict],
 ) -> dict[str, object]:
     actual_episode_seed = initial_info.get("episode_seed")
-    if actual_episode_seed != episode_seed:
+    conditioned_seed = ("workspace_mask" in initial_info
+                        and initial_info.get("requested_seed") == episode_seed
+                        and initial_info.get("actual_seed") == actual_episode_seed)
+    if actual_episode_seed != episode_seed and not conditioned_seed:
         raise RuntimeError(
             "episode seed mismatch: "
             f"requested={episode_seed}, actual={actual_episode_seed}"
@@ -700,6 +716,7 @@ def _episode_row(
         "episode": episode,
         "seed": episode_seed,
         "actual_episode_seed": actual_episode_seed,
+        **{key: final_info.get(key) for key in WORKSPACE_EPISODE_FIELDS},
         "scenario_name": initial_info.get("scenario_name"),
         "scenario_id": initial_info.get("scenario_id"),
         "scenario_split": initial_info.get("scenario_split"),
@@ -913,6 +930,12 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         rl_config=evaluation_rl_config(args),
         controller_profile=getattr(args, "controller_profile", "legacy"),
         table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
+        target_workspace=getattr(args, "target_workspace", None),
+        workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
+        workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
+        workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
+        replay_bank_dir=getattr(args, "replay_bank_dir", None),
+        replay_seed_fallback=getattr(args, "replay_seed_fallback", "resample"),
     )
     configure_target_evaluation(env, args)
 
@@ -1161,7 +1184,8 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
                         policy_file=np.asarray(str(args.model.resolve())),
                         mujoco_version=np.asarray(mujoco.__version__),
                         episode=np.int64(episode),
-                        seed=np.int64(episode_seed),
+                        seed=np.int64(initial_info.get("episode_seed", episode_seed)),
+                        requested_seed=np.int64(episode_seed),
                         result=np.asarray(result),
                         episode_return=np.float64(episode_return),
                         actions=action_array,
@@ -1358,6 +1382,12 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         rl_config=evaluation_rl_config(args),
         controller_profile=getattr(args, "controller_profile", "legacy"),
         table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
+        target_workspace=getattr(args, "target_workspace", None),
+        workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
+        workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
+        workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
+        replay_bank_dir=getattr(args, "replay_bank_dir", None),
+        replay_seed_fallback=getattr(args, "replay_seed_fallback", "resample"),
     )
     configure_target_evaluation(env, args)
 
@@ -1430,6 +1460,9 @@ def parse_args() -> argparse.Namespace:
             "cross-policy success-rate evaluation"
         )
     )
+    from .workspace import add_workspace_arguments, WORKSPACE_SCENE_FAMILIES
+    add_workspace_arguments(parser)
+    parser.add_argument("--workspace-scene-family", choices=tuple(WORKSPACE_SCENE_FAMILIES))
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--target-node-index", type=int, default=None,
                         help="force a material node in a target-node checkpoint evaluation")
@@ -1516,10 +1549,15 @@ def parse_args() -> argparse.Namespace:
         # A named scenario is the complete selection; do not leave the default
         # distribution in the manifest where it could be mistaken for sampling.
         args.distribution = None
-    args.scenario_names = resolve_scenario_names(
-        args.scenario,
-        args.distribution or "l1",
-    )
+    if args.workspace_scene_family:
+        if args.scenario is not None:
+            parser.error("Workspace scene family cannot be combined with a single scenario")
+        args.distribution = None
+        args.scenario_names = list(WORKSPACE_SCENE_FAMILIES[args.workspace_scene_family])
+    else:
+        args.scenario_names = resolve_scenario_names(
+            args.scenario, args.distribution or "l1",
+        )
     return args
 
 

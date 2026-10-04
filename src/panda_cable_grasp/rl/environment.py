@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from collections.abc import Sequence
 
 from ..runtime import configure_mujoco_runtime
@@ -300,9 +301,26 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         frame_skip: int | None = None,
         controller_profile: str = "legacy",
         table_execution_guard_enabled: bool | None = None,
+        target_workspace: str | Path | None = None,
+        workspace_mask_key: str = "interior",
+        workspace_entry_seconds: float = 8.,
+        workspace_reset_attempts: int = 50,
+        replay_bank_dir: str | Path | None = None,
+        replay_seed_fallback: str | None = None,
     ):
         super().__init__()
         self.rl_config = rl_config or RLConfig()
+        if target_workspace is not None and not self.rl_config.target_node_task:
+            raise ValueError("Workspace sampling requires target-node task")
+        if not np.isfinite(workspace_entry_seconds) or workspace_entry_seconds < 0:
+            raise ValueError("Workspace entry seconds must be finite and nonnegative")
+        if workspace_reset_attempts < 1:
+            raise ValueError("Workspace reset attempts must be positive")
+        self._workspace = None
+        self._workspace_entry_seconds = float(workspace_entry_seconds)
+        self._workspace_reset_attempts = int(workspace_reset_attempts)
+        self._workspace_reset_info = {}
+        self._workspace_inside_steps = self._workspace_sample_steps = 0
         self.goal = None
         self._scenario_configs: tuple[ScenarioConfig, ...] = tuple(
             get_scenario(name) for name in (scenario_names or ())
@@ -359,17 +377,22 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 dynamicvla_cameras_enabled=dynamicvla_cameras_enabled,
                 **first_overrides,
             )
-        self.base_env = CableGraspEnv(
-            env_config
-            if env_config is not None
-            else EnvConfig(
-                robot=robot,
-                seed=seed,
-                disturbance_strength=disturbance_strength,
+        if env_config is None:
+            env_config = EnvConfig(
+                robot=robot, seed=seed, disturbance_strength=disturbance_strength,
                 episode_seconds=episode_seconds,
                 dynamicvla_cameras_enabled=dynamicvla_cameras_enabled,
             )
-        )
+        # CableGraspEnv initializes the first scene in its constructor, so replay
+        # paths and seed policy must be configured before that initial reset.
+        if replay_bank_dir is not None:
+            env_config.replay_bank_dir = str(replay_bank_dir)
+        if replay_seed_fallback is not None:
+            if replay_seed_fallback not in {"resample", "error"}:
+                raise ValueError("Invalid replay seed fallback")
+            env_config.replay_seed_fallback = replay_seed_fallback
+        self.base_env = CableGraspEnv(env_config)
+        self._workspace_episode_seconds = self.base_env.config.episode_seconds
         if controller_profile != "legacy":
             configure_profile(self.base_env.config, controller_profile)
             self.base_env.configure_controller_profile(controller_profile)
@@ -400,6 +423,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         if self.rl_config.target_node_task:
             from .target_node import TargetNodeTask
             self.goal = TargetNodeTask(self, seed)
+            if target_workspace is not None:
+                from .workspace import WorkspaceMask, WorkspaceTargetNode
+                self._workspace = WorkspaceMask(target_workspace, workspace_mask_key)
+                self.goal = WorkspaceTargetNode(self, seed, self._workspace)
         self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(5,), dtype=np.float32)
         self.observation_space = gym.spaces.Box(
             -10.0, 10.0,
@@ -1813,12 +1840,43 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         options: dict | None = None,
     ) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
-        self._select_training_scenario(seed)
         # 底层环境只使用自己的 Generator；把显式 seed 透传到底层，既保证并行
         # 环境中的场景可复现，也让评估 CSV/manifest 能准确记录该轮场景。
-        _, info = self.base_env.reset(randomize=True, seed=seed)
-        if self.goal is not None:
-            self.goal.reset(seed, options)
+        if self._workspace is None:
+            self._select_training_scenario(seed)
+            _, info = self.base_env.reset(randomize=True, seed=seed)
+            if self.goal is not None:
+                self.goal.reset(seed, options)
+        else:
+            from .workspace import NoWorkspaceTarget, prepare_workspace_entry
+            requested_seed = seed
+            for attempt in range(self._workspace_reset_attempts):
+                actual_seed = (None if requested_seed is None else
+                               int(requested_seed) + attempt * 100003)
+                self._select_training_scenario(actual_seed)
+                self.base_env.config.episode_seconds = self._workspace_episode_seconds
+                _, info = self.base_env.reset(randomize=True, seed=actual_seed)
+                try:
+                    prefix = prepare_workspace_entry(self.base_env, self._workspace,
+                        self._workspace_entry_seconds, self._workspace_episode_seconds)
+                    self.goal.reset(actual_seed, options)
+                except NoWorkspaceTarget:
+                    # Explicit material identities must never be replaced.
+                    if (options or {}).get("goal_node_index") is not None or self.goal.fixed_index is not None:
+                        raise
+                    if attempt + 1 == self._workspace_reset_attempts:
+                        raise
+                    continue
+                self._workspace_reset_info = dict(
+                    requested_seed=requested_seed, actual_seed=self.base_env.episode_seed,
+                    workspace_reset_attempts=attempt+1, workspace_reset_rejections=attempt,
+                    workspace_prefix_seconds=prefix,
+                    workspace_initial_goal_xyz=self.data.xpos[
+                        self.base_env.cable_ids[self.goal.index]].tolist(),
+                    workspace_mask=self._workspace.manifest())
+                self._workspace_inside_steps = self._workspace_sample_steps = 1
+                info = self.base_env.info()
+                break
         self._episode_return = 0.0
         self._episode_steps = 0
         self._table_safety_penalty_total = 0.0
@@ -1951,6 +2009,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
 
         self._episode_return += reward
         self._episode_steps += 1
+        if self._workspace is not None and self.goal.first_grasp_correct is None:
+            self._workspace_sample_steps += 1
+            self._workspace_inside_steps += int(self.goal.info()["workspace_goal_current_inside"])
         info = self._augment_info(info, base_success=base_success)
         info.update(reward_components)
         info["episode_return"] = self._episode_return
@@ -1960,6 +2021,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
 
     def _augment_info(self, info: dict, *, base_success: bool | None = None) -> dict:
         result = dict(info)
+        if self._workspace is not None:
+            result.update(self._workspace_reset_info)
+            result["workspace_inside_fraction"] = self._workspace_inside_steps/max(1, self._workspace_sample_steps)
         result["target_distance"] = self._nearest_graspable_distance
         result["nearest_graspable_distance"] = self._nearest_graspable_distance
         result["nearest_graspable_segment_index"] = (

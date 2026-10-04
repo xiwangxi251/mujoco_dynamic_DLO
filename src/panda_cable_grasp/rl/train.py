@@ -214,7 +214,23 @@ def make_configured_env(
         ),
         controller_profile=getattr(args, "controller_profile", "legacy"),
         table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
+        target_workspace=getattr(args, "target_workspace", None),
+        workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
+        workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
+        workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
+        replay_bank_dir=getattr(args, "replay_bank_dir", None),
+        replay_seed_fallback=getattr(args, "replay_seed_fallback", "resample"),
     )
+    if getattr(args, "workspace_curriculum", False):
+        from .workspace import WORKSPACE_STAGES, WorkspaceCurriculumCallback
+        # SB3 resets environments before callback startup; resumed first episodes
+        # must already use the restored curriculum distribution.
+        stage = WorkspaceCurriculumCallback(
+            args.training_scenario_names, args.output / "evaluation/workspace_curriculum.json",
+            resume=getattr(args, "resume", None) is not None,
+        ).stage_index
+        env.set_training_scenario_distribution(tuple(args.training_scenario_names), WORKSPACE_STAGES[stage][1])
+        env.set_motion_difficulty(WORKSPACE_STAGES[stage][2])
     if pointcloud:
         return DLOPointCloudObservation(env, pointcloud_config_from_args(args))
     return env
@@ -554,6 +570,7 @@ class StrictSuccessEvalCallback(BaseCallback):
         lift_attempts = 0
         loaded_lifts = 0
         grasps = 0
+        first_correct = 0
         slips = 0
         returns: list[float] = []
         lengths: list[int] = []
@@ -584,6 +601,17 @@ class StrictSuccessEvalCallback(BaseCallback):
                 finished = np.flatnonzero(active & np.asarray(dones, dtype=bool))
                 for worker in finished:
                     info = infos[int(worker)]
+                    first_correct += int(info.get("first_grasp_correct") is True)
+                    if "workspace_mask" in info:
+                        with (self.output_dir / "workspace_eval_episodes.jsonl").open("a", encoding="utf-8") as stream:
+                            record = {key: info.get(key) for key in (
+                                "requested_seed", "actual_seed", "scenario_name", "goal_node_index",
+                                "first_grasp_correct", "workspace_reset_rejections", "workspace_prefix_seconds",
+                                "workspace_inside_fraction", "workspace_initial_goal_xyz", "workspace_mask")}
+                            record.update(success=bool(info["success"]), timesteps=self.num_timesteps,
+                                          seed_offset=seed_offset,
+                                          phase=self.curriculum.phase_index if self.curriculum else 0)
+                            stream.write(json.dumps(record) + "\n")
                     successes += int(bool(info["success"]))
                     strict_successes += int(bool(info.get("strict_success", False)))
                     pinches += int(bool(info["ever_pinched"]))
@@ -606,6 +634,7 @@ class StrictSuccessEvalCallback(BaseCallback):
                 flush=True,
             )
         return {
+            "first_grasp_correct_rate": first_correct / episodes,
             "success_rate": successes / episodes,
             "strict_success_rate": strict_successes / episodes,
             "pinch_rate": pinches / episodes,
@@ -730,6 +759,10 @@ class StrictSuccessEvalCallback(BaseCallback):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO for dynamic cable grasping")
+    from .workspace import add_workspace_arguments, WORKSPACE_SCENE_FAMILIES
+    add_workspace_arguments(parser)
+    parser.add_argument("--workspace-curriculum", action="store_true")
+    parser.add_argument("--workspace-scene-family", choices=tuple(WORKSPACE_SCENE_FAMILIES))
     parser.add_argument("--target-node-task", action="store_true")
     parser.add_argument("--target-u-min", type=float, default=1.0 / 6.0)
     parser.add_argument("--target-u-max", type=float, default=5.0 / 6.0)
@@ -969,6 +1002,29 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    if args.workspace_scene_family:
+        args.curriculum_stage_steps = 0
+        if args.training_scenarios or args.eval_scenarios:
+            parser.error("Workspace scene family cannot be combined with explicit scenario lists")
+        args.training_scenarios = ",".join(WORKSPACE_SCENE_FAMILIES[args.workspace_scene_family])
+    if args.target_workspace is not None:
+        if not args.target_node_task or args.observation_mode != "state":
+            parser.error("Target workspace requires target-node task and state observations")
+        from .workspace import WorkspaceMask
+        try:
+            WorkspaceMask(args.target_workspace, args.workspace_mask_key)
+        except (ValueError, KeyError, OSError) as error:
+            parser.error(str(error))
+    if not np.isfinite(args.workspace_entry_seconds) or args.workspace_entry_seconds < 0 or args.workspace_reset_attempts < 1:
+        parser.error("Invalid workspace entry duration or reset attempts")
+    if args.workspace_curriculum:
+        if args.target_workspace is None or args.workspace_scene_family is None:
+            parser.error("Workspace curriculum requires target-workspace and workspace-scene-family")
+        if args.eval_freq <= 0:
+            parser.error("Workspace curriculum requires periodic evaluation")
+        args.curriculum_stage_steps = 0
+    if args.workspace_curriculum and args.resume is None and (args.output / "training_config.json").exists():
+        parser.error("Use a new output directory for a fresh workspace curriculum run")
     args.training_scenario_weights = None
     if args.training_scenarios:
         names = []
@@ -1313,7 +1369,12 @@ def main() -> None:
         ),
     ]
     curriculum_callback: MotionCurriculumCallback | None = None
-    if (
+    if getattr(args, "workspace_curriculum", False):
+        from .workspace import WorkspaceCurriculumCallback
+        curriculum_callback = WorkspaceCurriculumCallback(args.training_scenario_names,
+            args.output / "evaluation/workspace_curriculum.json", resume=args.resume is not None)
+        callback_items.append(curriculum_callback)
+    elif (
         args.training_distribution == "l1"
         and args.curriculum_stage_steps > 0
     ):
@@ -1346,6 +1407,7 @@ def main() -> None:
             curriculum=curriculum_callback,
         ))
     callbacks = CallbackList(callback_items)
+    from .workspace import WorkspaceMask, WORKSPACE_STAGES
     configuration = {
         "algorithm": "PPO",
         "rl_interface_version": action_interface_version(args.action_mode),
@@ -1354,7 +1416,18 @@ def main() -> None:
         "observation_interface_version": "target_node_state_v1" if args.target_node_task else "baseline_state_v1",
         "target_node_task": args.target_node_task,
         "warm_start": warm_start_record,
-        "arm_acceleration_limit_enabled": True,
+        "controller_profile": args.controller_profile,
+        "table_execution_guard_enabled": args.table_execution_guard,
+        "grasp_judgement_version": "physical_holding_v2",
+        "arm_acceleration_limit_enabled": args.controller_profile == "legacy",
+        "target_workspace": (None if args.target_workspace is None else WorkspaceMask(args.target_workspace, args.workspace_mask_key).manifest()),
+        "workspace_entry_seconds": args.workspace_entry_seconds,
+        "workspace_reset_attempts": args.workspace_reset_attempts,
+        "workspace_curriculum": args.workspace_curriculum,
+        "workspace_scene_family": args.workspace_scene_family,
+        "workspace_stages": (WORKSPACE_STAGES if args.workspace_curriculum else None),
+        "replay_bank_dir": (str(args.replay_bank_dir.resolve()) if args.replay_bank_dir else None),
+        "replay_seed_fallback": args.replay_seed_fallback,
         "geometric_safety_enabled": args.geometric_safety,
         "table_finger_collision_filter_enabled": (
             not args.disable_table_finger_collision_filter
@@ -1490,6 +1563,17 @@ def main() -> None:
             "IK with uniform joint-velocity scaling"
         ),
     }
+    if args.workspace_curriculum:
+        configuration["curriculum_stages"] = WORKSPACE_STAGES
+        configuration["curriculum_training_mixes"] = [
+            list(zip(args.training_scenario_names, stage[1])) for stage in WORKSPACE_STAGES
+        ]
+        configuration["curriculum_required_evals"] = "2 passing evaluations in last 3"
+        configuration["curriculum_success_rate"] = .40
+        configuration["curriculum_first_grasp_correct_rate"] = .60
+        configuration["curriculum_motion_difficulty"] = "explicit seven-stage workspace curriculum"
+    if args.controller_profile == "enhanced6_bounded_dls_v1":
+        configuration["action"] = configuration["action"].split(";", 1)[0] + "; enhanced full6 bounded DLS, gravity feedforward and enhanced servo"
     if args.target_node_task:
         configuration["rl_success_definition"] = (
             "shared physical lift/retention qualification AND material node error "
