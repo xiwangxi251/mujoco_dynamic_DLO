@@ -30,6 +30,11 @@ class TargetNodeTask:
         self.wrong_count = 0
         self.wrong_penalty = 0.0
         self.fixed_index = None
+        self.first_grasp_index = None
+        self.first_grasp_correct = None
+        self.first_position_reward_paid = False
+        self.first_grasp_outside_reward_range = False
+        self.previous_wrong = False
         self.base.task_success_filter = self.qualify
 
     def reset(self, seed, options):
@@ -55,6 +60,9 @@ class TargetNodeTask:
         self.previous_match = self.previous_secured = self.was_pinched = False
         self.wrong_count = 0
         self.wrong_penalty = 0.0
+        self.first_grasp_index = self.first_grasp_correct = None
+        self.first_position_reward_paid = self.first_grasp_outside_reward_range = False
+        self.previous_wrong = False
 
     def actual_index(self):
         state = self.base.grasp_state
@@ -68,6 +76,12 @@ class TargetNodeTask:
     def qualify(self, physical_qualification):
         # Called once at each physics substep. Any-node success is measured in
         # parallel, while the base timer receives the continuous goal predicate.
+        if self.first_grasp_index is None and self.base.grasp_confirmed:
+            self.first_grasp_index = self.actual_index()
+            self.first_grasp_correct = bool(self.matches())
+            if self.wrapper.rl_config.target_reward_profile == "tolerance_progress_v2":
+                self.first_grasp_outside_reward_range = (
+                    abs(self.first_grasp_index - self.index) > self.wrapper.rl_config.target_position_reward_radius)
         dt = self.base.model.opt.timestep
         self.any_hold = self.any_hold + dt if physical_qualification else 0.0
         self.any_success |= self.any_hold + 1e-12 >= self.base.config.success_hold_seconds
@@ -116,7 +130,19 @@ class TargetNodeTask:
         tangent /= max(float(np.linalg.norm(tangent)), 1e-12)
         return projections[chosen].copy(), float(distances[chosen]), tangent, index, float(alpha[chosen])
 
+    def lift_reward_scale(self):
+        actual = self.actual_index()
+        if actual is None:
+            return 0.
+        error = abs(actual - self.index)
+        if error <= self.wrapper.rl_config.target_node_tolerance:
+            return 1.
+        return {3: .5, 4: .25}.get(error, 0.)
+
     def finish_reward(self, components, status):
+        if self.wrapper.rl_config.target_reward_profile == "tolerance_progress_v2":
+            self._finish_revised_reward(components, status)
+            return
         pinched = bool(status['pinch_confirmed'])
         matched = self.matches()
         wrong_event = pinched and not matched and not self.was_pinched
@@ -129,10 +155,43 @@ class TargetNodeTask:
         self.previous_secured = bool(status['secured_grasp']) and matched
         self.was_pinched = pinched
 
+    def _finish_revised_reward(self, components, status):
+        pinched = bool(status['pinch_confirmed'])
+        actual = self.actual_index()
+        if self.first_grasp_index is None and pinched and actual is not None:
+            # Also supports reward-sequence tests without a physics substep.
+            self.first_grasp_index = actual
+            self.first_grasp_correct = bool(self.matches())
+        first_event = self.first_grasp_index is not None and not self.first_position_reward_paid
+        error = abs(actual - self.index) if actual is not None else None
+        first_error = abs(self.first_grasp_index - self.index) if first_event else None
+        cfg = self.wrapper.rl_config
+        outside = bool(pinched and error is not None and error > cfg.target_position_reward_radius)
+        first_outside = first_error is not None and first_error > cfg.target_position_reward_radius
+        wrong_event = (outside and not self.previous_wrong) or first_outside
+        if wrong_event:
+            self.wrong_count += 1
+        penalty = min(cfg.target_wrong_event_penalty, max(0., cfg.target_wrong_event_cap - self.wrong_penalty)) if wrong_event else 0.
+        self.wrong_penalty += penalty
+        components['reward_wrong_target_grasp'] = -penalty
+        components['reward_first_grasp_proximity'] = (
+            2. - .25 * first_error if first_error is not None and first_error <= 4 else 0.)
+        if first_event:
+            self.first_position_reward_paid = True
+            self.first_grasp_outside_reward_range = bool(first_outside)
+        self.previous_wrong = outside
+        self.previous_match = bool(pinched and self.matches())
+        self.previous_secured = bool(status['secured_grasp']) and self.matches()
+        self.was_pinched = pinched
+
     def info(self):
         actual = self.actual_index()
         return {
             'target_node_task': True, 'goal_node_index': self.index,
+            'first_grasp_index': self.first_grasp_index, 'first_grasp_correct': self.first_grasp_correct,
+            'first_grasp_outside_reward_range': self.first_grasp_outside_reward_range,
+            'target_reward_profile': self.wrapper.rl_config.target_reward_profile,
+            'lift_reward_scale': self.lift_reward_scale(),
             'goal_material_u': self.index / (len(self.base.cable_ids) - 1),
             'goal_node_tolerance': self.wrapper.rl_config.target_node_tolerance,
             'actual_grasp_node_index': actual,

@@ -88,13 +88,6 @@ class WorkspaceTargetNode(TargetNodeTask):
         super().reset(seed, dict(options or {}, goal_node_index=goal))
         self.first_grasp_correct = self.first_grasp_index = None
 
-    def qualify(self, physical_qualification):
-        # First confirmed grasp is sampled at the original physics frequency.
-        if self.first_grasp_correct is None and self.base.grasp_confirmed:
-            self.first_grasp_index = self.actual_index()
-            self.first_grasp_correct = bool(self.matches())
-        return super().qualify(physical_qualification)
-
     def info(self):
         info = super().info()
         info.update(workspace_candidate_count=len(self.candidates),

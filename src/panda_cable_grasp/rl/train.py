@@ -148,7 +148,21 @@ def linear_schedule(
 
 def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
     """Build one immutable-by-convention reward/action configuration per env."""
+    reference = getattr(args, "rl_config_file", None)
+    if reference is not None:
+        from dataclasses import fields
+        saved = json.loads(Path(reference).read_text(encoding="utf-8"))
+        saved = saved.get("rl_config", saved)
+        accepted = {field.name for field in fields(RLConfig)}
+        values = {key: value for key, value in saved.items() if key in accepted}
+        values["target_reward_profile"] = getattr(args, "target_reward_profile", "legacy")
+        if values["target_reward_profile"] == "tolerance_progress_v2":
+            values.update(target_node_task=True, target_node_tolerance=2,
+                          target_position_reward_radius=4,
+                          target_wrong_event_penalty=2., target_wrong_event_cap=8.)
+        return RLConfig(**values)
     return RLConfig(
+        target_reward_profile=getattr(args, "target_reward_profile", "legacy"),
         target_node_task=getattr(args, "target_node_task", False),
         target_u_min=getattr(args, "target_u_min", 1.0 / 6.0),
         target_u_max=getattr(args, "target_u_max", 5.0 / 6.0),
@@ -218,6 +232,7 @@ def make_configured_env(
         workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
         workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
         workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
+        workspace_reset_seed_pool=getattr(args, "workspace_reset_seed_pool", None),
         replay_bank_dir=getattr(args, "replay_bank_dir", None),
         replay_seed_fallback=getattr(args, "replay_seed_fallback", "resample"),
     )
@@ -266,8 +281,15 @@ def make_worker(rank: int, args: argparse.Namespace):
 def make_eval_worker(rank: int, args: argparse.Namespace):
     """Build one deterministic strict-evaluation environment."""
     def initialize():
+        from copy import copy
+        eval_args = copy(args)
+        if getattr(args, "eval_replay_bank_dir", None) is not None:
+            eval_args.replay_bank_dir = args.eval_replay_bank_dir
+            eval_args.replay_seed_fallback = "error"
+        if getattr(args, "eval_seed_pool_size", 0) > 0:
+            eval_args.workspace_reset_seed_pool = (args.eval_seed, args.eval_seed_pool_size)
         return make_configured_env(
-            args,
+            eval_args,
             seed=args.eval_seed + rank,
             scenario_names=args.eval_scenario_names,
         )
@@ -762,8 +784,17 @@ def parse_args() -> argparse.Namespace:
     from .workspace import add_workspace_arguments, WORKSPACE_SCENE_FAMILIES
     add_workspace_arguments(parser)
     parser.add_argument("--workspace-curriculum", action="store_true")
+    parser.add_argument("--eval-replay-bank-dir", type=Path,
+                        help="separate held-out replay bank; uses strict bank seed matching")
+    parser.add_argument("--eval-seed-pool-size", type=int, default=0,
+                        help="conditioned eval reset retry pool starting at eval-seed; 0 disables")
     parser.add_argument("--workspace-scene-family", choices=tuple(WORKSPACE_SCENE_FAMILIES))
     parser.add_argument("--target-node-task", action="store_true")
+    parser.add_argument("--target-reward-profile", choices=("legacy", "tolerance_progress_v2"), default="legacy")
+    parser.add_argument("--rl-config-file", type=Path,
+                        help="explicit reference RLConfig JSON; preserves its non-target reward/action values")
+    parser.add_argument("--resume-legacy-full6", action="store_true",
+                        help="explicitly migrate a frozen full6_workspace_target_node_v1 checkpoint")
     parser.add_argument("--target-u-min", type=float, default=1.0 / 6.0)
     parser.add_argument("--target-u-max", type=float, default=5.0 / 6.0)
     parser.add_argument("--target-node-tolerance", type=int, default=2)
@@ -1002,6 +1033,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    if args.target_reward_profile == "tolerance_progress_v2" and not args.target_node_task:
+        parser.error("tolerance_progress_v2 requires --target-node-task")
+    if args.eval_seed_pool_size < 0:
+        parser.error("eval seed pool size must be nonnegative")
+    if args.rl_config_file is not None:
+        try:
+            rl_config_from_args(args)
+        except (ValueError, OSError, TypeError) as error:
+            parser.error(str(error))
     if args.workspace_scene_family:
         args.curriculum_stage_steps = 0
         if args.training_scenarios or args.eval_scenarios:
@@ -1222,7 +1262,13 @@ def parse_args() -> argparse.Namespace:
         version = checkpoint_interface_version(
             args.resume if args.resume.is_file() else resume_with_zip
         )
-        if version != action_interface_version(args.action_mode):
+        compatible_legacy = (
+            args.resume_legacy_full6 and version == "full6_workspace_target_node_v1"
+            and args.robot == "nero" and args.action_mode == "task_space_vertical_down"
+            and args.target_node_task and args.observation_mode == "state"
+            and args.controller_profile == "enhanced6_bounded_dls_v1"
+        )
+        if version != action_interface_version(args.action_mode) and not compatible_legacy:
             parser.error(
                 "--resume checkpoint uses a different RL action interface and "
                 "cannot be continued safely"
@@ -1351,6 +1397,7 @@ def main() -> None:
     if args.warm_start is not None:
         from .target_node import warm_start_policy
         warm_start_record = warm_start_policy(model, args.warm_start)
+    from .health import TrainingHealthCallback
     checkpoint_callback = CheckpointCallback(
         save_freq=max(1, args.checkpoint_steps // args.workers),
         save_path=str(args.output / "checkpoints"),
@@ -1362,6 +1409,7 @@ def main() -> None:
     callback_items: list[BaseCallback] = [
         checkpoint_callback,
         metrics_callback,
+        TrainingHealthCallback(args.output / "training_health.json"),
         EntropyCoefficientScheduleCallback(
             entropy_coef_initial,
             entropy_coef_final,
@@ -1416,6 +1464,10 @@ def main() -> None:
         "observation_interface_version": "target_node_state_v1" if args.target_node_task else "baseline_state_v1",
         "target_node_task": args.target_node_task,
         "warm_start": warm_start_record,
+        "target_reward_profile": args.target_reward_profile,
+        "reference_rl_config_file": str(args.rl_config_file.resolve()) if args.rl_config_file else None,
+        "resume_legacy_full6_requested": args.resume_legacy_full6,
+        "resume_interface_migration": ("frozen full6_workspace_target_node_v1 -> formal bounded DLS and physical_holding_v2" if args.resume_legacy_full6 else None),
         "controller_profile": args.controller_profile,
         "table_execution_guard_enabled": args.table_execution_guard,
         "grasp_judgement_version": "physical_holding_v2",
@@ -1428,6 +1480,8 @@ def main() -> None:
         "workspace_stages": (WORKSPACE_STAGES if args.workspace_curriculum else None),
         "replay_bank_dir": (str(args.replay_bank_dir.resolve()) if args.replay_bank_dir else None),
         "replay_seed_fallback": args.replay_seed_fallback,
+        "eval_replay_bank_dir": str(args.eval_replay_bank_dir.resolve()) if args.eval_replay_bank_dir else None,
+        "eval_seed_pool_size": args.eval_seed_pool_size,
         "geometric_safety_enabled": args.geometric_safety,
         "table_finger_collision_filter_enabled": (
             not args.disable_table_finger_collision_filter

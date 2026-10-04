@@ -36,6 +36,10 @@ class RLConfig:
     target_u_min: float = 1.0 / 6.0
     target_u_max: float = 5.0 / 6.0
     target_node_tolerance: int = 2
+    target_reward_profile: str = "legacy"
+    target_position_reward_radius: int = 4
+    target_wrong_event_penalty: float = 2.0
+    target_wrong_event_cap: float = 8.0
     cable_position_scale: float = 0.50
     cable_velocity_scale: float = 1.0
     translation_delta_scale: float = 0.010
@@ -140,6 +144,14 @@ class RLConfig:
                 or not isinstance(self.target_node_tolerance, int)
                 or self.target_node_tolerance < 0):
             raise ValueError("target_node_tolerance must be a nonnegative integer")
+        if self.target_reward_profile not in {"legacy", "tolerance_progress_v2"}:
+            raise ValueError("unknown target reward profile")
+        if self.target_reward_profile == "tolerance_progress_v2":
+            if not self.target_node_task or self.target_node_tolerance != 2 or self.target_position_reward_radius != 4:
+                raise ValueError("tolerance_progress_v2 requires target-node task, success radius 2 and reward radius 4")
+            for value in (self.target_wrong_event_penalty, self.target_wrong_event_cap):
+                if not np.isfinite(value) or value < 0:
+                    raise ValueError("target wrong-event penalties must be finite and nonnegative")
         if self.cable_sample_count != 14:
             raise ValueError("cable_sample_count must be 14 for the 99-D baseline")
         for name in (
@@ -305,6 +317,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         workspace_mask_key: str = "interior",
         workspace_entry_seconds: float = 8.,
         workspace_reset_attempts: int = 50,
+        workspace_reset_seed_pool: tuple[int, int] | None = None,
         replay_bank_dir: str | Path | None = None,
         replay_seed_fallback: str | None = None,
     ):
@@ -316,6 +329,11 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             raise ValueError("Workspace entry seconds must be finite and nonnegative")
         if workspace_reset_attempts < 1:
             raise ValueError("Workspace reset attempts must be positive")
+        if workspace_reset_seed_pool is not None:
+            start, count = workspace_reset_seed_pool
+            if start < 0 or count < 1:
+                raise ValueError("Invalid workspace reset seed pool")
+        self._workspace_reset_seed_pool = workspace_reset_seed_pool
         self._workspace = None
         self._workspace_entry_seconds = float(workspace_entry_seconds)
         self._workspace_reset_attempts = int(workspace_reset_attempts)
@@ -455,6 +473,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._last_overheight_severity = 0.0
         self._last_grasp_body_height_above_table = 0.0
         self._episode_initial_cable_z = np.zeros(len(self.base_env.cable_ids))
+        self._lift_progress_credit = None
         self._secured_candidate_hold = 0.0
         self._secured_contact_loss_hold = 0.0
         self._strict_success_hold = 0.0
@@ -1415,6 +1434,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         physical_pinch = bool(grasp_status["pinch_confirmed"])
         goal_match = self.goal is None or self.goal.matches()
         pinch_confirmed = physical_pinch and goal_match
+        revised_progress = self.rl_config.target_reward_profile == "tolerance_progress_v2"
+        lift_scale = self.goal.lift_reward_scale() if revised_progress else float(goal_match)
+        height_pinched = physical_pinch and lift_scale > 0. if revised_progress else pinch_confirmed
         pregrasp = not physical_pinch
         progress = self._previous_distance - distance if pregrasp else 0.0
         self._previous_distance = distance
@@ -1550,7 +1572,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._last_overheight_severity = 0.0
 
         if self.rl_config.height_band_reward_enabled:
-            if pinch_confirmed:
+            if height_pinched:
                 if self._height_below_distance_previous is not None:
                     lift_progress_reward = (
                         self.rl_config.reward_lift_progress
@@ -1585,7 +1607,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 self.rl_config.overheight_step_penalty_cap
                 - self._overheight_step_penalty_total,
             )
-            if pinch_confirmed and severity > 0.0 and remaining > 0.0:
+            if height_pinched and severity > 0.0 and remaining > 0.0:
                 magnitude = min(
                     -self.rl_config.reward_overheight_step
                     * smooth_severity * height_penalty_scale,
@@ -1593,7 +1615,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 )
                 overheight_step_reward = -magnitude
                 self._overheight_step_penalty_total += magnitude
-            if success and pinch_confirmed and overheight_distance > 0.0:
+            if success and height_pinched and overheight_distance > 0.0:
                 success_overheight_reward = -min(
                     self.rl_config.success_overheight_penalty_cap,
                     self.rl_config.success_overheight_penalty_per_m
@@ -1629,6 +1651,15 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             else 0.0
         )
         self._cable_lift_credit_previous = capped_lifted_fraction
+        if revised_progress:
+            heights = self._lift_credit_heights()
+            held_index = self.goal.actual_index() if physical_pinch else None
+            lift_progress, cable_lift_progress = self._lift_progress_credit.update(
+                heights, capped_lifted_fraction, held_index, lift_scale,
+            )
+            lift_progress_reward = self.rl_config.reward_lift_progress * lift_progress
+            self._lift_credit_high_water = self._lift_progress_credit.height_high_water
+            self._cable_lift_credit_high_water = self._lift_progress_credit.fraction_high_water
 
         active_open, physical_slip, ambiguous_release = (
             self._classify_secured_grasp_break()
@@ -1740,6 +1771,15 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         if self.goal is not None:
             self.goal.finish_reward(components, grasp_status)
         return float(sum(components.values())), components
+
+    def _lift_credit_heights(self):
+        table = self.base_env.table_geom_id
+        heights = self.data.xpos[self.base_env.cable_ids, 2] - float(
+            self.data.geom_xpos[table, 2] + self.model.geom_size[table, 2])
+        if self.rl_config.height_band_reward_enabled:
+            return np.clip(heights, 0., self.rl_config.height_band_low_m)
+        return np.clip(self.data.xpos[self.base_env.cable_ids, 2] - self._episode_initial_cable_z,
+                       0., self.rl_config.lift_credit_cap)
 
     def _safety_reward_components(self) -> dict[str, float]:
         """Return bounded shaping terms without changing termination semantics."""
@@ -1853,6 +1893,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             for attempt in range(self._workspace_reset_attempts):
                 actual_seed = (None if requested_seed is None else
                                int(requested_seed) + attempt * 100003)
+                if attempt and requested_seed is not None and self._workspace_reset_seed_pool is not None:
+                    start, count = self._workspace_reset_seed_pool
+                    actual_seed = start + (int(requested_seed)-start+attempt) % count
                 self._select_training_scenario(actual_seed)
                 self.base_env.config.episode_seconds = self._workspace_episode_seconds
                 _, info = self.base_env.reset(randomize=True, seed=actual_seed)
@@ -1945,6 +1988,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         ))
         self._lift_credit_previous = 0.0
         self._cable_lift_credit_previous = self._cable_lift_credit_high_water
+        from .lift_credit import HighWaterLiftCredit
+        self._lift_progress_credit = (HighWaterLiftCredit(
+            self._lift_credit_heights(), self._cable_lift_credit_high_water,
+        ) if self.rl_config.target_reward_profile == "tolerance_progress_v2" else None)
         self._secured_session_active = False
         self._last_grasp_break_key = None
         self._active_open_after_secured_event = False
@@ -2017,7 +2064,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         info["episode_return"] = self._episode_return
         info["episode_steps"] = self._episode_steps
         info["mujoco_action"] = mujoco_action.copy()
-        return self._observation(), reward, task_success, bool(truncated), info
+        wrong_first = bool(self.goal is not None and self.goal.first_grasp_outside_reward_range)
+        if wrong_first:
+            info["termination_reason"] = "wrong_target_first_grasp"
+        return self._observation(), reward, bool(task_success or wrong_first), bool(truncated), info
 
     def _augment_info(self, info: dict, *, base_success: bool | None = None) -> dict:
         result = dict(info)

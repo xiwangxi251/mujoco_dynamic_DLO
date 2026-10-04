@@ -30,6 +30,9 @@ secured、举起和保持奖励受材料身份匹配约束。错误抓取的第�
 
 ## 训练
 
+2026-10-05：优化点 1、容差外递减抬升正奖励及跨重抓信用已实装，
+见 [指定点奖励 v2](target_node_reward_v2.md)，显式开启 `tolerance_progress_v2`。
+
 工作区内目标采样、新六场景选择和七阶段课程已接入正式训练/评估入口，
 见 [工作区指定点训练](target_node_workspace_training.md)。该模式必须显式开启。
 
