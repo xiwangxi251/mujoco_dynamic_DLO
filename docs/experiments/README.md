@@ -8,6 +8,7 @@
 
 ## 目录结构
 
+- [指定点策略训练、测试场景族 `cable_x075_v1`](cable_x075_scene_family.md)：X 基准 0.750 m；历史权重与实验仍归属旧场景。
 - `policies/`：策略与端到端方法实验记录
   - [Scripted 与 Expert](policies/scripted_policy_experiments.md)
   - [RL / PPO](policies/rl_experiments.md)、[目标节点 PPO](policies/target_node_ppo.md)、[控制诊断](policies/control_diagnostics.md)

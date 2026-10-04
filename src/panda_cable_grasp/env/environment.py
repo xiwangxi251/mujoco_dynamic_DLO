@@ -321,6 +321,9 @@ class EnvConfig:
     # 作用于初始形状生成；L1/L2 驱动的 yaw 伺服在 spawn 朝向之上叠加
     # 其 24° 旋转剖面，即缆全程保持偏置后的横向进入工作区。
     initial_cable_yaw_deg: float = 0.0
+    # 可选的单线缆 X 中心基准；None 完整保留模型/轨迹库原始摆位。
+    # 显式设置时仍保留随机偏移，并同步平移旧轨迹库的绝对摆位。
+    initial_cable_center_x: float | None = None
 
     # rigid_replay_v1：轨迹库名解析为 <replay_bank_dir>/<replay_bank>.npz；
     # 回放线缆保持初始形状，COM 与 yaw 跟随所选材料节点的记录轨迹。
@@ -474,6 +477,8 @@ class EnvConfig:
             raise ValueError(
                 "target_selection must be either 'random' or 'middle'"
             )
+        if self.initial_cable_center_x is not None and not math.isfinite(self.initial_cable_center_x):
+            raise ValueError("initial_cable_center_x must be finite")
         if self.motion_mode not in {"static", "rigid", "shape", "combined"}:
             raise ValueError(f"unsupported motion_mode: {self.motion_mode!r}")
         if self.motion_regularity not in {
@@ -1662,6 +1667,11 @@ class CableGraspEnv:
         self._replay_yaw_rate = trajectory.yaw_rate
         self._replay_valid_steps = int(bank.valid_steps[entry])
         self._replay_placed_com = bank.placed_com_xy[entry].astype(float)
+        if self.config.initial_cable_center_x is not None:
+            self._replay_placed_com[0] += (
+                self.config.initial_cable_center_x
+                - float(bank.meta.get("source_initial_cable_center_x", 0.62))
+            )
         self._replay_source_motion_mode = bank.source_motion_mode
         self._replay_elapsed = 0.0
 
@@ -1740,6 +1750,11 @@ class CableGraspEnv:
         self._initial_shape_step = int(step)
         self._initial_shape_tangents = np.arctan2(diffs[:, 1], diffs[:, 0])
         self._initial_shape_com = positions.mean(axis=0)
+        if self.config.initial_cable_center_x is not None:
+            self._initial_shape_com[0] += (
+                self.config.initial_cable_center_x
+                - float(bank.meta.get("source_initial_cable_center_x", 0.62))
+            )
         self._initial_shape_source_seed = int(bank.seeds[entry])
 
     def _activate_replay_welds(self) -> None:
@@ -1829,6 +1844,13 @@ class CableGraspEnv:
             self.phase_offset = 0.0
             self.spatial_phase = 0.0
             self.target_body_id = self.cable_ids[len(self.cable_ids) // 2]
+
+        if (
+            self.config.initial_cable_center_x is not None
+            and self.config.n_objects == 1
+            and self.config.object_family == "cable"
+        ):
+            dx += self.config.initial_cable_center_x - float(base_com_xy[0])
 
         if self._uses_replay_motion:
             # 先确定回放条目与追踪节点，再用库中记录的初始摆位放置线缆；

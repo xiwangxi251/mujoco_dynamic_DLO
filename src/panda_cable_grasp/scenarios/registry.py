@@ -150,6 +150,9 @@ class ScenarioConfig:
     # static 场景专用的初始形状库名（与回放库同格式）：reset 时按 seed
     # 取条目、在有效区间采一个中间帧构型作为初始线缆形状。
     initial_shape_bank: str | None = None
+    # None preserves the original model/bank placement. Used only by an
+    # explicitly selected placement variant such as cable_x075_v1.
+    initial_cable_center_x: float | None = None
     disturbance_strength: float = 1.50
     frequency_scale: float = 1.0
     shape_motion_scale: float = SHAPE_MOTION_SCALE
@@ -218,6 +221,11 @@ class ScenarioConfig:
             )
         if not isinstance(self.description, str):
             raise TypeError("description must be a string")
+        if self.initial_cable_center_x is not None:
+            if not math.isfinite(self.initial_cable_center_x):
+                raise ValueError("initial_cable_center_x must be finite")
+            if self.n_objects != 1 or self.object_family != "cable":
+                raise ValueError("initial_cable_center_x requires a single cable")
         allowed_profiles = {
             "factorized_v1",
             "factorized_v2",
@@ -597,6 +605,7 @@ class ScenarioConfig:
             "gait_swim_speed": None,
             "replay_bank": None,
             "initial_shape_bank": None,
+            "initial_cable_center_x": None,
             "arm_motion_start_delay": 0.0,
         }
         for field_name, default_value in object_defaults.items():
@@ -644,6 +653,7 @@ class ScenarioConfig:
             "motion_profile_version": self.motion_profile_version,
             "replay_bank": self.replay_bank,
             "initial_shape_bank": self.initial_shape_bank,
+            "initial_cable_center_x": self.initial_cable_center_x,
             "motion_regularity": self.regularity.value,
             "motion_frequency_scale": self.frequency_scale,
             "shape_motion_scale": self.shape_motion_scale,
@@ -1272,10 +1282,32 @@ def _registered_scenarios() -> list[ScenarioConfig]:
             tags=("material_ood", "rigid_l1"),
             **common,
         ))
+    # Separate placement family: explicit names, never selected by the
+    # original PPO six-scene list. Keep original scene identities intact.
+    by_name = {scenario.name: scenario for scenario in scenarios}
+    for source_name, variant_name in zip(CABLE_X075_SOURCE_NAMES, CABLE_X075_SCENARIO_NAMES):
+        source = by_name[source_name]
+        scenarios.append(replace(
+            source,
+            name=variant_name,
+            split=ScenarioSplit.DEV,
+            initial_cable_center_x=0.75,
+            description=f"{source_name} with initial X placement basis 0.75 m.",
+            tags=source.tags + ("cable_x075_v1", "placement_variant"),
+        ))
     return scenarios
 
 
 DEFAULT_SCENARIO_NAME = "id_shape_nominal_current"
+CABLE_X075_SOURCE_NAMES = (
+    "id_static", "id_rigid_l1_nominal", "id_shape_nominal_current",
+    "id_combined_l1_nominal", "id_static_midshape_v1", "id_rigid_replay_shape_nominal",
+)
+CABLE_X075_SCENARIO_NAMES = tuple(
+    "dev_" + name.removeprefix("id_") + "_x075_v1"
+    for name in CABLE_X075_SOURCE_NAMES
+)
+SCENARIO_FAMILIES = {"cable_x075_v1": CABLE_X075_SCENARIO_NAMES}
 SCENARIO_REGISTRY = ScenarioRegistry(_registered_scenarios())
 SCENARIOS = SCENARIO_REGISTRY
 DEFAULT_SCENARIO = SCENARIO_REGISTRY[DEFAULT_SCENARIO_NAME]
@@ -1447,6 +1479,9 @@ validate_registry()
 __all__ = [
     "AMPLITUDE_STRENGTHS",
     "CORE_SCENARIO_NAMES",
+    "CABLE_X075_SOURCE_NAMES",
+    "CABLE_X075_SCENARIO_NAMES",
+    "SCENARIO_FAMILIES",
     "DEFAULT_SCENARIO",
     "DEFAULT_SCENARIO_NAME",
     "FREQUENCY_SCALES",

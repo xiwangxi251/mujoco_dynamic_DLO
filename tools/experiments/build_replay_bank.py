@@ -159,6 +159,10 @@ def _record_entry(
         "control_dt": control_dt,
         "frame_skip": frame_skip,
         "physics_timestep": float(env.model.opt.timestep),
+        "initial_cable_center_x": (
+            float(env.config.initial_cable_center_x)
+            if env.config.initial_cable_center_x is not None else 0.62
+        ),
     }
 
 
@@ -291,6 +295,7 @@ def main() -> None:
     overrides = scenario.sample_for_episode(0).to_env_overrides()
     meta = {
         "format": "replay_bank",
+        "source_initial_cable_center_x": float(first["initial_cable_center_x"]),
         "format_version": BANK_FORMAT_VERSION,
         "created": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "created_by": getpass.getuser(),
