@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
   "mujoco==3.11.0",
   "numpy>=2.0,<3",
+  "scipy>=1.13",
   "opencv-python-headless>=4.12,<6",
   "pyzmq>=26,<28",
   "trimesh>=4.0",

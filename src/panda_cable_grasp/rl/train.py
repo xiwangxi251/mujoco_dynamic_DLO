@@ -212,6 +212,8 @@ def make_configured_env(
         table_finger_collision_filter_enabled=(
             not args.disable_table_finger_collision_filter
         ),
+        controller_profile=getattr(args, "controller_profile", "legacy"),
+        table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
     )
     if pointcloud:
         return DLOPointCloudObservation(env, pointcloud_config_from_args(args))
@@ -750,6 +752,8 @@ def parse_args() -> argparse.Namespace:
         "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
         help="robot model used by the MuJoCo environment",
     )
+    from ..env.control import add_controller_arguments
+    add_controller_arguments(parser)
     parser.add_argument(
         "--action-mode",
         choices=("task_space", "task_space_vertical_down", "joint_target"),

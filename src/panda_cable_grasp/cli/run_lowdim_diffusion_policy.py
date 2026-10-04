@@ -15,6 +15,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--scenario", choices=list_scenario_names(), required=True)
     parser.add_argument("--robot", choices=("panda", "nero"), default="nero")
+    from ..env.control import add_controller_arguments
+    add_controller_arguments(parser)
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument("--seed", type=int, default=20280804)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
@@ -45,6 +47,7 @@ def run(args: argparse.Namespace) -> Path:
 
     from ..diffusion_policy.lowdim import LowDimPolicyRunner
     from ..env.environment import CableGraspEnv, EnvConfig
+    from ..env.control import configure_profile
     from ..evaluation.benchmark import base_row, sha256_file, summarize, write_csv
     from ..evaluation.motion_diagnostics import env_config_for_scenario
     from ..evaluation.recording import EpisodeRecorder
@@ -63,6 +66,8 @@ def run(args: argparse.Namespace) -> Path:
             "dynamicvla_cameras_enabled": bool(args.record_video),
         }
     )
+    config = configure_profile(config, getattr(args, "controller_profile", "legacy"))
+    config.table_execution_guard_enabled = getattr(args, "table_execution_guard", False)
     env = CableGraspEnv(config)
     run_name = args.run_name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
     run_dir = args.output_dir.expanduser().resolve() / run_name
@@ -163,6 +168,9 @@ def run(args: argparse.Namespace) -> Path:
     summary = summarize(rows)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest = {
+        "controller_profile": getattr(args, "controller_profile", "legacy"),
+        "table_execution_guard": getattr(args, "table_execution_guard", False),
+        "grasp_judgement_version": "physical_holding_v2",
         "schema_version": 1,
         "method": "diffusion_policy_lowdim",
         "checkpoint": str(args.model.expanduser().resolve()),

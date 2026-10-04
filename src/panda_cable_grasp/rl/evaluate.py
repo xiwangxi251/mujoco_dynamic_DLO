@@ -911,6 +911,8 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         geometric_safety_enabled=args.geometric_safety,
         frame_skip=getattr(args, "frame_skip", None),
         rl_config=evaluation_rl_config(args),
+        controller_profile=getattr(args, "controller_profile", "legacy"),
+        table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
     )
     configure_target_evaluation(env, args)
 
@@ -1354,6 +1356,8 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         geometric_safety_enabled=args.geometric_safety,
         frame_skip=getattr(args, "frame_skip", None),
         rl_config=evaluation_rl_config(args),
+        controller_profile=getattr(args, "controller_profile", "legacy"),
+        table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
     )
     configure_target_evaluation(env, args)
 
@@ -1438,6 +1442,8 @@ def parse_args() -> argparse.Namespace:
         "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="panda",
         help="robot model used by the MuJoCo environment",
     )
+    from ..env.control import add_controller_arguments
+    add_controller_arguments(parser)
     parser.add_argument(
         "--action-mode",
         choices=("task_space", "task_space_vertical_down", "joint_target"),

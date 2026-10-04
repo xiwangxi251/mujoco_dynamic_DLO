@@ -608,6 +608,9 @@ def _run_policy_episode(job: dict[str, Any]) -> dict[str, Any]:
         seconds=float(job["episode_seconds"]),
         robot=str(job.get("robot", "panda")),
     )
+    from ..env.control import configure_profile
+    config = configure_profile(config, job.get("controller_profile", "legacy"))
+    config.table_execution_guard_enabled = bool(job.get("table_execution_guard", False))
     config = _config_for_method(config, method)
     config = _recordable_config(config, recording)
 
@@ -878,6 +881,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Paired scenario-matrix benchmark for cable grasping"
     )
+    from ..env.control import add_controller_arguments
+    add_controller_arguments(parser)
     parser.add_argument(
         "--methods", nargs="+",
         choices=("scripted", "expert", "ppo", "diffusion_policy"),
@@ -1037,6 +1042,9 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             seconds=args.episode_seconds,
             robot=getattr(args, "robot", "panda"),
         ), args.recording or "diffusion_policy" in args.methods)
+        from ..env.control import configure_profile
+        config = configure_profile(config, getattr(args, "controller_profile", "legacy"))
+        config.table_execution_guard_enabled = getattr(args, "table_execution_guard", False)
         model_env = CableGraspEnv(config)
         scenario_name = config.scenario_name
         model_path = models_dir / f"{scenario_name}.mjb"
@@ -1095,6 +1103,8 @@ def run_benchmark(args: argparse.Namespace) -> Path:
                     "output_dir": output_dir,
                     "compiled_model": model_path,
                     "robot": getattr(args, "robot", "panda"),
+                    "controller_profile": getattr(args, "controller_profile", "legacy"),
+                    "table_execution_guard": getattr(args, "table_execution_guard", False),
                 }
                 for episode, seed in enumerate(seeds, start=1)
                 for method in args.methods
@@ -1197,6 +1207,8 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             else str(diffusion_policy_model.resolve())
         ),
         "diffusion_policy_model_sha256": _sha256(diffusion_policy_model),
+        "controller_profile": getattr(args, "controller_profile", "legacy"),
+        "table_execution_guard": getattr(args, "table_execution_guard", False),
         "robot": getattr(args, "robot", "panda"),
         "source_xml": str(XML_PATH.resolve()),
         "source_xml_sha256": _sha256(XML_PATH),

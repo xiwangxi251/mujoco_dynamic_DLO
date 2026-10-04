@@ -30,6 +30,10 @@ secured、举起和保持奖励受材料身份匹配约束。错误抓取的第�
 
 ## 训练
 
+2026-10-05：新运行可显式选择 `--controller-profile enhanced6_bounded_dls_v1`，
+并以 `--table-execution-guard` 开启碰桌保护；见 [正式执行入口](enhanced6_dev_migration_20261005.md)。
+历史训练继续按其冻结配置解释，不能将新执行层和判定用于重标原结果。
+
 从匹配动作接口、网络结构的原有 state99 checkpoint 迁移：
 
 ```bash

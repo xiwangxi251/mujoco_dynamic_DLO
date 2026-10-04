@@ -62,6 +62,9 @@ def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
         dynamicvla_cameras_enabled=True,
         **scenario.to_env_overrides(),
     )
+    from ..env.control import configure_profile
+    config = configure_profile(config, getattr(args, "controller_profile", "legacy"))
+    config.table_execution_guard_enabled = getattr(args, "table_execution_guard", False)
     # EnvConfig.__post_init__ intentionally maps its default camera values to
     # NERO's new rig.  For the old-camera control arm, restore the old rig
     # after construction so it is not remapped by that compatibility rule.
@@ -580,7 +583,10 @@ def run_server(args: argparse.Namespace) -> None:
         )
         git_status = git_text("status", "--porcelain=v1")
         manifest = {
-            "schema_version": 4,
+            "controller_profile": getattr(args, "controller_profile", "legacy"),
+        "table_execution_guard": getattr(args, "table_execution_guard", False),
+        "grasp_judgement_version": "physical_holding_v2",
+        "schema_version": 4,
             "created_at": datetime.now().astimezone().isoformat(),
             "command": [sys.executable, *sys.argv],
             "method": "dynamicvla_zero_shot",
@@ -690,6 +696,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Zero-shot DynamicVLA evaluation on the MuJoCo cable task"
     )
+    from ..env.control import add_controller_arguments
+    add_controller_arguments(parser)
     parser.add_argument("--scenario", choices=list_scenario_names(), required=True)
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--seed", type=int, default=DEFAULT_EVALUATION_SEED)

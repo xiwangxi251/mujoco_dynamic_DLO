@@ -18,6 +18,10 @@ import mujoco
 import numpy as np
 
 from ..env.environment import CableGraspEnv, EnvConfig
+from ..env.control import (
+    ENHANCED6_BOUNDED_DLS_V1, configure_profile, delta_pose_twist,
+    solve_bounded_full6,
+)
 from ..env.kinematics import quat_error, rotation_to_quat
 from ..scenarios.registry import ScenarioConfig, get_scenario
 
@@ -294,6 +298,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         geometric_safety_enabled: bool | None = None,
         table_finger_collision_filter_enabled: bool = True,
         frame_skip: int | None = None,
+        controller_profile: str = "legacy",
+        table_execution_guard_enabled: bool | None = None,
     ):
         super().__init__()
         self.rl_config = rl_config or RLConfig()
@@ -364,6 +370,15 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 dynamicvla_cameras_enabled=dynamicvla_cameras_enabled,
             )
         )
+        if controller_profile != "legacy":
+            configure_profile(self.base_env.config, controller_profile)
+            self.base_env.configure_controller_profile(controller_profile)
+            if self.base_env.config.frame_skip != 10:
+                raise ValueError("enhanced6_bounded_dls_v1 requires a 20 ms control period")
+        if table_execution_guard_enabled is not None:
+            self.base_env.config.table_execution_guard_enabled = bool(table_execution_guard_enabled)
+        if self.base_env.config.table_execution_guard_enabled and self.base_env.config.controller_profile == "legacy":
+            raise ValueError("Table execution guard requires enhanced6_bounded_dls_v1")
         if geometric_safety_enabled is not None:
             self.base_env.config.geometric_safety_enabled = bool(
                 geometric_safety_enabled
@@ -373,12 +388,14 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         # The PPO training/evaluation interface uses the shared target limiter
         # plus the configured joint acceleration limiter.
-        self.base_env.config.arm_acceleration_limit_enabled = True
+        self.base_env.config.arm_acceleration_limit_enabled = self.base_env.config.controller_profile == "legacy"
         # The wrapper converts task-space actions to joint targets, while the
         # shared environment remains the final authority on robot capability.
         # Keep the historical joint-speed command limit as the only arm speed
         # guard for this configuration; do not add the newer Cartesian cap.
-        self.base_env.config.hand_cartesian_velocity_limit_enabled = False
+        self.base_env.config.hand_cartesian_velocity_limit_enabled = (
+            self.base_env.config.controller_profile == "enhanced6_bounded_dls_v1"
+        )
         self.action_mode = TASK_SPACE_ACTION_MODE
         if self.rl_config.target_node_task:
             from .target_node import TargetNodeTask
@@ -965,6 +982,45 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
 
         jacp, jacr = self.base_env._hand_jacobian()
         jacobian = np.vstack((jacp, jacr))[:, self.base_env.arm_dof_adr]
+        if self.base_env.config.controller_profile == "enhanced6_bounded_dls_v1":
+            linear_velocity, angular_velocity = delta_pose_twist(
+                world_translation,
+                control_dt,
+                orientation_error,
+                ENHANCED6_BOUNDED_DLS_V1,
+            )
+            q_current = self.data.qpos[self.base_env.arm_qpos_adr]
+            _, target_qpos, self._last_ik_velocity_scale = solve_bounded_full6(
+                jacobian,
+                linear_velocity,
+                angular_velocity,
+                q_current,
+                self.base_env.ready_qpos[:7],
+                np.asarray(self.base_env.config.arm_joint_velocity_limits, dtype=float),
+                self.model.jnt_range[self.base_env.arm_joint_ids, 0],
+                self.model.jnt_range[self.base_env.arm_joint_ids, 1],
+                ENHANCED6_BOUNDED_DLS_V1,
+            )
+            self._singularity_metrics(jacobian)
+            self._last_ik_singularity_damping = ENHANCED6_BOUNDED_DLS_V1.damping
+            self._last_ik_singularity_target_clipped = False
+            mujoco_action = np.empty(8)
+            mujoco_action[:7] = target_qpos
+            previous_gripper_closed = self._gripper_closed
+            if normalized[4] <= self.rl_config.gripper_close_threshold:
+                self._gripper_closed = True
+            elif normalized[4] >= self.rl_config.gripper_open_threshold:
+                self._gripper_closed = False
+            self._gripper_switch_event = bool(
+                self._gripper_closed != previous_gripper_closed
+            )
+            self._gripper_switch_count += int(self._gripper_switch_event)
+            mujoco_action[self.base_env.gripper_actuator_id] = (
+                self.rl_config.gripper_closed_ctrl
+                if self._gripper_closed
+                else self.base_env.gripper_open_ctrl
+            )
+            return mujoco_action
         twist = np.concatenate((linear_velocity, angular_velocity))
         _, _, singularity_severity, damping, singularity_active = (
             self._singularity_metrics(jacobian)

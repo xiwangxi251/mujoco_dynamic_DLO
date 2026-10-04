@@ -15,6 +15,7 @@ import mujoco
 import numpy as np
 
 from ..env.environment import CableGraspEnv
+from ..env.control import ENHANCED6_BOUNDED_DLS_V1, absolute_pose_twist, solve_bounded_full6
 from ..env.kinematics import point_jacobian, quat_error, rotation_to_quat
 
 
@@ -234,6 +235,35 @@ class DynamicVLATaskSpaceAdapter:
 
         desired_position = self.last_pose_command[:3]
         desired_quaternion = self.last_pose_command[3:]
+        if (
+            self.env.robot == "nero"
+            and self.env.config.controller_profile == "enhanced6_bounded_dls_v1"
+        ):
+            current_rotation = self.env.data.xmat[self.env.hand_id].reshape(3, 3)
+            position_error = desired_position - self.env.hand_position
+            orientation_error = quat_error(
+                rotation_to_quat(current_rotation), desired_quaternion
+            )
+            linear_velocity, angular_velocity = absolute_pose_twist(
+                position_error, orientation_error
+            )
+            jac_pos, jac_rot = point_jacobian(
+                self.env.model, self.env.data, self.env.hand_id,
+                self.env.GRASP_CENTER_LOCAL,
+            )
+            jacobian = np.vstack((jac_pos, jac_rot))[:, self.env.arm_dof_adr]
+            q_current = self.env.data.qpos[self.env.arm_qpos_adr]
+            _, target, _ = solve_bounded_full6(
+                jacobian, linear_velocity, angular_velocity, q_current,
+                self.env.ready_qpos[:7],
+                np.asarray(self.env.config.arm_joint_velocity_limits, dtype=float),
+                self.env.model.jnt_range[self.env.arm_joint_ids, 0],
+                self.env.model.jnt_range[self.env.arm_joint_ids, 1],
+                ENHANCED6_BOUNDED_DLS_V1,
+            )
+            self.last_joint_action[:7] = target
+            self.last_joint_action[self.env.gripper_actuator_id] = self._gripper_ctrl
+            return self.last_joint_action.copy()
         if self.env.robot == "nero" and self.config.nero_pose_ik_enabled:
             self.last_joint_action[:7] = self._pose_ik_target(
                 desired_position, desired_quaternion

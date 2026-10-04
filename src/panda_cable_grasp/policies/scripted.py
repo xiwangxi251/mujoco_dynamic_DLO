@@ -9,6 +9,7 @@ import math
 import numpy as np
 
 from ..env.environment import CableGraspEnv
+from ..env.control import ENHANCED6_BOUNDED_DLS_V1, absolute_pose_twist, solve_bounded_full6
 from ..env.kinematics import point_jacobian, quat_error, rotation_to_quat
 
 
@@ -868,6 +869,32 @@ class DynamicCableGraspPolicy:
         data = self.env.data
         position_error = desired_position - self.env.hand_position
         orientation_error, _ = self._orientation_error()
+        if (
+            self.env.robot == "nero"
+            and self.env.config.controller_profile == "enhanced6_bounded_dls_v1"
+        ):
+            jacobian = self._task_jacobian()
+            linear_velocity, angular_velocity = absolute_pose_twist(
+                desired_position - self.env.hand_position,
+                orientation_error,
+            )
+            q_current = data.qpos[self.env.arm_qpos_adr]
+            _, q_target, self._full6_velocity_scale = solve_bounded_full6(
+                jacobian,
+                linear_velocity,
+                angular_velocity,
+                q_current,
+                self.env.ready_qpos[:7],
+                np.asarray(self.env.config.arm_joint_velocity_limits, dtype=float),
+                model.jnt_range[self.env.arm_joint_ids, 0],
+                model.jnt_range[self.env.arm_joint_ids, 1],
+                ENHANCED6_BOUNDED_DLS_V1,
+            )
+            action = self.env.ready_ctrl.copy()
+            action[:7] = q_target
+            action[self.env.gripper_actuator_id] = gripper
+            self.last_desired = desired_position.copy()
+            return action
         position_error_norm = float(np.linalg.norm(position_error))
         fast_approach = bool(
             self.phase is Phase.APPROACH

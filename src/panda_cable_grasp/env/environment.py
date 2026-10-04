@@ -12,6 +12,7 @@ from pathlib import Path
 
 from ..paths import PROJECT_ROOT, output_path
 from ..runtime import configure_mujoco_runtime
+from .control import CONTROLLER_PROFILES, configure_profile, compose_bounded_pd_gravity
 from .objects import (
     DeformableSpec,
     LaneDrive,
@@ -152,6 +153,19 @@ def robot_spec(name: str) -> RobotSpec:
     except KeyError as error:
         supported = ", ".join(sorted(ROBOT_SPECS))
         raise ValueError(f"unsupported robot {name!r}; choose one of {supported}") from error
+
+@lru_cache(maxsize=4)
+def _cached_gravity_robot_model(xml_path: str) -> mujoco.MjModel:
+    """Compile one robot-only model for gravity terms, without scene bodies.
+
+    Gravity bias depends on robot kinematics and inertias, not on cable/table
+    collision bodies.  Reusing this immutable model lets each environment keep
+    its own MjData while avoiding a full deformable-scene ``mj_forward`` at every
+    500 Hz physics substep.
+    """
+
+    return mujoco.MjModel.from_xml_path(xml_path)
+
 
 # -------------------------------------------------------------------------
 # 找 MuJoCo Menagerie 里的 Franka Panda 官方资源目录
@@ -429,6 +443,8 @@ class EnvConfig:
     arm_joint_acceleration_limits: tuple[float, ...] = (
         15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0,
     )
+    controller_profile: str = "legacy"
+    table_execution_guard_enabled: bool = False
     hand_cartesian_velocity_limit_enabled: bool = False
     hand_linear_velocity_limit: float = 1.0
     hand_angular_velocity_limit: float = 2.0
@@ -649,6 +665,14 @@ class EnvConfig:
                 raise ValueError(f"{name} must contain exactly 7 values")
             if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
                 raise ValueError(f"{name} values must be finite and positive")
+        if self.controller_profile not in CONTROLLER_PROFILES:
+            raise ValueError("Unknown controller_profile")
+        if not isinstance(self.table_execution_guard_enabled, bool):
+            raise ValueError("table_execution_guard_enabled must be boolean")
+        if (self.controller_profile != "legacy" or self.table_execution_guard_enabled) and self.robot != "nero":
+            raise ValueError("Enhanced6 and table guard require NERO")
+        if self.table_execution_guard_enabled and self.controller_profile == "legacy":
+            raise ValueError("table_execution_guard requires enhanced6_bounded_dls_v1")
         if not isinstance(self.arm_acceleration_limit_enabled, bool):
             raise ValueError("arm_acceleration_limit_enabled must be boolean")
         if not isinstance(self.hand_cartesian_velocity_limit_enabled, bool):
@@ -1239,6 +1263,35 @@ class CableGraspEnv:
         ], dtype=int)
         self.arm_qpos_adr = self.model.jnt_qposadr[self.arm_joint_ids].copy()
         self.arm_dof_adr = self.model.jnt_dofadr[self.arm_joint_ids].copy()
+        # Torque compensation is currently part of the NERO profile contract.
+        # Other robot models may expose different actuator names (or no arm
+        # position actuators), so leave their legacy path untouched.
+        self._arm_actuator_ids = (
+            np.asarray([
+                id_of(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+                for name in self.robot_spec.arm_joint_names
+            ], dtype=int)
+            if self.robot == "nero"
+            else np.empty(0, dtype=int)
+        )
+        self._gravity_ff_enabled = False
+        self._gravity_model: mujoco.MjModel | None = None
+        self._gravity_data: mujoco.MjData | None = None
+        self._gravity_qpos_sync: tuple[tuple[int, int], ...] = ()
+        self._gravity_arm_dof_adr = np.empty(0, dtype=int)
+        self.last_gravity_compensation = np.zeros(7, dtype=float)
+        self.last_gravity_compensation_applied = np.zeros(7, dtype=float)
+        self.last_pd_torque_requested = np.zeros(7, dtype=float)
+        self.last_pd_torque_actuator_limited = np.zeros(7, dtype=float)
+        self.last_preexisting_applied_torque = np.zeros(7, dtype=float)
+        self.last_bounded_arm_drive_torque = np.zeros(7, dtype=float)
+        self.last_physical_arm_drive_torque = np.zeros(7, dtype=float)
+        self.last_ctrl_clip_count = 0
+        self._gravity_torque_saturation_steps = 0
+        self._profile_actuation_initialized = False
+        self.arm_actuator_ids = self._arm_actuator_ids
+        self._table_execution_guard = None
+        self.configure_controller_profile(self.config.controller_profile)
         self.hand_id = id_of(
             self.model, mujoco.mjtObj.mjOBJ_BODY,
             self.robot_spec.hand_body_name,
@@ -1581,6 +1634,9 @@ class CableGraspEnv:
         self._cartesian_velocity_limit_steps = 0
         self._gripper_velocity_limit_steps = 0
         self._physics_steps = 0
+        self._gravity_torque_saturation_steps = 0
+        if self._table_execution_guard is not None:
+            self._table_execution_guard.reset()
         self._velocity_guard_steps = 0
         self._actual_velocity_exceedance_steps = 0
         self._physics_velocity_limit_steps = 0
@@ -2052,6 +2108,9 @@ class CableGraspEnv:
         self._cartesian_velocity_limit_steps = 0
         self._gripper_velocity_limit_steps = 0
         self._physics_steps = 0
+        self._gravity_torque_saturation_steps = 0
+        if self._table_execution_guard is not None:
+            self._table_execution_guard.reset()
         self._velocity_guard_steps = 0
         self._actual_velocity_exceedance_steps = 0
         self._physics_velocity_limit_steps = 0
@@ -2125,8 +2184,14 @@ class CableGraspEnv:
                 self.last_termination_reason = "geometric_safety_violation"
                 truncated = True
                 break
+            if self.config.table_execution_guard_enabled:
+                if self._table_execution_guard is None:
+                    from .table_execution_guard import TableExecutionGuard
+                    self._table_execution_guard = TableExecutionGuard(self)
+                guarded_action = self._table_execution_guard.project(guarded_action)
+                velocity_guard_active = velocity_guard_active or self._table_execution_guard.last_active
             self.data.ctrl[:] = guarded_action
-            if self._geometric_safety_filter.last_predicted_step_safe:
+            if self._geometric_safety_filter.last_predicted_step_safe and not self._gravity_ff_enabled:
                 # The near-table trial step was already advanced on the
                 # reusable probe data; commit that exact state instead of
                 # integrating the real data a second, slightly different way.
@@ -2136,6 +2201,7 @@ class CableGraspEnv:
                 self._geometric_safety_filter.last_predicted_step_safe = False
                 pre_limit_qvel = self.data.qvel.copy()
             else:
+                self._geometric_safety_filter.last_predicted_step_safe = False
                 pre_limit_qvel = self._physics_step()
             self._record_actual_robot_velocity(
                 velocity_guard_active, pre_limit_qvel
@@ -2411,9 +2477,144 @@ class CableGraspEnv:
 
     def _physics_step(self) -> np.ndarray:
         """执行普通 MuJoCo 物理步，不在物理层追加速度限制。"""
-
-        mujoco.mj_step(self.model, self.data)
+        if self._gravity_ff_enabled:
+            gravity = self._gravity_bias_for_qpos(self.data.qpos)
+            actuator_ids = self._arm_actuator_ids
+            q = self.data.qpos[self.arm_qpos_adr]
+            qvel = self.data.qvel[self.arm_dof_adr]
+            ctrl_range = self.model.actuator_ctrlrange[actuator_ids]
+            requested_ctrl = self.data.ctrl[actuator_ids].copy()
+            limited_ctrl = np.clip(requested_ctrl, ctrl_range[:, 0], ctrl_range[:, 1])
+            self.last_ctrl_clip_count = int(np.count_nonzero(
+                np.abs(limited_ctrl - requested_ctrl) > 1e-12
+            ))
+            self.data.ctrl[actuator_ids] = limited_ctrl
+            pd_requested = (
+                self.model.actuator_gainprm[actuator_ids, 0] * limited_ctrl
+                + self.model.actuator_biasprm[actuator_ids, 0]
+                + self.model.actuator_biasprm[actuator_ids, 1] * q
+                + self.model.actuator_biasprm[actuator_ids, 2] * qvel
+            )
+            force_range = self.model.actuator_forcerange[actuator_ids]
+            old_applied = self.data.qfrc_applied[self.arm_dof_adr].copy()
+            pd_limited, total_limited, added_compensation = compose_bounded_pd_gravity(
+                pd_requested, gravity, old_applied, force_range
+            )
+            self._gravity_torque_saturation_steps += int(
+                np.any(np.abs(total_limited - (pd_limited + old_applied + gravity)) > 1e-10)
+            )
+            self.data.qfrc_applied[self.arm_dof_adr] = old_applied + added_compensation
+            self.last_pd_torque_requested[:] = pd_requested
+            self.last_pd_torque_actuator_limited[:] = pd_limited
+            self.last_preexisting_applied_torque[:] = old_applied
+            self.last_bounded_arm_drive_torque[:] = total_limited
+            self.last_gravity_compensation[:] = gravity
+            self.last_gravity_compensation_applied[:] = added_compensation
+            try:
+                mujoco.mj_step(self.model, self.data)
+                self.last_physical_arm_drive_torque[:] = (
+                    self.data.qfrc_actuator[self.arm_dof_adr]
+                    + self.data.qfrc_applied[self.arm_dof_adr]
+                )
+            finally:
+                self.data.qfrc_applied[self.arm_dof_adr] = old_applied
+        else:
+            mujoco.mj_step(self.model, self.data)
         return self.data.qvel.copy()
+
+    def _gravity_bias_for_qpos(self, qpos: np.ndarray) -> np.ndarray:
+        """Evaluate NERO gravity on the cached robot-only model.
+
+        The environment and standalone robot XML share the same named arm and
+        finger joints, inertias, gravity and base orientation.  The task-frame
+        base offset is translational and therefore does not change gravity.
+        Finger positions are mirrored because their link masses contribute to
+        arm gravity; unrelated cable and table coordinates do not.
+        """
+
+        assert self._gravity_model is not None and self._gravity_data is not None
+        q = np.asarray(qpos, dtype=float)
+        for gravity_adr, scene_adr in self._gravity_qpos_sync:
+            self._gravity_data.qpos[gravity_adr] = q[scene_adr]
+        self._gravity_data.qvel[:] = 0.0
+        self._gravity_data.qacc[:] = 0.0
+        mujoco.mj_forward(self._gravity_model, self._gravity_data)
+        return self._gravity_data.qfrc_bias[self._gravity_arm_dof_adr].copy()
+
+    def configure_controller_profile(self, profile: str) -> None:
+        """Apply one named controller envelope and its actuator calibration."""
+        if profile not in set(CONTROLLER_PROFILES):
+            raise ValueError(f"unknown controller profile: {profile}")
+        if self.config.table_execution_guard_enabled and profile == "legacy":
+            raise ValueError("Table execution guard requires enhanced6_bounded_dls_v1")
+        if self._profile_actuation_initialized and profile == "legacy":
+            raise ValueError("cannot revert an initialized model's actuator gains in-place")
+        configure_profile(self.config, profile)
+        if profile == "enhanced6_bounded_dls_v1" and self.robot == "nero":
+            if not self._profile_actuation_initialized:
+                for joint_name in self.robot_spec.arm_joint_names:
+                    actuator_id = id_of(
+                        self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, joint_name
+                    )
+                    self.model.actuator_gainprm[actuator_id, 0] *= 4.0
+                    self.model.actuator_biasprm[actuator_id, 1] *= 4.0
+                    self.model.actuator_biasprm[actuator_id, 2] *= 2.0
+                self._profile_actuation_initialized = True
+            self._gravity_ff_enabled = True
+            if self._gravity_model is None:
+                self._gravity_model = _cached_gravity_robot_model(
+                    str(self.robot_spec.xml_path.resolve())
+                )
+                self._gravity_data = mujoco.MjData(self._gravity_model)
+                sync_names = (
+                    *self.robot_spec.arm_joint_names,
+                    *self.robot_spec.finger_joint_names,
+                )
+                sync: list[tuple[int, int]] = []
+                for joint_name in sync_names:
+                    gravity_joint_id = id_of(
+                        self._gravity_model,
+                        mujoco.mjtObj.mjOBJ_JOINT,
+                        joint_name,
+                    )
+                    scene_joint_id = id_of(
+                        self.model,
+                        mujoco.mjtObj.mjOBJ_JOINT,
+                        joint_name,
+                    )
+                    gravity_type = int(self._gravity_model.jnt_type[gravity_joint_id])
+                    scene_type = int(self.model.jnt_type[scene_joint_id])
+                    if gravity_type != scene_type:
+                        raise RuntimeError(
+                            f"Gravity model joint type mismatch for {joint_name!r}"
+                        )
+                    gravity_adr = int(
+                        self._gravity_model.jnt_qposadr[gravity_joint_id]
+                    )
+                    scene_adr = int(self.model.jnt_qposadr[scene_joint_id])
+                    sync.append((gravity_adr, scene_adr))
+                self._gravity_qpos_sync = tuple(sync)
+                self._gravity_arm_dof_adr = np.asarray([
+                    self._gravity_model.jnt_dofadr[
+                        id_of(
+                            self._gravity_model,
+                            mujoco.mjtObj.mjOBJ_JOINT,
+                            name,
+                        )
+                    ]
+                    for name in self.robot_spec.arm_joint_names
+                ], dtype=int)
+        else:
+            self.config.controller_profile = profile
+            self._gravity_ff_enabled = False
+            self.last_gravity_compensation[:] = 0.0
+            self.last_gravity_compensation_applied[:] = 0.0
+            self.last_pd_torque_requested[:] = 0.0
+            self.last_pd_torque_actuator_limited[:] = 0.0
+            self.last_preexisting_applied_torque[:] = 0.0
+            self.last_bounded_arm_drive_torque[:] = 0.0
+            self.last_physical_arm_drive_torque[:] = 0.0
+            self.last_ctrl_clip_count = 0
 
     def _record_actual_robot_velocity(
         self,
@@ -2565,6 +2766,28 @@ class CableGraspEnv:
         )
         arm_motion_start_time = self._arm_motion_start_time()
         return {
+            "controller_profile": self.config.controller_profile,
+            "physics_substep_count": self._physics_steps,
+            "controller_control_dt": float(
+                self.model.opt.timestep * max(1, self.config.frame_skip)
+            ),
+            "gravity_compensation_enabled": self._gravity_ff_enabled,
+            "gravity_compensation_torque": self.last_gravity_compensation.copy(),
+            "gravity_compensation_applied_torque": (
+                self.last_gravity_compensation_applied.copy()
+            ),
+            "pd_torque_requested": self.last_pd_torque_requested.copy(),
+            "pd_torque_actuator_limited": self.last_pd_torque_actuator_limited.copy(),
+            "preexisting_applied_arm_torque": self.last_preexisting_applied_torque.copy(),
+            "bounded_total_arm_drive_torque": self.last_bounded_arm_drive_torque.copy(),
+            "measured_pd_plus_applied_arm_torque": self.last_physical_arm_drive_torque.copy(),
+            "arm_ctrl_clip_count": self.last_ctrl_clip_count,
+            "gravity_torque_saturation_step_ratio": (
+                self._gravity_torque_saturation_steps
+                / max(self._physics_steps, 1)
+            ),
+            "table_execution_guard_enabled": self.config.table_execution_guard_enabled,
+            "table_execution_guard": (self._table_execution_guard.summary() if self._table_execution_guard is not None else None),
             "trial": self.trial_index,
             "episode_seed": self.episode_seed,
             "robot": self.robot,

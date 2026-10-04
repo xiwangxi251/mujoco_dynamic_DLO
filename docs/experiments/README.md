@@ -8,6 +8,8 @@
 
 ## 目录结构
 
+- [增强 6、有界 DLS 与碰桌保护迁入 dev](policies/enhanced6_dev_migration_20261005.md)：正式配置入口、来源和迁移边界。
+
 - [指定点策略训练、测试场景族 `cable_x075_v1`](cable_x075_scene_family.md)：X 基准 0.750 m；历史权重与实验仍归属旧场景。
 - `policies/`：策略与端到端方法实验记录
   - [Scripted 与 Expert](policies/scripted_policy_experiments.md)

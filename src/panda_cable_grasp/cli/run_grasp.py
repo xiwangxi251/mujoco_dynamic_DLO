@@ -7,6 +7,7 @@ from pathlib import Path
 import time
 
 from ..env.environment import CableGraspEnv, EnvConfig, ROBOT_SPECS
+from ..env.control import add_controller_arguments
 from ..evaluation.benchmark import run_benchmark
 from ..evaluation.defaults import DEFAULT_EVALUATION_SEED, DEFAULT_VIDEO_FPS
 from ..paths import output_path
@@ -23,6 +24,8 @@ def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
     if args.scenario is None:
         return EnvConfig(
             robot=robot,
+            controller_profile=getattr(args, "controller_profile", "legacy"),
+            table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
             seed=args.seed,
             episode_seconds=args.episode_seconds,
             disturbance_strength=args.disturbance,
@@ -31,6 +34,8 @@ def env_config_from_args(args: argparse.Namespace) -> EnvConfig:
     scenario = get_scenario(args.scenario)
     return EnvConfig(
         robot=robot,
+        controller_profile=getattr(args, "controller_profile", "legacy"),
+        table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
         seed=args.seed,
         episode_seconds=args.episode_seconds,
         scenario_name=scenario.name,
@@ -75,6 +80,8 @@ def run_headless(args: argparse.Namespace) -> None:
         output=args.video_dir,
         run_name=args.run_name,
         robot=getattr(args, "robot", "panda"),
+        controller_profile=getattr(args, "controller_profile", "legacy"),
+        table_execution_guard=getattr(args, "table_execution_guard", False),
     ))
 
 
@@ -178,6 +185,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Reactive robot grasping of a continuously deforming cable"
     )
+    add_controller_arguments(parser)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--duration", type=float, default=0.0)

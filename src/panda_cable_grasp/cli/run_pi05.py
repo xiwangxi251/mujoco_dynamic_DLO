@@ -21,6 +21,7 @@ configure_mujoco_runtime()
 import mujoco
 
 from ..dynamicvla.adapter import DynamicVLAAdapterConfig, DynamicVLATaskSpaceAdapter
+from ..env.control import configure_profile
 from ..env.environment import (
     CableGraspEnv,
     EnvConfig,
@@ -51,8 +52,10 @@ def _env_config(
     seed: int,
     episode_seconds: float,
     robot: str,
+    controller_profile: str = "legacy",
+    table_execution_guard_enabled: bool = False,
 ) -> EnvConfig:
-    return EnvConfig(
+    config = EnvConfig(
         robot=robot,
         seed=seed,
         episode_seconds=episode_seconds,
@@ -64,6 +67,9 @@ def _env_config(
         target_selection="middle",
         **scenario.to_env_overrides(),
     )
+    config = configure_profile(config, controller_profile)
+    config.table_execution_guard_enabled = table_execution_guard_enabled
+    return config
 
 
 def _observation(env: CableGraspEnv, instruction: str) -> dict:
@@ -146,6 +152,8 @@ def _run_episode(
         seed=seed,
         episode_seconds=args.episode_seconds,
         robot=args.robot,
+        controller_profile=getattr(args, "controller_profile", "legacy"),
+        table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
     ))
     adapter = DynamicVLATaskSpaceAdapter(env, DynamicVLAAdapterConfig())
     model_path = run_dir / "models" / f"{scenario.name}.mjb"
@@ -287,6 +295,8 @@ def run(args: argparse.Namespace) -> Path:
             seed=args.seed,
             episode_seconds=args.episode_seconds,
             robot=args.robot,
+            controller_profile=getattr(args, "controller_profile", "legacy"),
+            table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
         ))
         try:
             mujoco.mj_saveModel(env.model, str(run_dir / "models" / f"{scenario.name}.mjb"), None)
@@ -316,6 +326,9 @@ def run(args: argparse.Namespace) -> Path:
     summary = summarize(rows)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest = {
+        "controller_profile": getattr(args, "controller_profile", "legacy"),
+        "table_execution_guard": getattr(args, "table_execution_guard", False),
+        "grasp_judgement_version": "physical_holding_v2",
         "schema_version": 4,
         "created_at": datetime.now().astimezone().isoformat(),
         "command": [sys.executable, *sys.argv],
@@ -395,6 +408,8 @@ def parse_args() -> argparse.Namespace:
         help="number of predicted actions to execute before replanning",
     )
     parser.add_argument("--robot", choices=tuple(sorted(ROBOT_SPECS)), default="nero")
+    from ..env.control import add_controller_arguments
+    add_controller_arguments(parser)
     parser.add_argument("--video-fps", type=float, default=DEFAULT_VIDEO_FPS)
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
     parser.add_argument("--policy-host", default="10.1.114.130")

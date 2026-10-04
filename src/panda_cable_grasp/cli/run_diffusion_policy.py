@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
         "--robot", choices=tuple(sorted(ROBOT_SPECS)), default="nero",
         help="robot model used by the MuJoCo environment",
     )
+    from ..env.control import add_controller_arguments
+    add_controller_arguments(parser)
     parser.add_argument("--video-fps", type=float, default=25.0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -71,6 +73,7 @@ def run(args: argparse.Namespace) -> Path:
         CableGraspEnv, EnvConfig, PANDA_XML_PATH, XML_PATH,
         resolve_menagerie_panda_dir,
     )
+    from ..env.control import configure_profile
     from ..evaluation.benchmark import base_row, sha256_file, summarize, write_csv
     from ..evaluation.defaults import DEFAULT_VIDEO_FPS
     from ..evaluation.motion_diagnostics import env_config_for_scenario
@@ -91,6 +94,8 @@ def run(args: argparse.Namespace) -> Path:
     if args.rigid_contact_only:
         overrides["rigid_motion_contact_only"] = True
     config = EnvConfig(**{**vars(config), **overrides})
+    config = configure_profile(config, getattr(args, "controller_profile", "legacy"))
+    config.table_execution_guard_enabled = getattr(args, "table_execution_guard", False)
     env = CableGraspEnv(config)
     run_name = args.run_name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
     run_dir = args.video_dir.expanduser().resolve() / run_name
@@ -193,6 +198,9 @@ def run(args: argparse.Namespace) -> Path:
     summary = summarize(rows)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest = {
+        "controller_profile": getattr(args, "controller_profile", "legacy"),
+        "table_execution_guard": getattr(args, "table_execution_guard", False),
+        "grasp_judgement_version": "physical_holding_v2",
         "schema_version": 1,
         "method": "diffusion_policy",
         "checkpoint": str(args.model.expanduser().resolve()),
