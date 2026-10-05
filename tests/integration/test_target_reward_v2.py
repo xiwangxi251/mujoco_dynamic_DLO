@@ -39,6 +39,32 @@ def env():
     instance.close()
 
 
+@pytest.mark.parametrize('cause,key,penalty', [
+    ('active_open', 'reward_active_open_after_secured', -8.),
+    ('physical_slip', 'reward_physical_slip', -3.),
+    ('open_during_contact_loss', 'reward_physical_slip', -3.),
+])
+@pytest.mark.parametrize('node,qualified', [(20, True), (23, False)])
+def test_delayed_release_uses_secured_session_target_qualification(env, cause, key, penalty, node, qualified):
+    held(env, node)
+    status = dict(pinch_confirmed=True, secured_grasp=True, grasp_lift_delta=.05,
+                  grasp_body_height_above_table=.09, strict_success_hold=0., height_band_hold=0.)
+    env._secured_session_active = True
+    env._reward(np.zeros(5), False, {'lifted_fraction': .1}, status)
+    # Contact qualification disappears before the delayed physical break.
+    env.base_env.grasp_state = None
+    status.update(pinch_confirmed=False, secured_grasp=False)
+    env._reward(np.zeros(5), False, {'lifted_fraction': 0.}, status)
+    assert not env.goal.previous_secured
+    env.base_env.last_grasp_break = dict(time=1., reason='physical_grasp_geometry_lost', causal_class=cause)
+    env.base_env.grasp_break_history.append(env.base_env.last_grasp_break)
+    _, parts = env._reward(np.zeros(5), False, {'lifted_fraction': 0.}, status)
+    assert parts[key] == (penalty if qualified else 0.)
+    assert not env._secured_session_target_match
+    _, parts = env._reward(np.zeros(5), False, {'lifted_fraction': 0.}, status)
+    assert parts[key] == 0.
+
+
 def held(env, index):
     env.base_env.grasp_state = GraspState(body_id=env.base_env.cable_ids[index],
         candidate_time=0., bilateral_confirmed=True, last_bilateral_time=0., lost_contact_time=0.)

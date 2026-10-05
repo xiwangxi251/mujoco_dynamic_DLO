@@ -521,6 +521,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._lift_credit_previous = 0.0
         self._cable_lift_credit_previous = 0.0
         self._secured_session_active = False
+        self._secured_session_target_match = False
         self._last_grasp_break_key: tuple[float, str] | None = None
         self._active_open_after_secured_event = False
         self._physical_slip_after_secured_event = False
@@ -1314,6 +1315,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._open_during_contact_loss_event = True
             self._open_during_contact_loss_count += 1
         self._secured_session_active = False
+        self._secured_session_target_match = False
         return (
             self._active_open_after_secured_event,
             self._physical_slip_after_secured_event,
@@ -1661,6 +1663,14 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._lift_credit_high_water = self._lift_progress_credit.height_high_water
             self._cable_lift_credit_high_water = self._lift_progress_credit.fraction_high_water
 
+        # Preserve qualification across the contact-loss steps preceding the
+        # physical break event. The immediately previous step may be unheld.
+        if secured_grasp and goal_match:
+            self._secured_session_target_match = True
+        penalty_target_match = self.goal is None or (
+            self._secured_session_target_match if revised_progress
+            else self.goal.previous_secured
+        )
         active_open, physical_slip, ambiguous_release = (
             self._classify_secured_grasp_break()
         )
@@ -1671,11 +1681,11 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         # 明确主动张爪另有一次较重惩罚，避免先制造低成本滑脱后免费张爪。
         penalize_active_open = bool(
             active_open and not self._active_open_penalty_applied
-            and (self.goal is None or self.goal.previous_secured)
+            and penalty_target_match
         )
         penalize_contact_loss = bool(
             (physical_slip or ambiguous_release) and not self._contact_loss_penalty_applied
-            and (self.goal is None or self.goal.previous_secured)
+            and penalty_target_match
         )
         if penalize_active_open:
             self._active_open_penalty_applied = True
@@ -1993,6 +2003,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._lift_credit_heights(), self._cable_lift_credit_high_water,
         ) if self.rl_config.target_reward_profile == "tolerance_progress_v2" else None)
         self._secured_session_active = False
+        self._secured_session_target_match = False
         self._last_grasp_break_key = None
         self._active_open_after_secured_event = False
         self._physical_slip_after_secured_event = False
