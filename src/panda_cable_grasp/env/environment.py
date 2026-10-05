@@ -13,6 +13,7 @@ from pathlib import Path
 from ..paths import PROJECT_ROOT, output_path
 from ..runtime import configure_mujoco_runtime
 from .control import CONTROLLER_PROFILES, configure_profile, compose_bounded_pd_gravity
+from .contact_cache import cached_contact_reads
 from .objects import (
     DeformableSpec,
     LaneDrive,
@@ -303,6 +304,7 @@ RIGID_MOTION_L2_ARC_LENGTH = float(np.linalg.norm(
 # -------------------------------------------------------------------------
 @dataclass
 class EnvConfig:
+    contact_read_cache_enabled: bool = True
     # 基础参数
     robot: str = "panda"
     seed: int = 20260804
@@ -1254,6 +1256,8 @@ class CableGraspEnv:
         self.model.actuator_biasprm[self.gripper_actuator_id, 1] *= grip_scale
         self.model.actuator_biasprm[self.gripper_actuator_id, 2] *= math.sqrt(grip_scale)
         self.data = mujoco.MjData(self.model)
+        self._pad_contact_cache_active = False
+        self._pad_contact_cache = None
 
         # 批量查找各类对象 ID、地址
         self.home_id = id_of(self.model, mujoco.mjtObj.mjOBJ_KEY, "home")
@@ -1845,6 +1849,7 @@ class CableGraspEnv:
             eq_data[6:10] = rel_q
             eq_data[10] = 1.0
         self.data.eq_active[eq_ids] = 1.0
+        self._invalidate_contact_cache()
         mujoco.mj_forward(self.model, self.data)
 
     def _replay_index(self) -> int:
@@ -1872,6 +1877,7 @@ class CableGraspEnv:
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[:9] = self.ready_qpos
         self.data.ctrl[:8] = self.ready_ctrl
+        self._invalidate_contact_cache()
         mujoco.mj_forward(self.model, self.data)
 
         uses_rigid_motion = (
@@ -2037,6 +2043,7 @@ class CableGraspEnv:
             f"{self.config.shape_motion_scale:.17g}|"
             f"{self.phase_offset:.17g}|{self.spatial_phase:.17g}"
         ).encode("ascii")
+        self._invalidate_contact_cache()
         mujoco.mj_forward(self.model, self.data)
         self._rigid_reference_xy[:] = self.data.xpos[self.cable_ids, :2]
         self._rigid_reference_com_xy[:] = np.average(
@@ -2132,6 +2139,7 @@ class CableGraspEnv:
         self.trial_index += 1
         return self.observation(), self.info()
 
+    @cached_contact_reads
     def step(self, action: np.ndarray) -> tuple[dict, float, bool, bool, dict]:
         """一个50 Hz控制动作内部执行十个500 Hz物理子步。"""
         # action裁剪。
@@ -2191,6 +2199,7 @@ class CableGraspEnv:
                 guarded_action = self._table_execution_guard.project(guarded_action)
                 velocity_guard_active = velocity_guard_active or self._table_execution_guard.last_active
             self.data.ctrl[:] = guarded_action
+            self._invalidate_contact_cache()
             if self._geometric_safety_filter.last_predicted_step_safe and not self._gravity_ff_enabled:
                 # The near-table trial step was already advanced on the
                 # reusable probe data; commit that exact state instead of
@@ -2477,6 +2486,7 @@ class CableGraspEnv:
 
     def _physics_step(self) -> np.ndarray:
         """执行普通 MuJoCo 物理步，不在物理层追加速度限制。"""
+        self._invalidate_contact_cache()
         if self._gravity_ff_enabled:
             gravity = self._gravity_bias_for_qpos(self.data.qpos)
             actuator_ids = self._arm_actuator_ids
@@ -3513,6 +3523,7 @@ class CableGraspEnv:
             self.data.qpos[qpos_address:qpos_address + 4] = [
                 math.cos(0.5 * angle), 0.0, 0.0, math.sin(0.5 * angle),
             ]
+        self._invalidate_contact_cache()
         mujoco.mj_forward(self.model, self.data)
 
         current_xy = self.data.xpos[ids, :2]
@@ -3563,6 +3574,7 @@ class CableGraspEnv:
         self.data.qvel[
             obj.free_dadr:obj.free_dadr + 6
         ] = 0.0
+        self._invalidate_contact_cache()
         mujoco.mj_forward(self.model, self.data)
 
     def _cable_table_contact_mask(self) -> np.ndarray:
@@ -4819,6 +4831,17 @@ class CableGraspEnv:
         ))
     def _pad_contact_samples(self) -> list[tuple[int, int, float]]:
         """读取真实内指垫接触及其法向力，不修改任何物理状态。"""
+        if self._pad_contact_cache_active and self._pad_contact_cache is not None:
+            return self._pad_contact_cache.copy()
+        samples = self._compute_pad_contact_samples()
+        if self._pad_contact_cache_active:
+            self._pad_contact_cache = samples.copy()
+        return samples
+
+    def _invalidate_contact_cache(self) -> None:
+        self._pad_contact_cache = None
+
+    def _compute_pad_contact_samples(self) -> list[tuple[int, int, float]]:
         samples: list[tuple[int, int, float]] = []
         contact_force = np.zeros(6)
         for contact_id, contact in enumerate(self.data.contact[:self.data.ncon]):

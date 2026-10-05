@@ -19,6 +19,7 @@ import mujoco
 import numpy as np
 
 from ..env.environment import CableGraspEnv, EnvConfig
+from ..env.contact_cache import cached_contact_reads
 from ..env.control import (
     ENHANCED6_BOUNDED_DLS_V1, configure_profile, delta_pose_twist,
     solve_bounded_full6,
@@ -2046,6 +2047,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._previous_alignment_potential = self._alignment_potential
         return self._observation(), self._augment_info(info)
 
+    @cached_contact_reads
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         normalized_action = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
         mujoco_action = self._convert_action(normalized_action)

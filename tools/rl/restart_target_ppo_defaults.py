@@ -49,6 +49,7 @@ def main():
     parser.add_argument('--source-run',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--expected-commit',required=True)
+    parser.add_argument('--worker-affinity', choices=('none','numa'))
     parser.add_argument('--source-stop-record',type=Path,
                         help='validated stop record when the user stopped the source before restart')
     opts=parser.parse_args()
@@ -108,6 +109,11 @@ def main():
     write(output/'source_curriculum_state.json',previous_state)
     command=list(old['command'])
     command[0]=sys.executable
+    if opts.worker_affinity is not None:
+        if '--worker-affinity' in command:
+            command[command.index('--worker-affinity')+1]=opts.worker_affinity
+        else:
+            command.extend(['--worker-affinity',opts.worker_affinity])
     for option,value in [('--resume',str(checkpoint)),('--rl-config-file',str(reference)),
                          ('--timesteps',str(remaining)),('--output',str(output))]:
         command[command.index(option)+1]=value
@@ -141,6 +147,8 @@ def main():
         source_entropy_coef=float(data['ent_coef']),source_stage=state['stage'],command=command,
         resolved_target_ppo_defaults=TARGET_PPO_DEFAULTS,
         changes=dict(workspace_scene_family=dict(old=cfg['workspace_scene_family'],new=actual.workspace_scene_family),
+                     contact_read_cache_enabled=dict(old=cfg.get('contact_read_cache_enabled',False),new=actual.contact_read_cache),
+                     worker_affinity=dict(old=cfg.get('worker_affinity','none'),new=actual.worker_affinity),
                      table_finger_collision_filter_enabled=dict(old=cfg.get('table_finger_collision_filter_enabled',True),
                                                                new=not actual.disable_table_finger_collision_filter),
                      table_execution_guard_enabled=dict(old=cfg['table_execution_guard_enabled'],new=actual.table_execution_guard)),

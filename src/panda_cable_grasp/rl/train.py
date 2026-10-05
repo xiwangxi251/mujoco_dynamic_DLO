@@ -237,6 +237,7 @@ def make_configured_env(
         replay_bank_dir=getattr(args, "replay_bank_dir", None),
         replay_seed_fallback=getattr(args, "replay_seed_fallback", "resample"),
     )
+    env.base_env.config.contact_read_cache_enabled = getattr(args, 'contact_read_cache', True)
     if getattr(args, "workspace_curriculum", False):
         from .workspace import WORKSPACE_STAGES, WorkspaceCurriculumCallback
         # SB3 resets environments before callback startup; resumed first episodes
@@ -255,6 +256,8 @@ def make_configured_env(
 def make_worker(rank: int, args: argparse.Namespace):
     """返回可由Windows spawn进程安全构造的独立环境工厂。"""
     def initialize():
+        from .affinity import bind_worker
+        bind_worker(args, rank)
         env = make_configured_env(
             args,
             seed=args.seed + rank,
@@ -282,6 +285,8 @@ def make_worker(rank: int, args: argparse.Namespace):
 def make_eval_worker(rank: int, args: argparse.Namespace):
     """Build one deterministic strict-evaluation environment."""
     def initialize():
+        from .affinity import bind_worker
+        bind_worker(args, rank, evaluation=True)
         from copy import copy
         eval_args = copy(args)
         if getattr(args, "eval_replay_bank_dir", None) is not None:
@@ -811,6 +816,10 @@ def parse_args() -> argparse.Namespace:
         help="CPU threads used by the small PPO MLP in the learner process",
     )
     parser.add_argument("--seed", type=int, default=20260804)
+    parser.add_argument('--worker-affinity', choices=('none','numa'), default='none',
+                        help='Linux: pin workers to distinct physical cores balanced across NUMA nodes')
+    parser.add_argument('--contact-read-cache', action=argparse.BooleanOptionalAction, default=True,
+                        help='reuse contact reads within a controlled step, invalidated on physics updates')
     parser.add_argument("--disturbance", type=float, default=1.5)
     parser.add_argument("--episode-seconds", type=float, default=15.0)
     parser.add_argument(
@@ -1281,6 +1290,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
+    from .affinity import prepare_worker_affinity
+    args.worker_affinity_plan = prepare_worker_affinity(args)
     torch.set_num_threads(args.torch_threads)
     set_random_seed(args.seed)
     target_kl = args.target_kl if args.target_kl > 0.0 else None
@@ -1504,6 +1515,9 @@ def main() -> None:
         "reset_num_timesteps": args.resume is None,
         "workers": args.workers,
         "torch_threads": args.torch_threads,
+        "worker_affinity": args.worker_affinity,
+        "worker_affinity_plan": args.worker_affinity_plan,
+        "contact_read_cache_enabled": args.contact_read_cache,
         "seed": args.seed,
         "disturbance": args.disturbance,
         "training_distribution": args.training_distribution,
