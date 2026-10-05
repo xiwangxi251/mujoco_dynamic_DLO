@@ -6,6 +6,7 @@ import argparse
 import csv
 from dataclasses import asdict
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -790,7 +791,7 @@ def parse_args() -> argparse.Namespace:
                         help="conditioned eval reset retry pool starting at eval-seed; 0 disables")
     parser.add_argument("--workspace-scene-family", choices=tuple(WORKSPACE_SCENE_FAMILIES))
     parser.add_argument("--target-node-task", action="store_true")
-    parser.add_argument("--target-reward-profile", choices=("legacy", "tolerance_progress_v2"), default="legacy")
+    parser.add_argument("--target-reward-profile", choices=("legacy", "tolerance_progress_v2"), default=None)
     parser.add_argument("--rl-config-file", type=Path,
                         help="explicit reference RLConfig JSON; preserves its non-target reward/action values")
     parser.add_argument("--resume-legacy-full6", action="store_true",
@@ -1032,7 +1033,11 @@ def parse_args() -> argparse.Namespace:
             "initial values; by default resume continues from checkpoint values"
         ),
     )
+    parser.set_defaults(robot=None, action_mode=None, controller_profile=None,
+                        table_execution_guard=None)
     args = parser.parse_args()
+    from .target_defaults import configure_target_training_defaults
+    configure_target_training_defaults(args, sys.argv[1:])
     if args.target_reward_profile == "tolerance_progress_v2" and not args.target_node_task:
         parser.error("tolerance_progress_v2 requires --target-node-task")
     if args.eval_seed_pool_size < 0:
@@ -1458,6 +1463,7 @@ def main() -> None:
     from .workspace import WorkspaceMask, WORKSPACE_STAGES
     configuration = {
         "algorithm": "PPO",
+        "robot": args.robot,
         "rl_interface_version": action_interface_version(args.action_mode),
         "action_mode": args.action_mode,
         "observation_mode": args.observation_mode,

@@ -1539,7 +1539,10 @@ def parse_args() -> argparse.Namespace:
         help="headless批量评估时跳过双相机MP4和state录制，仅写CSV和manifest",
     )
     parser.add_argument("--video-fps", type=float, default=25.0)
+    parser.set_defaults(robot=None, controller_profile=None, table_execution_guard=None)
     args = parser.parse_args()
+    from .target_defaults import configure_saved_evaluation_defaults
+    configure_saved_evaluation_defaults(args, sys.argv[1:])
     args.speed = float(np.clip(args.speed, 0.25, 8.0))
     if args.episodes < 1:
         parser.error("--episodes must be at least 1")

@@ -107,6 +107,7 @@ def compose_bounded_pd_gravity(requested_pd, gravity_feedforward, preexisting_ap
 
 
 def add_controller_arguments(parser):
+    import argparse
     parser.add_argument("--controller-profile", choices=CONTROLLER_PROFILES, default="legacy")
-    parser.add_argument("--table-execution-guard", action="store_true",
+    parser.add_argument("--table-execution-guard", action=argparse.BooleanOptionalAction, default=False,
                         help="enable 500 Hz near-table command projection (NERO enhanced6)")
