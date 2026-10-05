@@ -1469,6 +1469,8 @@ def main() -> None:
         ))
     callbacks = CallbackList(callback_items)
     from .workspace import WorkspaceMask, WORKSPACE_STAGES
+    from .affinity import bind_learner
+    bind_learner(args)
     configuration = {
         "algorithm": "PPO",
         "robot": args.robot,

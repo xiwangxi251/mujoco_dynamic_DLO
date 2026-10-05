@@ -3,7 +3,7 @@ from unittest.mock import patch
 import pytest
 from panda_cable_grasp.env.environment import CableGraspEnv
 from panda_cable_grasp.env.contact_cache import contact_read_scope, cached_contact_reads
-from panda_cable_grasp.rl.affinity import physical_core_order, prepare_worker_affinity, bind_worker
+from panda_cable_grasp.rl.affinity import physical_core_order, prepare_worker_affinity, bind_worker, bind_learner
 
 
 class ContactReader:
@@ -76,6 +76,8 @@ def test_numa_plan_balances_nodes_uses_distinct_physical_cores_and_keeps_spawn_p
          patch('panda_cable_grasp.rl.affinity.physical_core_order',return_value=[0,2,1,3]):
         args.worker_affinity_plan = prepare_worker_affinity(args)
         assert args.worker_affinity_plan['learner_cpu_id'] == 1
+        bind.assert_not_called()
+        bind_learner(args)
         bind.assert_called_with(0,{1})
         bind_worker(args,1)
         bind.assert_called_with(0,{2})

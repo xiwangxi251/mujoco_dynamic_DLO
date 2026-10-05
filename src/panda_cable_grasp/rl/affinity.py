@@ -36,9 +36,15 @@ def prepare_worker_affinity(args):
                 train_cpu_ids=cores[:args.workers], eval_cpu_ids=cores[:args.eval_workers],
                 learner_cpu_id=cores[max(args.workers, args.eval_workers)],
                 memory_policy='first-touch after worker pinning; no forced membind')
-    # Compute and pass the whole plan before narrowing the parent affinity.
-    os.sched_setaffinity(0, {plan['learner_cpu_id']})
     return plan
+
+
+def bind_learner(args):
+    # Call only after all spawn workers have imported their dependencies and
+    # applied their own affinity. Otherwise every startup inherits one core.
+    plan = getattr(args, 'worker_affinity_plan', {})
+    if plan.get('applied'):
+        os.sched_setaffinity(0, {plan['learner_cpu_id']})
 
 
 def bind_worker(args, rank, evaluation=False):

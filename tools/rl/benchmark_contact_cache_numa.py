@@ -17,7 +17,7 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from panda_cable_grasp.rl.train import parse_args, make_configured_env, make_worker
-from panda_cable_grasp.rl.affinity import prepare_worker_affinity
+from panda_cable_grasp.rl.affinity import prepare_worker_affinity, bind_learner
 
 
 class TimedEnvironment(gym.Wrapper):
@@ -88,6 +88,7 @@ def parallel_trial(args,policy,enabled,affinity,steps,allowed):
     vec=SubprocVecEnv([timed_factory(rank,local) for rank in range(local.workers)],start_method='spawn')
     try:
         vec.seed(local.seed);obs=vec.reset()
+        bind_learner(local)
         for _ in range(16):
             action,_=policy.predict(obs,deterministic=True);obs,_,_,_=vec.step(action)
         initialization=time.perf_counter()-initialized
