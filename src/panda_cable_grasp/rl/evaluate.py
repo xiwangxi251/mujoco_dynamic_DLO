@@ -930,6 +930,7 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         rl_config=evaluation_rl_config(args),
         controller_profile=getattr(args, "controller_profile", "legacy"),
         table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
+        table_finger_collision_filter_enabled=not args.disable_table_finger_collision_filter,
         target_workspace=getattr(args, "target_workspace", None),
         workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
         workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
@@ -1382,6 +1383,7 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         rl_config=evaluation_rl_config(args),
         controller_profile=getattr(args, "controller_profile", "legacy"),
         table_execution_guard_enabled=getattr(args, "table_execution_guard", False),
+        table_finger_collision_filter_enabled=not args.disable_table_finger_collision_filter,
         target_workspace=getattr(args, "target_workspace", None),
         workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
         workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
@@ -1539,6 +1541,8 @@ def parse_args() -> argparse.Namespace:
         help="headless批量评估时跳过双相机MP4和state录制，仅写CSV和manifest",
     )
     parser.add_argument("--video-fps", type=float, default=25.0)
+    from .target_defaults import add_table_finger_filter_arguments
+    add_table_finger_filter_arguments(parser)
     parser.set_defaults(robot=None, controller_profile=None, table_execution_guard=None)
     args = parser.parse_args()
     from .target_defaults import configure_saved_evaluation_defaults

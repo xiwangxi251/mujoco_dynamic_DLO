@@ -49,6 +49,8 @@ def main():
     parser.add_argument('--source-run',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--expected-commit',required=True)
+    parser.add_argument('--source-stop-record',type=Path,
+                        help='validated stop record when the user stopped the source before restart')
     opts=parser.parse_args()
     root=Path(__file__).resolve().parents[2]
     git=lambda *argv:subprocess.check_output(['git',*argv],cwd=root,text=True).strip()
@@ -77,8 +79,19 @@ def main():
         raise RuntimeError('No completed readable checkpoint')
     start,checkpoint,data,params=max(valid,key=lambda item:item[0])
     remaining=int(cfg['cumulative_target_timesteps'])-start
-    if remaining<=0 or not identity(old['pid']):
-        raise RuntimeError('No remaining budget or selected process is absent')
+    if remaining<=0:
+        raise RuntimeError('No remaining budget')
+    stopped=None
+    if opts.source_stop_record:
+        stop_path=opts.source_stop_record.resolve()
+        if stop_path.parent!=source:
+            raise RuntimeError('Stop record must belong to the source run')
+        stopped=json.loads(stop_path.read_text())
+        if (stopped['parent_pid']!=old['pid'] or str(source) not in stopped['argv']
+                or 'panda_cable_grasp.rl.train' not in stopped['argv'] or identity(old['pid'])):
+            raise RuntimeError('Stop record does not match an absent source training process')
+    elif not identity(old['pid']):
+        raise RuntimeError('Selected process is absent; provide its validated stop record')
     if not Path(cfg['target_workspace']['path']).is_file():
         raise FileNotFoundError('Workspace missing')
     for name in ('replay_bank_dir','eval_replay_bank_dir'):
@@ -105,7 +118,8 @@ def main():
         if option in command:
             index=command.index(option)
             del command[index:index+2]
-    for option in ('--table-execution-guard','--no-table-execution-guard'):
+    for option in ('--table-execution-guard','--no-table-execution-guard',
+                   '--disable-table-finger-collision-filter','--enable-table-finger-collision-filter'):
         if option in command:
             command.remove(option)
     previous_argv=sys.argv
@@ -127,11 +141,13 @@ def main():
         source_entropy_coef=float(data['ent_coef']),source_stage=state['stage'],command=command,
         resolved_target_ppo_defaults=TARGET_PPO_DEFAULTS,
         changes=dict(workspace_scene_family=dict(old=cfg['workspace_scene_family'],new=actual.workspace_scene_family),
+                     table_finger_collision_filter_enabled=dict(old=cfg.get('table_finger_collision_filter_enabled',True),
+                                                               new=not actual.disable_table_finger_collision_filter),
                      table_execution_guard_enabled=dict(old=cfg['table_execution_guard_enabled'],new=actual.table_execution_guard)),
         preserved='reward v2 + release fix, controller, original physical limits, workspace, banks, optimizer, worker counts, schedules and cumulative 20M budget',
         curriculum_history='same stage; old scene-family qualification history cleared',created_at=time.time())
     write(output/'launch_manifest.json',manifest)
-    write(output/'previous_training_stopped.json',stop_selected(int(old['pid']),source))
+    write(output/'previous_training_stopped.json',stopped if stopped is not None else stop_selected(int(old['pid']),source))
     env=dict(os.environ,PYTHONPATH=str(root/'src'),OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',MKL_NUM_THREADS='1',MUJOCO_GL='egl')
     with (output/'train.log').open('w') as log:
         process=subprocess.Popen(command,cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)

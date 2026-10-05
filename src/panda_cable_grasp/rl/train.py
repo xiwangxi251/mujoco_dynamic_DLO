@@ -866,11 +866,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="enable the shared geometric robot-obstacle safety layer",
     )
-    parser.add_argument(
-        "--disable-table-finger-collision-filter",
-        action="store_true",
-        help="disable the vertical-down gripper/table target filter",
-    )
+    from .target_defaults import add_table_finger_filter_arguments
+    add_table_finger_filter_arguments(parser)
     parser.add_argument(
         "--disable-singularity-avoidance",
         action="store_true",
