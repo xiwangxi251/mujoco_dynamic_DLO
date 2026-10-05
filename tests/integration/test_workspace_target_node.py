@@ -41,6 +41,17 @@ def test_mask_uses_xy_grid_and_height_band(mask_path):
     assert len(mask.manifest()['sha256']) == 64
 
 
+def test_default_rectangle_includes_exact_corners_and_rejects_outside():
+    from panda_cable_grasp.rl.workspace import DEFAULT_TARGET_WORKSPACE
+    mask=WorkspaceMask(DEFAULT_TARGET_WORKSPACE)
+    corners=[[x,y,z] for x in (.60,.84) for y in (-.22,.30) for z in (-.005,.10)]
+    assert np.all(mask.contains(corners))
+    assert not np.any(mask.contains([[.60-1e-6,0,.01],[.84+1e-6,0,.01],
+                                     [.70,-.22-1e-6,.01],[.70,.30+1e-6,.01],
+                                     [.70,0,-.005-1e-6],[.70,0,.10+1e-6]]))
+    assert np.all(mask.mask) and mask.mask.shape==(13,6)
+
+
 @pytest.mark.parametrize('axes,shape', [([0, .1, .3], (2, 3)), ([0, 0], (2, 2)),
                                       ([0, .1], (3, 2))])
 def test_invalid_grid_is_rejected(tmp_path, axes, shape):

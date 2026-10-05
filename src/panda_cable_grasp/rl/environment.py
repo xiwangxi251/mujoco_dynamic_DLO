@@ -145,11 +145,11 @@ class RLConfig:
                 or not isinstance(self.target_node_tolerance, int)
                 or self.target_node_tolerance < 0):
             raise ValueError("target_node_tolerance must be a nonnegative integer")
-        if self.target_reward_profile not in {"legacy", "tolerance_progress_v2"}:
+        if self.target_reward_profile not in {"legacy", "tolerance_progress_v2", "tolerance_progress_v3"}:
             raise ValueError("unknown target reward profile")
-        if self.target_reward_profile == "tolerance_progress_v2":
+        if self.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3"}:
             if not self.target_node_task or self.target_node_tolerance != 2 or self.target_position_reward_radius != 4:
-                raise ValueError("tolerance_progress_v2 requires target-node task, success radius 2 and reward radius 4")
+                raise ValueError("tolerance_progress_v2/v3 requires target-node task, success radius 2 and reward radius 4")
             for value in (self.target_wrong_event_penalty, self.target_wrong_event_cap):
                 if not np.isfinite(value) or value < 0:
                     raise ValueError("target wrong-event penalties must be finite and nonnegative")
@@ -1437,7 +1437,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         physical_pinch = bool(grasp_status["pinch_confirmed"])
         goal_match = self.goal is None or self.goal.matches()
         pinch_confirmed = physical_pinch and goal_match
-        revised_progress = self.rl_config.target_reward_profile == "tolerance_progress_v2"
+        revised_progress = self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3"}
         lift_scale = self.goal.lift_reward_scale() if revised_progress else float(goal_match)
         height_pinched = physical_pinch and lift_scale > 0. if revised_progress else pinch_confirmed
         pregrasp = not physical_pinch
@@ -2002,7 +2002,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         from .lift_credit import HighWaterLiftCredit
         self._lift_progress_credit = (HighWaterLiftCredit(
             self._lift_credit_heights(), self._cable_lift_credit_high_water,
-        ) if self.rl_config.target_reward_profile == "tolerance_progress_v2" else None)
+            bounded_debits=self.rl_config.target_reward_profile == "tolerance_progress_v3",
+        ) if self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3"} else None)
         self._secured_session_active = False
         self._secured_session_target_match = False
         self._last_grasp_break_key = None

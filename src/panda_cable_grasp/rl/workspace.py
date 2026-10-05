@@ -13,6 +13,8 @@ WORKSPACE_SCENE_FAMILIES = {
     "legacy_ppo_six": CABLE_X075_SOURCE_NAMES,
     "cable_x075_v1": SCENARIO_FAMILIES["cable_x075_v1"],
 }
+DEFAULT_TARGET_WORKSPACE = Path(__file__).with_name("workspaces") / "rectangle_060_084_m022_030.npz"
+TARGET_WORKSPACE_XY_BOUNDS = (.60, .84, -.22, .30)
 WORKSPACE_STAGES = (
     ("static_workspace_all_nodes", (1,0,0,0,0,0), 0.),
     ("complex_static_workspace", (.3,0,0,0,.7,0), 0.),
@@ -36,6 +38,8 @@ class WorkspaceMask:
         with np.load(self.path, allow_pickle=False) as data:
             self.xs, self.ys = data["xs"].copy(), data["ys"].copy()
             self.mask = data[key].astype(bool)
+            self.xy_bounds = (data["rectangle_xy_bounds"].copy()
+                              if "rectangle_xy_bounds" in data else None)
         if (self.xs.ndim != 1 or self.ys.ndim != 1 or
                 len(self.xs) < 2 or len(self.ys) < 2 or
                 self.mask.shape != (len(self.ys), len(self.xs))):
@@ -46,6 +50,18 @@ class WorkspaceMask:
                 raise ValueError("Workspace axes must be finite uniform increasing grids")
         if not np.any(self.mask):
             raise ValueError("Workspace mask has no accepted cells")
+        if self.xy_bounds is not None:
+            bounds = self.xy_bounds
+            if (bounds.shape != (4,) or not np.all(np.isfinite(bounds))
+                    or bounds[0] >= bounds[1] or bounds[2] >= bounds[3]
+                    or not np.all(self.mask)):
+                raise ValueError("Rectangle workspace requires finite bounds and a full mask")
+            edges = [self.xs[0]-(self.xs[1]-self.xs[0])/2,
+                     self.xs[-1]+(self.xs[1]-self.xs[0])/2,
+                     self.ys[0]-(self.ys[1]-self.ys[0])/2,
+                     self.ys[-1]+(self.ys[1]-self.ys[0])/2]
+            if not np.allclose(bounds, edges, atol=1e-12, rtol=0):
+                raise ValueError("Rectangle bounds must match the XY cell edges")
 
     def contains(self, positions):
         positions = np.atleast_2d(np.asarray(positions, dtype=float))
@@ -55,13 +71,25 @@ class WorkspaceMask:
         iy = np.rint((positions[:,1]-self.ys[0])/(self.ys[1]-self.ys[0])).astype(int)
         valid = ((ix >= 0) & (ix < len(self.xs)) & (iy >= 0) & (iy < len(self.ys))
                  & (positions[:,2] >= -.005) & (positions[:,2] <= .10))
+        if self.xy_bounds is not None:
+            xmin,xmax,ymin,ymax = self.xy_bounds
+            # Include exact cell-edge corners despite round-to-even and float
+            # roundoff. XY membership uses explicit rectangle bounds.
+            valid = ((positions[:,0] >= xmin-1e-12) & (positions[:,0] <= xmax+1e-12)
+                     & (positions[:,1] >= ymin-1e-12) & (positions[:,1] <= ymax+1e-12)
+                     & (positions[:,2] >= -.005) & (positions[:,2] <= .10))
+            ix = np.clip(ix, 0, len(self.xs)-1)
+            iy = np.clip(iy, 0, len(self.ys)-1)
         result = np.zeros(len(positions), dtype=bool)
         result[valid] = self.mask[iy[valid], ix[valid]]
         return result
 
     def manifest(self):
-        return dict(path=str(self.path), sha256=self.sha256, mask_key=self.key,
-                    accepted_cells=int(self.mask.sum()), z_range_m=[-.005, .10])
+        result = dict(path=str(self.path), sha256=self.sha256, mask_key=self.key,
+                      accepted_cells=int(self.mask.sum()), z_range_m=[-.005, .10])
+        if self.xy_bounds is not None:
+            result.update(kind="rectangle", xy_bounds_m=self.xy_bounds.tolist())
+        return result
 
 
 class WorkspaceTargetNode(TargetNodeTask):

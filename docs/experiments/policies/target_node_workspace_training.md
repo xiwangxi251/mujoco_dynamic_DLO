@@ -6,6 +6,8 @@
 
 ## 目标如何选择
 
+2026-10-06起，新指定点训练默认`cable_x075_v1`族使用X=0.60～0.84m、Y=−0.22～0.30m矩形工作区，78个4cm单元，包含四角边界。Z筛选仍为−0.005～0.10m。详见[奖励v3与矩形配置](target_node_reward_v3.md)。历史84格`interior`并不是这个矩形，原训练与录像继续按其保存文件解释。
+
 显式传入 `--target-workspace /path/to/workspace.npz`：文件包含均匀递增的
 `xs`、`ys` 和形状为 `(len(ys), len(xs))` 的布尔掩码。默认使用 `interior`，
 可用 `--workspace-mask-key` 选择其他字段。位置按最近网格点所属单元判断；

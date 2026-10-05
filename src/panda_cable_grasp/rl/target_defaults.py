@@ -9,7 +9,7 @@ TARGET_PPO_DEFAULTS = {
     'table_execution_guard': True,
     'disable_table_finger_collision_filter': True,
     'workspace_scene_family': 'cable_x075_v1',
-    'target_reward_profile': 'tolerance_progress_v2',
+    'target_reward_profile': 'tolerance_progress_v3',
 }
 
 
@@ -37,6 +37,10 @@ def configure_target_training_defaults(args, argv):
             and not supplied.intersection({'--training-scenarios', '--eval-scenarios',
                                             '--training-distribution', '--eval-distribution'})):
         args.workspace_scene_family = TARGET_PPO_DEFAULTS['workspace_scene_family']
+    if (target and args.target_workspace is None
+            and args.workspace_scene_family == 'cable_x075_v1'):
+        from .workspace import DEFAULT_TARGET_WORKSPACE
+        args.target_workspace = DEFAULT_TARGET_WORKSPACE
 
 
 def configure_saved_evaluation_defaults(args, argv):

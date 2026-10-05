@@ -14,7 +14,11 @@ def test_target_training_enables_validated_stack_and_new_six_scenes_by_default()
     assert args.controller_profile == 'enhanced6_bounded_dls_v1'
     assert args.table_execution_guard
     assert args.disable_table_finger_collision_filter
-    assert args.target_reward_profile == 'tolerance_progress_v2'
+    assert args.target_reward_profile == 'tolerance_progress_v3'
+    from panda_cable_grasp.rl.workspace import WorkspaceMask
+    mask=WorkspaceMask(args.target_workspace)
+    assert mask.manifest()['xy_bounds_m']==[.60,.84,-.22,.30]
+    assert mask.manifest()['accepted_cells']==78
     assert args.workspace_scene_family == 'cable_x075_v1'
     assert tuple(args.training_scenario_names) == tuple(args.eval_scenario_names) == WORKSPACE_SCENE_FAMILIES['cable_x075_v1']
 
