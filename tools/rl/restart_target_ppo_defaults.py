@@ -50,9 +50,13 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--expected-commit',required=True)
     parser.add_argument('--worker-affinity', choices=('none','numa'))
+    parser.add_argument('--workers', type=int,
+                        help='explicitly override the number of training environments')
     parser.add_argument('--source-stop-record',type=Path,
                         help='validated stop record when the user stopped the source before restart')
     opts=parser.parse_args()
+    if opts.workers is not None and opts.workers < 1:
+        parser.error('--workers must be positive')
     root=Path(__file__).resolve().parents[2]
     git=lambda *argv:subprocess.check_output(['git',*argv],cwd=root,text=True).strip()
     if git('branch','--show-current')!='dev' or git('rev-parse','HEAD')!=opts.expected_commit or git('status','--porcelain'):
@@ -102,13 +106,17 @@ def main():
     reference=output/'reference_training_config.json'
     write(reference,cfg)
     previous_state=json.loads((source/'evaluation/workspace_curriculum.json').read_text())
-    state=dict(stage=previous_state['stage'],history=[],
-        scene_names=WORKSPACE_SCENE_FAMILIES[TARGET_PPO_DEFAULTS['workspace_scene_family']])
+    same_family=cfg['workspace_scene_family']==TARGET_PPO_DEFAULTS['workspace_scene_family']
+    state=(dict(previous_state) if same_family else
+        dict(stage=previous_state['stage'],history=[],
+             scene_names=WORKSPACE_SCENE_FAMILIES[TARGET_PPO_DEFAULTS['workspace_scene_family']]))
     (output/'evaluation').mkdir()
     write(output/'evaluation/workspace_curriculum.json',state)
     write(output/'source_curriculum_state.json',previous_state)
     command=list(old['command'])
     command[0]=sys.executable
+    if opts.workers is not None:
+        command[command.index('--workers')+1]=str(opts.workers)
     if opts.worker_affinity is not None:
         if '--worker-affinity' in command:
             command[command.index('--worker-affinity')+1]=opts.worker_affinity
@@ -147,13 +155,16 @@ def main():
         source_entropy_coef=float(data['ent_coef']),source_stage=state['stage'],command=command,
         resolved_target_ppo_defaults=TARGET_PPO_DEFAULTS,
         changes=dict(workspace_scene_family=dict(old=cfg['workspace_scene_family'],new=actual.workspace_scene_family),
+                     train_workers=dict(old=cfg['workers'],new=actual.workers),
+                     rollout_transitions=dict(old=cfg['workers']*cfg['n_steps'],new=actual.workers*actual.n_steps),
                      contact_read_cache_enabled=dict(old=cfg.get('contact_read_cache_enabled',False),new=actual.contact_read_cache),
                      worker_affinity=dict(old=cfg.get('worker_affinity','none'),new=actual.worker_affinity),
                      table_finger_collision_filter_enabled=dict(old=cfg.get('table_finger_collision_filter_enabled',True),
                                                                new=not actual.disable_table_finger_collision_filter),
                      table_execution_guard_enabled=dict(old=cfg['table_execution_guard_enabled'],new=actual.table_execution_guard)),
-        preserved='reward v2 + release fix, controller, original physical limits, workspace, banks, optimizer, worker counts, schedules and cumulative 20M budget',
-        curriculum_history='same stage; old scene-family qualification history cleared',created_at=time.time())
+        preserved='reward v2 + release fix, controller, original physical limits, workspace, banks, optimizer, evaluation workers, n_steps, schedules and cumulative 20M budget',
+        curriculum_history=('same scene family; stage and history preserved' if same_family else
+                            'same stage; old scene-family qualification history cleared'),created_at=time.time())
     write(output/'launch_manifest.json',manifest)
     write(output/'previous_training_stopped.json',stopped if stopped is not None else stop_selected(int(old['pid']),source))
     env=dict(os.environ,PYTHONPATH=str(root/'src'),OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',MKL_NUM_THREADS='1',MUJOCO_GL='egl')
