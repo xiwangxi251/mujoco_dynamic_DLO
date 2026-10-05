@@ -38,7 +38,8 @@ def test_external_motion_does_not_create_a_reward_or_debit_budget():
 
 
 @pytest.mark.parametrize('profile,bounded', [('tolerance_progress_v2',False),
-                                          ('tolerance_progress_v3',True)])
+                                          ('tolerance_progress_v3',True),
+                                          ('tolerance_progress_v4',True)])
 def test_profile_selects_production_reward_accounting(profile, bounded):
     env = make_rl_env(robot='nero', action_mode='task_space_vertical_down',
                      scenario_names=['id_static'], rl_config=RLConfig(

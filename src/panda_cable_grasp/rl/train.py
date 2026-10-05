@@ -157,7 +157,7 @@ def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
         accepted = {field.name for field in fields(RLConfig)}
         values = {key: value for key, value in saved.items() if key in accepted}
         values["target_reward_profile"] = getattr(args, "target_reward_profile", "legacy")
-        if values["target_reward_profile"] in {"tolerance_progress_v2", "tolerance_progress_v3"}:
+        if values["target_reward_profile"] in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4"}:
             values.update(target_node_task=True, target_node_tolerance=2,
                           target_position_reward_radius=4,
                           target_wrong_event_penalty=2., target_wrong_event_cap=8.)
@@ -796,7 +796,7 @@ def parse_args() -> argparse.Namespace:
                         help="conditioned eval reset retry pool starting at eval-seed; 0 disables")
     parser.add_argument("--workspace-scene-family", choices=tuple(WORKSPACE_SCENE_FAMILIES))
     parser.add_argument("--target-node-task", action="store_true")
-    parser.add_argument("--target-reward-profile", choices=("legacy", "tolerance_progress_v2", "tolerance_progress_v3"), default=None)
+    parser.add_argument("--target-reward-profile", choices=("legacy", "tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4"), default=None)
     parser.add_argument("--rl-config-file", type=Path,
                         help="explicit reference RLConfig JSON; preserves its non-target reward/action values")
     parser.add_argument("--resume-legacy-full6", action="store_true",
@@ -1044,8 +1044,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     from .target_defaults import configure_target_training_defaults
     configure_target_training_defaults(args, sys.argv[1:])
-    if args.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3"} and not args.target_node_task:
-        parser.error("tolerance_progress_v2/v3 requires --target-node-task")
+    if args.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4"} and not args.target_node_task:
+        parser.error("tolerance_progress_v2/v3/v4 requires --target-node-task")
     if args.eval_seed_pool_size < 0:
         parser.error("eval seed pool size must be nonnegative")
     if args.rl_config_file is not None:
@@ -1482,10 +1482,11 @@ def main() -> None:
         "warm_start": warm_start_record,
         "target_reward_profile": args.target_reward_profile,
         "lift_progress_accounting_version": (
-            "episode_credit_bounded_debit_v1" if args.target_reward_profile == "tolerance_progress_v3"
+            "episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4"}
             else "episode_high_water_unbounded_debit_v2" if args.target_reward_profile == "tolerance_progress_v2"
             else "legacy"
         ),
+        "approach_progress_accounting_version": ("episode_credit_bounded_debit_v1" if args.target_reward_profile == "tolerance_progress_v4" else "legacy_phase_gated"),
         "reference_rl_config_file": str(args.rl_config_file.resolve()) if args.rl_config_file else None,
         "resume_legacy_full6_requested": args.resume_legacy_full6,
         "resume_interface_migration": ("frozen full6_workspace_target_node_v1 -> formal bounded DLS and physical_holding_v2" if args.resume_legacy_full6 else None),
