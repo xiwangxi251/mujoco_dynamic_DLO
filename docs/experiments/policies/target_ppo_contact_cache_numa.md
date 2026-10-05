@@ -58,3 +58,13 @@ learner 在全部子进程创建完成后才绑核，避免启动导入阶段的
 运行目录：`outputs/rl/train/ppo_targetnode_x075_guard_cache_workers48_dev_20261005`。
 实际启动配置、提交和权重来源由该目录的 `launch_manifest.json` 与
 `training_config.json` 记录；首轮正常更新由 `training_health.json` 记录。
+
+### 启动结果
+
+已于 151 的 `dev` 提交 `2619866` 启动，PID 为 `2643446`。
+来源为上一轮最新完整 `ppo_cable_7687128_steps.zip`，优化器保留。
+实际配置核对确认：48 个训练环境、13 个评估环境、缓存开启、NUMA 关闭，
+其余关键配置无差异。首轮到 7736280 步，PPO updates 从 1357 增至 1362，
+参数及优化指标均有限，`normal_training=true`。
+首轮日志吞吐量 164 策略步/秒，未包含后续定期评估，不代表长期平均速度。
+首次确认记录已写入运行目录 `startup_confirmation.json`；确认后结束检查。
