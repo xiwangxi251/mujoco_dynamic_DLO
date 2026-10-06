@@ -79,7 +79,7 @@ class TargetNodeTask:
         if self.first_grasp_index is None and self.base.grasp_confirmed:
             self.first_grasp_index = self.actual_index()
             self.first_grasp_correct = bool(self.matches())
-            if self.wrapper.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4"}:
+            if self.wrapper.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"}:
                 self.first_grasp_outside_reward_range = (
                     abs(self.first_grasp_index - self.index) > self.wrapper.rl_config.target_position_reward_radius)
         dt = self.base.model.opt.timestep
@@ -140,7 +140,7 @@ class TargetNodeTask:
         return {3: .5, 4: .25}.get(error, 0.)
 
     def finish_reward(self, components, status):
-        if self.wrapper.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4"}:
+        if self.wrapper.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"}:
             self._finish_revised_reward(components, status)
             return
         pinched = bool(status['pinch_confirmed'])

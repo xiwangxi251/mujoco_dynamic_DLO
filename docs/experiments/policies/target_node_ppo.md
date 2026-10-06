@@ -1,4 +1,4 @@
-当前默认采用[v4接近/对齐记账修正](target_node_reward_v4.md)，继承v3抬升和矩形工作区。
+当前默认采用[v5当前接触奖励资格](target_node_reward_v5.md)，继承v4防重复记账和矩形工作区。
 
 # 指定材料节点的状态 PPO
 

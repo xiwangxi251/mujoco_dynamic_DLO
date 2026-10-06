@@ -9,7 +9,7 @@ TARGET_PPO_DEFAULTS = {
     'table_execution_guard': True,
     'disable_table_finger_collision_filter': True,
     'workspace_scene_family': 'cable_x075_v1',
-    'target_reward_profile': 'tolerance_progress_v4',
+    'target_reward_profile': 'tolerance_progress_v5',
 }
 
 

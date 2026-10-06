@@ -145,11 +145,11 @@ class RLConfig:
                 or not isinstance(self.target_node_tolerance, int)
                 or self.target_node_tolerance < 0):
             raise ValueError("target_node_tolerance must be a nonnegative integer")
-        if self.target_reward_profile not in {"legacy", "tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4"}:
+        if self.target_reward_profile not in {"legacy", "tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"}:
             raise ValueError("unknown target reward profile")
-        if self.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4"}:
+        if self.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"}:
             if not self.target_node_task or self.target_node_tolerance != 2 or self.target_position_reward_radius != 4:
-                raise ValueError("tolerance_progress_v2/v3/v4 requires target-node task, success radius 2 and reward radius 4")
+                raise ValueError("tolerance_progress_v2/v3/v4/v5 requires target-node task, success radius 2 and reward radius 4")
             for value in (self.target_wrong_event_penalty, self.target_wrong_event_cap):
                 if not np.isfinite(value) or value < 0:
                     raise ValueError("target wrong-event penalties must be finite and nonnegative")
@@ -1438,7 +1438,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         physical_pinch = bool(grasp_status["pinch_confirmed"])
         goal_match = self.goal is None or self.goal.matches()
         pinch_confirmed = physical_pinch and goal_match
-        revised_progress = self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4"}
+        revised_progress = self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"}
         lift_scale = self.goal.lift_reward_scale() if revised_progress else float(goal_match)
         height_pinched = physical_pinch and lift_scale > 0. if revised_progress else pinch_confirmed
         pregrasp = not physical_pinch
@@ -1459,7 +1459,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._previous_alignment_potential = (
             alignment_potential if pregrasp else None
         )
-        if self.rl_config.target_reward_profile == "tolerance_progress_v4":
+        if self.rl_config.target_reward_profile in {"tolerance_progress_v4", "tolerance_progress_v5"}:
             from .approach_credit import ApproachProgressCredit
             if self._approach_progress_credit is None:
                 self._approach_progress_credit = ApproachProgressCredit(
@@ -1668,7 +1668,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._cable_lift_credit_previous = capped_lifted_fraction
         if revised_progress:
             heights = self._lift_credit_heights()
-            held_index = self.goal.actual_index() if physical_pinch else None
+            lift_holding = physical_pinch
+            if self.rl_config.target_reward_profile == "tolerance_progress_v5":
+                lift_holding = self._current_lift_reward_holding(grasp_status)
+            held_index = self.goal.actual_index() if lift_holding else None
             lift_progress, cable_lift_progress = self._lift_progress_credit.update(
                 heights, capped_lifted_fraction, held_index, lift_scale,
             )
@@ -1794,6 +1797,17 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         if self.goal is not None:
             self.goal.finish_reward(components, grasp_status)
         return float(sum(components.values())), components
+
+    def _current_lift_reward_holding(self, grasp_status):
+        """Reward current bilateral holding, not the release-detection grace period."""
+        state = self.base_env.grasp_state
+        if (state is None or not grasp_status["pinch_confirmed"]
+                or not grasp_status.get("raw_bilateral_contact", False)):
+            return False
+        return bool(
+            self.base_env.finger_aperture <= self.base_env.config.max_grasp_aperture
+            and np.linalg.norm(self.data.xpos[state.body_id]-self._grasp_center_position())
+            <= self.base_env.config.max_pad_distance)
 
     def _lift_credit_heights(self):
         table = self.base_env.table_geom_id
@@ -2015,8 +2029,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         from .lift_credit import HighWaterLiftCredit
         self._lift_progress_credit = (HighWaterLiftCredit(
             self._lift_credit_heights(), self._cable_lift_credit_high_water,
-            bounded_debits=self.rl_config.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4"},
-        ) if self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4"} else None)
+            bounded_debits=self.rl_config.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"},
+        ) if self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"} else None)
         self._secured_session_active = False
         self._secured_session_target_match = False
         self._last_grasp_break_key = None
@@ -2218,6 +2232,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._last_grasp_body_height_above_table
         )
         result["height_band_hold"] = self._height_band_hold
+        result["lift_reward_holding_qualified"] = (
+            self._current_lift_reward_holding(self._last_grasp_status)
+            if self.rl_config.target_reward_profile == "tolerance_progress_v5"
+            else bool(self._last_grasp_status["pinch_confirmed"]))
         result["height_penalty_scale"] = self._last_height_penalty_scale
         result["overheight_severity"] = self._last_overheight_severity
         result["overheight_step_penalty_total"] = (
