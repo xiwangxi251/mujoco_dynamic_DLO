@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from panda_cable_grasp.rl.train import StrictSuccessEvalCallback
 
@@ -20,15 +21,19 @@ class _FakeEvalVecEnv:
     def seed(self, seed: int):
         self._seed = seed
         self.seed_calls.append(seed)
-        return [seed + rank for rank in range(self.num_envs)]
+        self._seeds = [seed + rank for rank in range(self.num_envs)]
+        return self._seeds
 
     def reset(self):
         self._steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._episode_seeds = np.array(self._seeds)
+        if hasattr(self, "allowed_seeds"):
+            assert all(seed in self.allowed_seeds for seed in self._episode_seeds)
         return np.zeros((self.num_envs, 1), dtype=np.float32)
 
     def step(self, actions):
         self._steps += 1
-        seeds = self._seed + np.arange(self.num_envs)
+        seeds = self._episode_seeds
         episode_lengths = seeds % 3 + 1
         dones = self._steps >= episode_lengths
         infos = []
@@ -76,3 +81,42 @@ def test_parallel_strict_eval_preserves_episode_count_and_seed_order(tmp_path):
     assert metrics["slip_rate"] == 1 / 5
     assert metrics["mean_return"] == 2.2
     assert metrics["mean_length"] == 2.2
+
+
+def test_bank_pool_confirmation_uses_remaining_seeds_and_wraps_inactive_workers(tmp_path):
+    import json
+    env = _FakeEvalVecEnv(num_envs=13)
+    env.allowed_seeds = set(range(20260804, 20260854))
+    original_step = env.step
+
+    def step(actions):
+        observations, rewards, dones, infos = original_step(actions)
+        for seed, info in zip(env._episode_seeds, infos):
+            info.update(requested_seed=int(seed), actual_seed=int(seed), workspace_mask={})
+        return observations, rewards, dones, infos
+
+    env.step = step
+    callback = StrictSuccessEvalCallback(
+        env, tmp_path, eval_freq=100, episodes=26,
+        confirmation_episodes=26, seed=20260804, seed_pool_size=50,
+    )
+    callback.model = _FakeModel()
+    assert callback.confirmation_episodes == 24
+    assert callback.confirmation_seed_offset == 26
+    callback._evaluate(26)
+    callback._evaluate(callback.confirmation_episodes, seed_offset=callback.confirmation_seed_offset)
+    rows = [json.loads(line) for line in (tmp_path / "workspace_eval_episodes.jsonl").read_text().splitlines()]
+    routine = {row["actual_seed"] for row in rows if row["seed_offset"] == 0}
+    confirmation = {row["actual_seed"] for row in rows if row["seed_offset"] == 26}
+    assert len(routine) == 26 and len(confirmation) == 24
+    assert not routine & confirmation
+    assert routine | confirmation == env.allowed_seeds
+    assert env.seed_calls == [20260804, 20260817, 20260830, 20260843]
+
+
+def test_bank_pool_requires_unused_confirmation_seeds(tmp_path):
+    with pytest.raises(ValueError, match="leave seeds for confirmation"):
+        StrictSuccessEvalCallback(
+            _FakeEvalVecEnv(13), tmp_path, eval_freq=100, episodes=26,
+            confirmation_episodes=26, seed=20260804, seed_pool_size=26,
+        )

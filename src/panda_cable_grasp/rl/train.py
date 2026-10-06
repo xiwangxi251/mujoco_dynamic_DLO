@@ -505,13 +505,26 @@ class StrictSuccessEvalCallback(BaseCallback):
         confirmation_episodes: int,
         seed: int,
         curriculum: MotionCurriculumCallback | None = None,
+        seed_pool_size: int = 0,
     ):
         super().__init__(verbose=0)
         self.env = env
         self.output_dir = Path(output_dir)
         self.eval_freq = max(1, int(eval_freq))
         self.episodes = max(1, int(episodes))
-        self.confirmation_episodes = max(1, int(confirmation_episodes))
+        self.confirmation_requested_episodes = max(1, int(confirmation_episodes))
+        self.seed_pool_size = int(seed_pool_size)
+        if self.seed_pool_size < 0:
+            raise ValueError("evaluation seed pool size must be nonnegative")
+        if self.seed_pool_size and self.seed_pool_size <= self.episodes:
+            raise ValueError("evaluation seed pool must leave seeds for confirmation")
+        # Bank-backed evaluations must use the unused part of the finite
+        # held-out pool, never fabricated +100000 seeds or routine duplicates.
+        self.confirmation_seed_offset = self.episodes if self.seed_pool_size else 100_000
+        self.confirmation_episodes = (
+            min(self.confirmation_requested_episodes, self.seed_pool_size - self.episodes)
+            if self.seed_pool_size else self.confirmation_requested_episodes
+        )
         self.seed = int(seed)
         self.curriculum = curriculum
         self.eval_workers = int(env.num_envs)
@@ -617,6 +630,16 @@ class StrictSuccessEvalCallback(BaseCallback):
             # requested episode therefore keeps the exact seeds used by the
             # former serial evaluator, independent of worker count.
             self.env.seed(batch_seed)
+            if self.seed_pool_size:
+                if seed_offset < 0 or seed_offset + completed + batch_size > self.seed_pool_size:
+                    raise ValueError("active evaluation seeds exceed the held-out pool")
+                # VecEnv.reset resets inactive workers as well. SB3 stores the
+                # pending per-worker reset seeds in _seeds; wrap only the unused
+                # worker slots, preserving every counted episode's exact seed.
+                self.env._seeds = [
+                    self.seed + (seed_offset + completed + rank) % self.seed_pool_size
+                    for rank in range(self.eval_workers)
+                ]
             observations = self.env.reset()
             active = np.arange(self.eval_workers) < batch_size
             batch_returns = np.zeros(self.eval_workers, dtype=np.float64)
@@ -740,7 +763,7 @@ class StrictSuccessEvalCallback(BaseCallback):
         has_task_progress = success_rate > 0.0 or grasp_rate > 0.0
         if has_task_progress and routine_score > best_score:
             confirmed = self._evaluate(
-                self.confirmation_episodes, seed_offset=100_000
+                self.confirmation_episodes, seed_offset=self.confirmation_seed_offset
             )
             confirmed_score = (
                 curriculum_phase, confirmed["success_rate"],
@@ -767,6 +790,9 @@ class StrictSuccessEvalCallback(BaseCallback):
                         {
                             "timesteps": self.num_timesteps,
                             "episodes": self.confirmation_episodes,
+                            "requested_episodes": self.confirmation_requested_episodes,
+                            "seed_offset": self.confirmation_seed_offset,
+                            "seed_pool_size": self.seed_pool_size,
                             "curriculum_phase": curriculum_phase,
                             "curriculum_stage": curriculum_stage,
                             "motion_difficulty": motion_difficulty,
@@ -1051,6 +1077,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("tolerance_progress_v2/v3/v4/v5 requires --target-node-task")
     if args.eval_seed_pool_size < 0:
         parser.error("eval seed pool size must be nonnegative")
+    if args.eval_freq > 0 and args.eval_seed_pool_size and args.eval_seed_pool_size <= args.eval_episodes:
+        parser.error("eval seed pool must leave seeds beyond routine episodes for confirmation")
     if args.rl_config_file is not None:
         try:
             rl_config_from_args(args)
@@ -1474,6 +1502,7 @@ def main() -> None:
             confirmation_episodes=args.eval_confirmation_episodes,
             seed=args.eval_seed,
             curriculum=curriculum_callback,
+            seed_pool_size=args.eval_seed_pool_size,
         ))
     callbacks = CallbackList(callback_items)
     from .workspace import WorkspaceMask, WORKSPACE_STAGES
@@ -1619,6 +1648,14 @@ def main() -> None:
         "eval_freq": args.eval_freq,
         "eval_episodes": args.eval_episodes,
         "eval_confirmation_episodes": args.eval_confirmation_episodes,
+        "eval_confirmation_effective_episodes": (
+            min(args.eval_confirmation_episodes, args.eval_seed_pool_size - args.eval_episodes)
+            if args.eval_seed_pool_size else args.eval_confirmation_episodes
+        ),
+        "eval_confirmation_seed_offset": (
+            args.eval_episodes if args.eval_seed_pool_size else 100_000
+        ),
+        "eval_seed_protocol": "finite_pool_disjoint_confirmation_v1",
         "eval_workers": args.eval_workers,
         "eval_seed": args.eval_seed,
         "rl_grasp_definition": (
