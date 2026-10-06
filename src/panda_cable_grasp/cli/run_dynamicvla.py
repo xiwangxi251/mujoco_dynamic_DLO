@@ -585,7 +585,7 @@ def run_server(args: argparse.Namespace) -> None:
         manifest = {
             "controller_profile": getattr(args, "controller_profile", "legacy"),
         "table_execution_guard": getattr(args, "table_execution_guard", False),
-        "grasp_judgement_version": "physical_holding_v2",
+        "grasp_judgement_version": "physical_holding_v3_no_aperture",
         "schema_version": 4,
             "created_at": datetime.now().astimezone().isoformat(),
             "command": [sys.executable, *sys.argv],

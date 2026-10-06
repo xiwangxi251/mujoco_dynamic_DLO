@@ -1185,13 +1185,11 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         grasp_body_height = float(self.data.xpos[body_id, 2] - table_top_z)
         self._last_grasp_body_height_above_table = grasp_body_height
 
-        aperture = self.base_env.finger_aperture
         distance = float(np.linalg.norm(
             self.data.xpos[body_id] - self._grasp_center_position()
         ))
         secured_geometry_valid = bool(
             pinch_confirmed
-            and aperture <= self.base_env.config.max_grasp_aperture
             and distance <= self.base_env.config.max_pad_distance
             and lift_delta >= self.rl_config.secured_lift_delta
         )
@@ -1825,8 +1823,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         elif not grasp_status.get("raw_bilateral_contact", False):
             return False
         return bool(
-            self.base_env.finger_aperture <= self.base_env.config.max_grasp_aperture
-            and np.linalg.norm(self.data.xpos[state.body_id]-self._grasp_center_position())
+            np.linalg.norm(self.data.xpos[state.body_id]-self._grasp_center_position())
             <= self.base_env.config.max_pad_distance)
 
     def _lift_credit_heights(self):

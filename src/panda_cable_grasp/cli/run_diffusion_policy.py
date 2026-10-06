@@ -200,7 +200,7 @@ def run(args: argparse.Namespace) -> Path:
     manifest = {
         "controller_profile": getattr(args, "controller_profile", "legacy"),
         "table_execution_guard": getattr(args, "table_execution_guard", False),
-        "grasp_judgement_version": "physical_holding_v2",
+        "grasp_judgement_version": "physical_holding_v3_no_aperture",
         "schema_version": 1,
         "method": "diffusion_policy",
         "checkpoint": str(args.model.expanduser().resolve()),

@@ -577,7 +577,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-negative integer"):
             EnvConfig(confirmed_grasp_contact_index_radius=-1)
 
-    def test_oblique_bilateral_grasp_accepts_39_mm_aperture(self) -> None:
+    def test_bilateral_grasp_uses_force_and_distance_without_aperture_cutoff(self) -> None:
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1013)
@@ -591,7 +591,18 @@ class EnvironmentScenarioTests(unittest.TestCase):
                 env._physical_grasp_candidate(), env.target_body_id
             )
 
-            env.data.qpos[env.finger_qpos_adr] = 0.0205
+            env.data.qpos[env.finger_qpos_adr] = 0.030
+            self.assertEqual(env._physical_grasp_candidate(), env.target_body_id)
+            env._pad_contact_samples = lambda: [
+                (env.target_body_id, env.left_finger_id, 1.0),
+                (env.target_body_id, env.right_finger_id, 0.0),
+            ]
+            self.assertIsNone(env._physical_grasp_candidate())
+            env._pad_contact_samples = lambda: [
+                (env.target_body_id, env.left_finger_id, 1.0),
+                (env.target_body_id, env.right_finger_id, 1.0),
+            ]
+            env.config.max_pad_distance = 0.001
             self.assertIsNone(env._physical_grasp_candidate())
         finally:
             del env

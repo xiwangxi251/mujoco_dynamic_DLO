@@ -44,12 +44,10 @@ def test_lift_pays_inside_grace_and_debits_after_expiry(env):
         assert lost[key] == pytest.approx(-paid[key])
 
 
-@pytest.mark.parametrize('invalid', ['aperture', 'distance', 'unconfirmed', 'cleared'])
+@pytest.mark.parametrize('invalid', ['distance', 'unconfirmed', 'cleared'])
 def test_geometry_or_unconfirmed_state_invalidates_immediately(env, invalid):
     env.data.time = .02
-    if invalid == 'aperture':
-        env.data.qpos[env.base_env.finger_qpos_adr] = [.05, -.05]
-    elif invalid == 'distance':
+    if invalid == 'distance':
         env._grasp_center_position = lambda: np.array([1., 0., .15])
     elif invalid == 'unconfirmed':
         env.base_env.grasp_state.bilateral_confirmed = False
@@ -78,14 +76,18 @@ def test_loaded_confirmation_tolerates_jitter_before_first_secured(env, profile,
     assert not s['secured_grasp']
 
 
-def test_loaded_reward_once_and_actual_open_invalidates_inside_grace(env):
+def test_large_aperture_pays_lift_and_secured_reward_once_then_expires(env):
+    env.data.qpos[env.base_env.finger_qpos_adr] = [.035, -.035]
     for t in [.02, .04, .06, .08, .10]:
         env.data.time = t
         s = env._update_grasp_status({'lifted_fraction': .30})
     _, paid = env._reward(np.zeros(5), False, {'lifted_fraction': .30}, s)
     assert paid['reward_new_secured_grasp'] == env.rl_config.reward_new_secured_grasp
+    assert paid['reward_lift_progress'] > 0
+    assert paid['reward_cable_lift_progress'] > 0
     _, repeated = env._reward(np.zeros(5), False, {'lifted_fraction': .30}, s)
     assert repeated['reward_new_secured_grasp'] == 0.
-    env.data.qpos[env.base_env.finger_qpos_adr] = [.05, -.05]
+    env.data.time = .351
     s = env._update_grasp_status({'lifted_fraction': .30})
     assert not s['secured_grasp']
+    assert not env._current_lift_reward_holding(s)

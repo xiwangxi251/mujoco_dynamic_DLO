@@ -55,9 +55,13 @@ class PhysicalGraspJudgementTests(unittest.TestCase):
         self.base._update_physical_grasp_state(gripper_closed=False)
         self.base.data.qpos[self.base.finger_qpos_adr] = [.026,-.026]
         self.rl._secured_session_active = True
-        self.base._update_physical_grasp_state(gripper_closed=False)
+        self.pairs = []
+        with patch.object(self.base, '_physical_grasp_candidate', return_value=None):
+            count = int(np.ceil(self.base.config.grasp_loss_seconds/self.base.model.opt.timestep))+1
+            for _ in range(count):
+                self.base._update_physical_grasp_state(gripper_closed=False)
         self.assertIsNone(self.base.grasp_state)
-        self.assertEqual(self.base.last_grasp_break['reason'],'physical_grasp_geometry_lost')
+        self.assertEqual(self.base.last_grasp_break['reason'],'lost_physical_pad_contact')
         self.assertEqual(self.base.last_grasp_break['causal_class'],'active_open')
         self.assertEqual(self.rl._classify_secured_grasp_break(),(True,False,False))
         self.assertEqual(self.rl._classify_secured_grasp_break(),(False,False,False))
@@ -70,8 +74,8 @@ class PhysicalGraspJudgementTests(unittest.TestCase):
         self.assertIsNone(self.base.grasp_state)
         self.assertEqual(self.base.last_grasp_break['causal_class'],'physical_slip')
 
-    def test_oblique_48mm_aperture_keeps_confirmed_hold(self):
-        self.base.data.qpos[self.base.finger_qpos_adr] = [.024,-.024]
+    def test_bilateral_60mm_aperture_keeps_confirmed_hold(self):
+        self.base.data.qpos[self.base.finger_qpos_adr] = [.030,-.030]
         self.base._update_physical_grasp_state(gripper_closed=True)
         self.assertTrue(self.base.grasp_confirmed)
         self.assertTrue(self.base._physical_grasp_geometry_valid())
@@ -87,10 +91,13 @@ class PhysicalGraspJudgementTests(unittest.TestCase):
             self.base.data.time += self.base.config.grasp_loss_seconds + .002
             self.assertFalse(self.base._success_qualification(gripper_closed=True))
 
-    def test_public_success_rejects_real_opening_despite_contact_grace(self):
+    def test_public_success_with_large_aperture_still_expires_after_contact_loss(self):
         self.base.data.xpos[np.asarray(self.base.cable_ids),2] = .22
         with patch.object(type(self.base),'pad_center_position',new_callable=lambda:property(lambda _:self.base.data.xpos[self.base.target_body_id].copy())):
-            self.base.data.qpos[self.base.finger_qpos_adr] = [.026,-.026]
+            self.base.data.qpos[self.base.finger_qpos_adr] = [.030,-.030]
+            self.assertTrue(self.base._success_qualification(gripper_closed=True))
+            self.pairs = []
+            self.base.data.time += self.base.config.grasp_loss_seconds + .002
             self.assertFalse(self.base._success_qualification(gripper_closed=True))
 
     def test_secured_contact_grace_and_strict_hold_do_not_depend_on_command(self):

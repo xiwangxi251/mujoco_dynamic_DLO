@@ -407,9 +407,8 @@ class EnvConfig:
     grasp_contact_index_radius: int = 5
     confirmed_grasp_contact_index_radius: int = 5
     grasp_loss_seconds: float = 0.35   
-    # User-selected 50 mm total finger aperture for oblique cable grasps.
-    # Bilateral pad force, local material neighborhood and center-distance
-    # checks remain required; aperture alone never confirms a grasp.
+    # Legacy configuration metadata retained for old callers/snapshots.
+    # Physical grasp qualification no longer uses an aperture cutoff.
     max_grasp_aperture: float = 0.050
     max_pad_distance: float = 0.055   
     min_pad_normal_force: float = 0.20 
@@ -850,7 +849,7 @@ class _ObjectRuntime:
     initial_tangent_angles: np.ndarray | None = None
     shape_family: str = "none"
     rotation_sign: float = 1.0
-    # 抓取确认孔径上限：按对象局部厚度放宽（细对象收紧、粗对象放宽）。
+    # Legacy object metadata; not a physical grasp qualification gate.
     aperture_limit: float = 0.050
     # sine_servo 伺服锚定：初始主轴/静止构型/静止高度，首次驱动时惰性初始化。
     sine_axis: np.ndarray | None = None
@@ -3058,8 +3057,9 @@ class CableGraspEnv:
             "success_now": self.success_now,
             "success": self.ever_success,
             "grasp_break_count": len(self.grasp_break_history),
-            "grasp_judgement_version": "physical_holding_v2",
-            "public_success_version": "confirmed_geometry_grace_v3",
+            "grasp_judgement_version": "physical_holding_v3_no_aperture",
+            "public_success_version": "confirmed_distance_grace_v4_no_aperture",
+            "grasp_aperture_qualification_enabled": False,
             "active_open_break_count": sum(
                 event.get("causal_class") == "active_open"
                 for event in self.grasp_break_history
@@ -3238,12 +3238,6 @@ class CableGraspEnv:
         self,
     ) -> int | None:
         """查找当前被两侧内指垫真实夹紧的局部线段。"""
-        aperture = self.finger_aperture
-        max_limit = max(
-            obj.aperture_limit for obj in self._objects
-        )
-        if aperture > max_limit:
-            return None
         samples = self._pad_contact_samples()
         if not samples:
             return None
@@ -3254,8 +3248,6 @@ class CableGraspEnv:
         for body_id in contacted_bodies:
             index = self.cable_index[body_id]
             object_index = self._node_object[index]
-            if aperture > self._objects[object_index].aperture_limit:
-                continue
             object_slice = self._object_slices[object_index]
             neighborhood = set(
                 self.cable_ids[
@@ -3296,10 +3288,8 @@ class CableGraspEnv:
     def _physical_grasp_geometry_valid(self) -> bool:
         if self.grasp_state is None:
             return False
-        object_index = self._object_of_body[self.grasp_state.body_id]
         return bool(
-            self.finger_aperture <= self._objects[object_index].aperture_limit
-            and self._current_grasp_error() <= 1.5 * self.config.max_pad_distance
+            self._current_grasp_error() <= 1.5 * self.config.max_pad_distance
         )
 
     def _grasp_has_bilateral_pad_contact(self) -> bool:
@@ -3319,7 +3309,7 @@ class CableGraspEnv:
     def _success_qualification(self, gripper_closed: bool) -> bool:
         """Confirmed holding tolerates the existing contact-loss grace.
 
-        Actual opening/distance invalidate holding immediately. A transient
+        Distance invalidates holding immediately. A transient
         missing solver contact does not reset task retention while the physical
         grasp remains confirmed; the raw-contact timer is an RL diagnostic.
         """
@@ -3372,8 +3362,6 @@ class CableGraspEnv:
                 physically_opened = bool(
                     state.open_intent_aperture is not None
                     and self.finger_aperture > state.open_intent_aperture + 1e-6
-                    and self.finger_aperture
-                    > self._objects[self._object_of_body[state.body_id]].aperture_limit
                 )
                 causal_class = (
                     "active_open"

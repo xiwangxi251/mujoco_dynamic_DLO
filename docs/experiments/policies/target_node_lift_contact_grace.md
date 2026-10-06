@@ -6,7 +6,7 @@
 
 ## 修正
 
-默认`tolerance_progress_v6`抬升正奖励改用底层`grasp_confirmed`：必须曾确认双侧夹持，距离最后双侧接触不超过已有`grasp_loss_seconds=0.35s`。实际开度须≤50mm（2026-10-06按用户要求由40mm调整，见[开度修改记录](grasp_aperture_050_20261006.md)），被夹节点与夹持中心距离仍须≤55mm；几何失效、确认状态清除、宽限过期立即停止支付。OPEN命令本身不等同于实际失去夹持，沿用已修复的物理口径。首次未确认的单侧接触不能通过宽限获得正奖励。训练配置记录`lift_reward_holding_version=confirmed_geometry_contact_grace_v2`和实际宽限秒数。
+默认`tolerance_progress_v6`抬升正奖励改用底层`grasp_confirmed`：必须曾确认双侧夹持，距离最后双侧接触不超过已有`grasp_loss_seconds=0.35s`。2026-10-06随后按用户要求[去掉固定开度资格](grasp_without_aperture_20261006.md)，被夹节点与夹持中心距离仍须≤55mm；距离失效、确认状态清除、宽限过期立即停止支付。OPEN命令本身不等同于实际失去夹持，沿用已修复的物理口径。首次未确认的单侧接触不能通过宽限获得正奖励。当前训练配置记录`lift_reward_holding_version=confirmed_distance_contact_grace_v3_no_aperture`和实际宽限秒数；此前冻结版本仍记录旧标记。
 
 同时修正同类的`secured`首次承载确认：原来先要求双侧接触连续0.10s才能进入0.06s滞回，首次确认前的接触抖动不断清零。v6承载候选仍要求原几何和节点相对初态抬升≥3cm，但候选连续0.10s使用同一已确认夹持宽限，后续承载保持也沿用0.35s。标记`secured_grasp_accounting_version=confirmed_geometry_contact_grace_v2`。稳定抬起奖励仍为一次性4分；已有释放处罚的金额、次数和因果分类规则不变。几何失效不宽限。v2～v5显式旧配置保留旧行为。
 
