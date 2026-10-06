@@ -9,7 +9,7 @@
 | 碰桌执行保护 | 开启 `TableExecutionGuard`，每物理步执行 |
 | 旧夹爪碰桌预测过滤器 | 默认关闭；避免与新执行保护叠加，并移除完整线缆模型的重复预测计算 |
 | 六场景族 | `cable_x075_v1`，训练和阶段评估一致 |
-| 指定点奖励 | `tolerance_progress_v6`，保持进度使用公共成功计时，继承v5当前接触抬升资格与防重复记账 |
+| 指定点奖励 | `tolerance_progress_v6`，保持进度使用公共成功计时；抬升及稳定承载确认沿用已有0.35s接触宽限；保留防重复记账并在松爪后扣回实际消失的抬升收益 |
 | 公共成功口径 | `confirmed_geometry_grace_v3`，已确认夹持与实际几何有效时容忍已有接触丢失宽限，连续0.80秒 |
 | 初始目标工作区 | X=0.60～0.84m、Y=−0.22～0.30m矩形，78个4cm单元；Z=−0.005～0.10m |
 | 成功 / 位置正奖励容差 | ±2 / ±4 节点 |
@@ -18,7 +18,7 @@
 `TARGET_PPO_DEFAULTS`，由正式训练参数解析调用，避免不同启动脚本分别维护开关。
 启动配置保存最终解析值及机器人类型。2026-10-06起，默认新场景族使用包内矩形工作区；显式工作区文件优先。
 训练库、评估库路径仍须按本机数据位置指定；七阶段课程仍用 `--workspace-curriculum` 显式开启。
-成功与保持奖励修正见 [指定点奖励v6](target_node_reward_v6.md)，当前抬升接触资格见 [v5](target_node_reward_v5.md)，接近/对齐记账见 [v4](target_node_reward_v4.md)，抬升与矩形规则见 [指定点奖励v3](target_node_reward_v3.md)。
+成功与保持奖励修正见 [指定点奖励v6](target_node_reward_v6.md)，当前抬升和稳定承载接触资格见 [接触宽限修正](target_node_lift_contact_grace.md)，松爪后的收益记账见 [下降扣回修正](target_node_lift_release_fix.md)，接近/对齐记账见 [v4](target_node_reward_v4.md)，矩形规则见 [指定点奖励v3](target_node_reward_v3.md)。
 
 命令行显式配置优先。复现旧实验须显式选择旧场景族、控制器和奖励；
 需要关闭碰桌保护时使用 `--no-table-execution-guard`。
