@@ -4,7 +4,7 @@ from panda_cable_grasp.env.environment import GraspState
 from panda_cable_grasp.rl.environment import RLConfig, make_rl_env
 
 
-@pytest.mark.parametrize('profile,paid', [('tolerance_progress_v4',True),('tolerance_progress_v5',False)])
+@pytest.mark.parametrize('profile,paid', [('tolerance_progress_v4',True),('tolerance_progress_v5',False),('tolerance_progress_v6',False)])
 def test_grasp_grace_does_not_pay_lift_without_live_contacts(profile, paid):
     env=make_rl_env(robot='nero',action_mode='task_space_vertical_down',scenario_names=['id_static'],
                    rl_config=RLConfig(target_node_task=True,target_reward_profile=profile))

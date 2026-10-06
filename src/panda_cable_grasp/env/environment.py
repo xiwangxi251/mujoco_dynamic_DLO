@@ -3060,6 +3060,7 @@ class CableGraspEnv:
             "success": self.ever_success,
             "grasp_break_count": len(self.grasp_break_history),
             "grasp_judgement_version": "physical_holding_v2",
+            "public_success_version": "confirmed_geometry_grace_v3",
             "active_open_break_count": sum(
                 event.get("causal_class") == "active_open"
                 for event in self.grasp_break_history
@@ -3317,13 +3318,17 @@ class CableGraspEnv:
         return self.left_finger_id in fingers and self.right_finger_id in fingers
 
     def _success_qualification(self, gripper_closed: bool) -> bool:
-        """Success uses current physical holding, independently of commands."""
+        """Confirmed holding tolerates the existing contact-loss grace.
+
+        Actual opening/distance invalidate holding immediately. A transient
+        missing solver contact does not reset task retention while the physical
+        grasp remains confirmed; the raw-contact timer is an RL diagnostic.
+        """
 
         if (
             self.grasp_state is None
             or not self.grasp_confirmed
             or not self._physical_grasp_geometry_valid()
-            or not self._grasp_has_bilateral_pad_contact()
         ):
             return False
         body_id = self.grasp_state.body_id

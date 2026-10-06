@@ -157,7 +157,7 @@ def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
         accepted = {field.name for field in fields(RLConfig)}
         values = {key: value for key, value in saved.items() if key in accepted}
         values["target_reward_profile"] = getattr(args, "target_reward_profile", "legacy")
-        if values["target_reward_profile"] in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"}:
+        if values["target_reward_profile"] in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"}:
             values.update(target_node_task=True, target_node_tolerance=2,
                           target_position_reward_radius=4,
                           target_wrong_event_penalty=2., target_wrong_event_cap=8.)
@@ -796,7 +796,7 @@ def parse_args() -> argparse.Namespace:
                         help="conditioned eval reset retry pool starting at eval-seed; 0 disables")
     parser.add_argument("--workspace-scene-family", choices=tuple(WORKSPACE_SCENE_FAMILIES))
     parser.add_argument("--target-node-task", action="store_true")
-    parser.add_argument("--target-reward-profile", choices=("legacy", "tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"), default=None)
+    parser.add_argument("--target-reward-profile", choices=("legacy", "tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"), default=None)
     parser.add_argument("--rl-config-file", type=Path,
                         help="explicit reference RLConfig JSON; preserves its non-target reward/action values")
     parser.add_argument("--resume-legacy-full6", action="store_true",
@@ -1044,7 +1044,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     from .target_defaults import configure_target_training_defaults
     configure_target_training_defaults(args, sys.argv[1:])
-    if args.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"} and not args.target_node_task:
+    if args.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} and not args.target_node_task:
         parser.error("tolerance_progress_v2/v3/v4/v5 requires --target-node-task")
     if args.eval_seed_pool_size < 0:
         parser.error("eval seed pool size must be nonnegative")
@@ -1482,13 +1482,13 @@ def main() -> None:
         "warm_start": warm_start_record,
         "target_reward_profile": args.target_reward_profile,
         "lift_progress_accounting_version": (
-            "episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"}
+            "episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"}
             else "episode_high_water_unbounded_debit_v2" if args.target_reward_profile == "tolerance_progress_v2"
             else "legacy"
         ),
-        "approach_progress_accounting_version": ("episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v4", "tolerance_progress_v5"} else "legacy_phase_gated"),
+        "approach_progress_accounting_version": ("episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} else "legacy_phase_gated"),
         "lift_reward_holding_version": (
-            "current_bilateral_geometry_v1" if args.target_reward_profile == "tolerance_progress_v5"
+            "current_bilateral_geometry_v1" if args.target_reward_profile in {"tolerance_progress_v5", "tolerance_progress_v6"}
             else "confirmed_grasp_grace_v1"),
         "reference_rl_config_file": str(args.rl_config_file.resolve()) if args.rl_config_file else None,
         "resume_legacy_full6_requested": args.resume_legacy_full6,
@@ -1496,6 +1496,10 @@ def main() -> None:
         "controller_profile": args.controller_profile,
         "table_execution_guard_enabled": args.table_execution_guard,
         "grasp_judgement_version": "physical_holding_v2",
+        "public_success_version": "confirmed_geometry_grace_v3",
+        "hold_reward_timer_version": (
+            "public_success_hold_v1" if args.target_reward_profile == "tolerance_progress_v6"
+            else "strict_height_band_hold_v1"),
         "arm_acceleration_limit_enabled": args.controller_profile == "legacy",
         "target_workspace": (None if args.target_workspace is None else WorkspaceMask(args.target_workspace, args.workspace_mask_key).manifest()),
         "workspace_entry_seconds": args.workspace_entry_seconds,
@@ -1607,7 +1611,7 @@ def main() -> None:
         "rl_strict_success_diagnostic": (
             "secured grasp + raw bilateral contact + distance <= 0.055 m at "
             "50 Hz for 0.80 s, intersected with the base environment's current "
-            "qualification; diagnostic and shaping only"
+            "qualification; diagnostic only for v6, historical shaping for earlier profiles"
         ),
         "observation_names": (
             {"points": [args.pointcloud_points, 3], "proprio": [16]}
@@ -1659,7 +1663,8 @@ def main() -> None:
     if args.target_node_task:
         configuration["rl_success_definition"] = (
             "shared physical lift/retention qualification AND material node error "
-            "within target_node_tolerance continuously for success_hold_seconds at physics substeps"
+            "within target_node_tolerance continuously for success_hold_seconds at physics substeps; "
+            "confirmed physical geometry with existing contact-loss grace, not uninterrupted raw contacts"
         )
         configuration["observation"] = "state99 plus target material u, TCP-relative position/velocity and tangent: 109-D"
     (args.output / "training_config.json").write_text(

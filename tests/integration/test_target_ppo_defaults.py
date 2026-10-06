@@ -14,7 +14,7 @@ def test_target_training_enables_validated_stack_and_new_six_scenes_by_default()
     assert args.controller_profile == 'enhanced6_bounded_dls_v1'
     assert args.table_execution_guard
     assert args.disable_table_finger_collision_filter
-    assert args.target_reward_profile == 'tolerance_progress_v5'
+    assert args.target_reward_profile == 'tolerance_progress_v6'
     from panda_cable_grasp.rl.workspace import WorkspaceMask
     mask=WorkspaceMask(args.target_workspace)
     assert mask.manifest()['xy_bounds_m']==[.60,.84,-.22,.30]

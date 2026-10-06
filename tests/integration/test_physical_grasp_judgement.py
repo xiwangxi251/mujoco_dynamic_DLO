@@ -70,12 +70,20 @@ class PhysicalGraspJudgementTests(unittest.TestCase):
         self.assertIsNone(self.base.grasp_state)
         self.assertEqual(self.base.last_grasp_break['causal_class'],'physical_slip')
 
-    def test_success_independent_of_command_but_requires_current_contacts(self):
+    def test_success_independent_of_command_tolerates_contact_grace(self):
         self.base.data.xpos[np.asarray(self.base.cable_ids),2] = .22
         with patch.object(type(self.base),'pad_center_position',new_callable=lambda:property(lambda _:self.base.data.xpos[self.base.target_body_id].copy())):
             self.assertTrue(self.base._success_qualification(gripper_closed=False))
             self.assertTrue(self.base._success_qualification(gripper_closed=True))
             self.pairs = []
+            self.assertTrue(self.base._success_qualification(gripper_closed=True))
+            self.base.data.time += self.base.config.grasp_loss_seconds + .002
+            self.assertFalse(self.base._success_qualification(gripper_closed=True))
+
+    def test_public_success_rejects_real_opening_despite_contact_grace(self):
+        self.base.data.xpos[np.asarray(self.base.cable_ids),2] = .22
+        with patch.object(type(self.base),'pad_center_position',new_callable=lambda:property(lambda _:self.base.data.xpos[self.base.target_body_id].copy())):
+            self.base.data.qpos[self.base.finger_qpos_adr] = [.025,-.025]
             self.assertFalse(self.base._success_qualification(gripper_closed=True))
 
     def test_secured_contact_grace_and_strict_hold_do_not_depend_on_command(self):
