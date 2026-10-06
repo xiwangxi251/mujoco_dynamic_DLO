@@ -1196,10 +1196,22 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             and lift_delta >= self.rl_config.secured_lift_delta
         )
         raw_secured_candidate = bool(secured_geometry_valid and raw_bilateral)
+        # v6 uses the already confirmed physical grasp and its existing contact
+        # grace during BOTH initial loaded confirmation and subsequent retention.
+        # Raw-contact continuity remains a separate strict diagnostic.
+        grace_secured_candidate = bool(
+            self.rl_config.target_reward_profile == "tolerance_progress_v6"
+            and secured_geometry_valid
+        )
         secured_was_confirmed = bool(
             self._secured_candidate_hold >= self.rl_config.secured_confirm_seconds
         )
-        if raw_secured_candidate:
+        if grace_secured_candidate:
+            self._secured_candidate_hold += action_seconds
+            self._secured_contact_loss_hold = max(
+                0.0, float(self.data.time - state.last_bilateral_time)
+            ) if not raw_bilateral else 0.0
+        elif raw_secured_candidate:
             self._secured_candidate_hold += action_seconds
             self._secured_contact_loss_hold = 0.0
         elif (
@@ -1799,11 +1811,18 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self.goal.finish_reward(components, grasp_status)
         return float(sum(components.values())), components
 
+    def _lift_reward_contact_grace_seconds(self):
+        return float(self.base_env.config.grasp_loss_seconds)
+
     def _current_lift_reward_holding(self, grasp_status):
-        """Reward current bilateral holding, not the release-detection grace period."""
+        """v6 rewards confirmed geometric holding within the existing contact grace."""
         state = self.base_env.grasp_state
-        if (state is None or not grasp_status["pinch_confirmed"]
-                or not grasp_status.get("raw_bilateral_contact", False)):
+        if state is None or not grasp_status["pinch_confirmed"]:
+            return False
+        if self.rl_config.target_reward_profile == "tolerance_progress_v6":
+            if not self.base_env.grasp_confirmed:
+                return False
+        elif not grasp_status.get("raw_bilateral_contact", False):
             return False
         return bool(
             self.base_env.finger_aperture <= self.base_env.config.max_grasp_aperture

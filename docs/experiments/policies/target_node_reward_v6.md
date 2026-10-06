@@ -1,5 +1,7 @@
 # 指定点奖励v6与公共成功计时恢复
 
+正奖励及稳定承载确认随后统一使用已有0.35秒接触宽限，见[接触宽限修正](target_node_lift_contact_grace.md)。
+
 2026-10-06随后修正了失去夹持后漏扣抬升收益的问题；v6默认使用
 `physical_node_release_bounded_debit_v2`，见[松爪后抬升收益扣回](target_node_lift_release_fix.md)。
 下文“v3抬升扣回预算保留”描述的是该修正之前的实现。

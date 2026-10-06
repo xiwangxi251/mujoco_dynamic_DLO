@@ -1501,8 +1501,18 @@ def main() -> None:
         ),
         "approach_progress_accounting_version": ("episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} else "legacy_phase_gated"),
         "lift_reward_holding_version": (
-            "current_bilateral_geometry_v1" if args.target_reward_profile in {"tolerance_progress_v5", "tolerance_progress_v6"}
+            "confirmed_geometry_contact_grace_v2" if args.target_reward_profile == "tolerance_progress_v6"
+            else "current_bilateral_geometry_v1" if args.target_reward_profile == "tolerance_progress_v5"
             else "confirmed_grasp_grace_v1"),
+        "lift_reward_contact_grace_seconds": (
+            vector_env.env_method('_lift_reward_contact_grace_seconds')[0]
+            if args.target_reward_profile == "tolerance_progress_v6" else 0.0),
+        "secured_grasp_accounting_version": (
+            "confirmed_geometry_contact_grace_v2" if args.target_reward_profile == "tolerance_progress_v6"
+            else "raw_confirm_then_secured_grace_v1"),
+        "secured_contact_grace_seconds": (
+            vector_env.env_method('_lift_reward_contact_grace_seconds')[0]
+            if args.target_reward_profile == "tolerance_progress_v6" else None),
         "reference_rl_config_file": str(args.rl_config_file.resolve()) if args.rl_config_file else None,
         "resume_legacy_full6_requested": args.resume_legacy_full6,
         "resume_interface_migration": ("frozen full6_workspace_target_node_v1 -> formal bounded DLS and physical_holding_v2" if args.resume_legacy_full6 else None),

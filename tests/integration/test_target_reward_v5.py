@@ -4,8 +4,8 @@ from panda_cable_grasp.env.environment import GraspState
 from panda_cable_grasp.rl.environment import RLConfig, make_rl_env
 
 
-@pytest.mark.parametrize('profile,paid', [('tolerance_progress_v4',True),('tolerance_progress_v5',False),('tolerance_progress_v6',False)])
-def test_grasp_grace_does_not_pay_lift_without_live_contacts(profile, paid):
+@pytest.mark.parametrize('profile,paid', [('tolerance_progress_v4',True),('tolerance_progress_v5',False),('tolerance_progress_v6',True)])
+def test_profile_selects_lift_contact_grace(profile, paid):
     env=make_rl_env(robot='nero',action_mode='task_space_vertical_down',scenario_names=['id_static'],
                    rl_config=RLConfig(target_node_task=True,target_reward_profile=profile))
     try:
@@ -18,6 +18,7 @@ def test_grasp_grace_does_not_pay_lift_without_live_contacts(profile, paid):
                     grasp_lift_delta=.05,grasp_body_height_above_table=.09,strict_success_hold=0.,height_band_hold=0.)
         env.data.xpos[env.base_env.cable_ids[20]]=[0.,0.,top+.09]
         env._grasp_center_position=lambda: np.array([0.,0.,top+.09])
+        env.data.qpos[env.base_env.finger_qpos_adr]=[.012,-.012]
         _,parts=env._reward(np.zeros(5),False,{'lifted_fraction':.1},status)
         assert (parts['reward_lift_progress']>0) is paid
         assert (parts['reward_cable_lift_progress']>0) is paid
