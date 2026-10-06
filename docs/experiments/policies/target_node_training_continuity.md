@@ -27,7 +27,7 @@
 
 `--evaluation-protocol six-scenes`用于独立全六场景测试，仍保留保存工作区与物理配置，但不套用课程权重。评估manifest明确记录协议、阶段来源和倍率。
 
-新检查点保存`target_evaluation_stage`，避免载入早期权重却使用后来晋级的课程文件。旧检查点没有阶段字段时从运行目录课程文件回退，manifest标记`run_curriculum_fallback`；这不是旧检查点精确历史阶段的保证，需使用冻结配置复现实验。
+新检查点保存`target_evaluation_stage`，避免载入早期权重却使用后来晋级的课程文件。旧检查点没有阶段字段时优先使用归档中的冻结课程（`archived_curriculum`），否则从运行目录课程文件回退（`run_curriculum_fallback`）；后者不是旧检查点精确历史阶段的保证，需使用冻结配置复现实验。
 
 ## 针对性验证
 

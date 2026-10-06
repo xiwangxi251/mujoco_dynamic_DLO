@@ -108,3 +108,10 @@ def test_unavailable_workspace_is_not_silently_replaced(tmp_path, monkeypatch):
     (tmp_path/'training_config.json').write_text(json.dumps(config))
     with pytest.raises(SystemExit):
         parse_args()
+
+
+def test_archived_checkpoint_uses_frozen_curriculum_before_mutable_run(tmp_path, monkeypatch):
+    from panda_cable_grasp.rl.target_defaults import saved_curriculum_stage
+    args, saved = saved_args(tmp_path, monkeypatch)
+    (tmp_path/'workspace_curriculum.json').write_text(json.dumps({'stage': 1}))
+    assert saved_curriculum_stage(args.model, saved) == (1, 'archived_curriculum')

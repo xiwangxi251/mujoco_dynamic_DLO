@@ -106,6 +106,9 @@ def saved_curriculum_stage(checkpoint, saved, model=None):
     # Old checkpoints lack stage metadata; explicitly report the fallback.
     for directory in (Path(checkpoint).resolve().parent, *Path(checkpoint).resolve().parents):
         if (directory/'training_config.json').is_file():
+            archived = directory/'workspace_curriculum.json'
+            if archived.is_file():
+                return int(json.loads(archived.read_text(encoding='utf-8'))['stage']), 'archived_curriculum'
             path = directory/'evaluation/workspace_curriculum.json'
             if path.is_file():
                 return int(json.loads(path.read_text(encoding='utf-8'))['stage']), 'run_curriculum_fallback'
