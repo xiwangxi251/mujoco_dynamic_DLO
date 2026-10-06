@@ -170,6 +170,9 @@ class WorkspaceCurriculumCallback(BaseCallback):
         return WORKSPACE_STAGES[self.stage_index][2]
 
     def _apply(self):
+        # Serialized with each PPO checkpoint, so an older checkpoint is not
+        # evaluated using a later stage from the run's mutable curriculum file.
+        self.model.target_evaluation_stage = self.stage_index
         self.training_env.env_method("set_training_scenario_distribution", self.scene_names,
                                      WORKSPACE_STAGES[self.stage_index][1])
         self.training_env.env_method("set_motion_difficulty", self.difficulty)

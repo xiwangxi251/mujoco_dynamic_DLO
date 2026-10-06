@@ -591,6 +591,9 @@ class StrictSuccessEvalCallback(BaseCallback):
             self.best_phase = int(confirmed.get("curriculum_phase", 0))
 
     def _evaluate(self, episodes: int, *, seed_offset: int = 0) -> dict[str, float]:
+        from .penalty_ramp import apply_progress
+        if hasattr(self.model, 'penalty_ramp_schedule'):
+            apply_progress(self.env, self.model, self.model.penalty_ramp_schedule)
         successes = 0
         strict_successes = 0
         pinches = 0
@@ -1410,6 +1413,11 @@ def main() -> None:
     if args.warm_start is not None:
         from .target_node import warm_start_policy
         warm_start_record = warm_start_policy(model, args.warm_start)
+    from .penalty_ramp import resolve_schedule, apply_progress
+    from .target_defaults import checkpoint_configuration
+    model.penalty_ramp_schedule = resolve_schedule(model, rl_config_from_args(args), args.workers,
+        checkpoint_configuration(args.resume) if args.resume is not None else {})
+    apply_progress(vector_env, model, model.penalty_ramp_schedule, training_workers=args.workers)
     from .health import TrainingHealthCallback
     checkpoint_callback = CheckpointCallback(
         save_freq=max(1, args.checkpoint_steps // args.workers),
@@ -1481,6 +1489,10 @@ def main() -> None:
         "target_node_task": args.target_node_task,
         "warm_start": warm_start_record,
         "target_reward_profile": args.target_reward_profile,
+        "target_termination_version": "public_success_or_original_timeout_v1",
+        "penalty_ramp_schedule": model.penalty_ramp_schedule,
+        "penalty_ramp_start_scales": {kind: vector_env.env_method('_penalty_ramp_scale', kind)[0]
+                                       for kind in ('height', 'safety')},
         "lift_progress_accounting_version": (
             "episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"}
             else "episode_high_water_unbounded_debit_v2" if args.target_reward_profile == "tolerance_progress_v2"

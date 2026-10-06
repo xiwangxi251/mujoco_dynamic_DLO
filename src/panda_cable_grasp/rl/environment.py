@@ -459,6 +459,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._episode_return = 0.0
         self._episode_steps = 0
         self._total_env_steps = 0
+        self._penalty_ramp_progress = None
         self._table_safety_penalty_total = 0.0
         self._singularity_safety_penalty_total = 0.0
         self._last_table_filter_reward = 0.0
@@ -1559,12 +1560,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 self._lift_credit_high_water, capped_lift
             )
 
-        ramp_steps = int(self.rl_config.height_penalty_ramp_env_steps)
-        height_penalty_scale = (
-            1.0
-            if ramp_steps == 0
-            else min(1.0, float(self._total_env_steps) / float(ramp_steps))
-        )
+        height_penalty_scale = self._penalty_ramp_scale('height')
         self._last_height_penalty_scale = (
             height_penalty_scale
             if self.rl_config.height_band_reward_enabled
@@ -1837,12 +1833,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 "reward_singularity_safety": 0.0,
             }
 
-        ramp_steps = int(self.rl_config.safety_penalty_ramp_env_steps)
-        scale = (
-            1.0
-            if ramp_steps == 0
-            else min(1.0, float(self._total_env_steps) / float(ramp_steps))
-        )
+        scale = self._penalty_ramp_scale('safety')
         self._last_safety_penalty_scale = scale
 
         table_remaining = max(
@@ -2110,13 +2101,35 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         info["episode_return"] = self._episode_return
         info["episode_steps"] = self._episode_steps
         info["mujoco_action"] = mujoco_action.copy()
-        wrong_first = bool(self.goal is not None and self.goal.first_grasp_outside_reward_range)
-        if wrong_first:
-            info["termination_reason"] = "wrong_target_first_grasp"
-        return self._observation(), reward, bool(task_success or wrong_first), bool(truncated), info
+        # Reward tolerance is not a failure/termination condition. A mistaken
+        # first pinch may be released and corrected within the original limit.
+        return self._observation(), reward, bool(task_success), bool(truncated), info
+
+    def set_penalty_ramp_progress(self, samples, samples_per_step, schedule):
+        from .penalty_ramp import validate_schedule
+        validate_schedule(schedule)
+        if samples < 0 or samples_per_step < 0:
+            raise ValueError('Penalty ramp sample counts must be non-negative')
+        self._penalty_ramp_progress = dict(samples=int(samples),
+            samples_per_step=int(samples_per_step), environment_start=self._total_env_steps,
+            schedule=dict(schedule))
+
+    def _penalty_ramp_scale(self, kind):
+        progress = self._penalty_ramp_progress
+        if progress is None:
+            full = int(getattr(self.rl_config, kind+'_penalty_ramp_env_steps'))
+            count = self._total_env_steps
+        else:
+            full = progress['schedule'][kind+'_full_samples']
+            count = progress['samples'] + progress['samples_per_step'] * (
+                self._total_env_steps-progress['environment_start'])
+        return 1.0 if full == 0 else float(np.clip(count/full, 0., 1.))
 
     def _augment_info(self, info: dict, *, base_success: bool | None = None) -> dict:
         result = dict(info)
+        result['height_penalty_ramp_scale'] = self._penalty_ramp_scale('height')
+        result['safety_penalty_ramp_scale'] = self._penalty_ramp_scale('safety')
+        result['target_termination_version'] = 'public_success_or_original_timeout_v1'
         if self._workspace is not None:
             result.update(self._workspace_reset_info)
             result["workspace_inside_fraction"] = self._workspace_inside_steps/max(1, self._workspace_sample_steps)

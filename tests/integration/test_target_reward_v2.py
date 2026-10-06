@@ -114,13 +114,14 @@ def test_actual_reward_path_discounts_lift_without_awarding_success_milestones(e
     assert parts['reward_cable_lift_progress'] == pytest.approx(3*.25*.05)
 
 
-def test_wrong_first_event_terminates_without_success(env, monkeypatch):
+def test_wrong_first_event_allows_recovery_without_success(env, monkeypatch):
     held(env, 25)
     monkeypatch.setattr(env.base_env, 'step', lambda action: (None, 0., False, False,
                                                            env.base_env.info()))
     _, _, terminated, _, info = env.step(np.zeros(5))
-    assert terminated and not info['success']
-    assert info['termination_reason'] == 'wrong_target_first_grasp'
+    assert not terminated and not info['success']
+    assert env.goal.first_grasp_outside_reward_range
+    assert info.get('termination_reason') != 'wrong_target_first_grasp'
 
 
 def test_wrong_events_cap_and_regrasp_never_reissues_first_reward(env):

@@ -1,5 +1,6 @@
 """Resolved defaults for new target-node PPO runs and saved evaluations."""
 import json
+import hashlib
 from pathlib import Path
 
 TARGET_PPO_DEFAULTS = {
@@ -60,6 +61,56 @@ def configure_saved_evaluation_defaults(args, argv):
     if (target and args.workspace_scene_family is None
             and not supplied.intersection({'--scenario', '--distribution'})):
         args.workspace_scene_family = saved.get('workspace_scene_family')
+    args.saved_evaluation_config = saved
+    args.saved_stage_evaluation = bool(target
+        and getattr(args, 'evaluation_protocol', 'saved-stage') == 'saved-stage'
+        and not supplied.intersection({'--scenario', '--distribution', '--workspace-scene-family'}))
+    if not target:
+        return
+    workspace = saved.get('target_workspace')
+    if '--target-workspace' not in supplied and workspace:
+        path = Path(workspace['path'])
+        if not path.is_file():
+            # The built-in rectangle can be relocated between Linux/Windows
+            # only when its content hash matches the saved experiment.
+            from .workspace import DEFAULT_TARGET_WORKSPACE
+            if hashlib.sha256(DEFAULT_TARGET_WORKSPACE.read_bytes()).hexdigest() != workspace.get('sha256'):
+                raise ValueError('Saved workspace unavailable; pass --target-workspace with the original NPZ')
+            path = DEFAULT_TARGET_WORKSPACE
+        args.target_workspace = path
+    for key in ('workspace_entry_seconds', 'workspace_reset_attempts', 'episode_seconds', 'disturbance'):
+        if '--'+key.replace('_', '-') not in supplied and key in saved:
+            setattr(args, key, saved[key])
+    if '--workspace-mask-key' not in supplied and workspace:
+        args.workspace_mask_key = workspace.get('mask_key', 'interior')
+    if '--replay-bank-dir' not in supplied:
+        bank = saved.get('eval_replay_bank_dir') or saved.get('replay_bank_dir')
+        if bank:
+            if not Path(bank).is_dir():
+                raise ValueError('Saved replay bank unavailable; pass --replay-bank-dir with the evaluation bank')
+            args.replay_bank_dir = Path(bank)
+    if '--replay-seed-fallback' not in supplied:
+        args.replay_seed_fallback = 'error' if saved.get('eval_replay_bank_dir') else saved.get('replay_seed_fallback', 'resample')
+    if '--geometric-safety' not in supplied:
+        args.geometric_safety = bool(saved.get('geometric_safety_enabled', False))
+    if '--seed' not in supplied and saved.get('eval_seed') is not None:
+        args.seed = int(saved['eval_seed'])
+    args.workspace_reset_seed_pool = ((int(saved['eval_seed']), int(saved['eval_seed_pool_size']))
+        if saved.get('eval_seed_pool_size', 0) > 0 else None)
+
+
+def saved_curriculum_stage(checkpoint, saved, model=None):
+    stage = getattr(model, 'target_evaluation_stage', None)
+    if stage is not None:
+        return int(stage), 'checkpoint'
+    # Old checkpoints lack stage metadata; explicitly report the fallback.
+    for directory in (Path(checkpoint).resolve().parent, *Path(checkpoint).resolve().parents):
+        if (directory/'training_config.json').is_file():
+            path = directory/'evaluation/workspace_curriculum.json'
+            if path.is_file():
+                return int(json.loads(path.read_text(encoding='utf-8'))['stage']), 'run_curriculum_fallback'
+            break
+    raise ValueError('Saved curriculum stage unavailable; use --evaluation-protocol six-scenes for a distinct full-scene test')
 
 
 def add_table_finger_filter_arguments(parser):

@@ -210,9 +210,29 @@ def evaluation_rl_config(args) -> RLConfig:
     return RLConfig(singularity_avoidance_enabled=not args.disable_singularity_avoidance)
 
 
-def configure_target_evaluation(env, args):
+def configure_target_evaluation(env, args, model=None):
     if env.goal is not None:
         env.goal.fixed_index = getattr(args, "target_node_index", None)
+    saved = getattr(args, 'saved_evaluation_config', {})
+    if model is not None:
+        from .penalty_ramp import resolve_schedule, apply_progress
+        schedule = resolve_schedule(model, env.rl_config, int(saved.get('workers', 1)), saved)
+        apply_progress(env, model, schedule)
+    if env.goal is not None and getattr(args, 'saved_stage_evaluation', False):
+        if saved.get('workspace_curriculum'):
+            from .target_defaults import saved_curriculum_stage
+            from .workspace import WORKSPACE_STAGES
+            stage, source = saved_curriculum_stage(args.model, saved, model)
+            if not 0 <= stage < len(WORKSPACE_STAGES):
+                raise ValueError('Invalid saved curriculum stage')
+            names = tuple(saved['training_scenario_names'])
+            env.set_training_scenario_distribution(names, WORKSPACE_STAGES[stage][1])
+            env.set_motion_difficulty(WORKSPACE_STAGES[stage][2])
+            args.resolved_evaluation_stage = dict(stage=stage, source=source,
+                weights=WORKSPACE_STAGES[stage][1], motion_difficulty=WORKSPACE_STAGES[stage][2])
+        elif saved.get('eval_scenario_names'):
+            env.set_training_scenario_distribution(tuple(saved['eval_scenario_names']),
+                saved.get('eval_scenario_weights'))
 
 
 def resolve_scenario_names(
@@ -568,6 +588,12 @@ def _manifest(
         "failure_taxonomy_source": _file_record(taxonomy_source),
         "checkpoint": _file_record(args.model),
         "environment": {
+            "evaluation_protocol": (args.evaluation_protocol if getattr(args, 'saved_stage_evaluation', False)
+                                    else 'custom' if getattr(args, 'evaluation_protocol', None) == 'saved-stage' else 'six-scenes'),
+            "evaluation_stage": getattr(args, 'resolved_evaluation_stage', None),
+            "penalty_ramp": getattr(env, '_penalty_ramp_progress', None),
+            "public_success_version": "confirmed_geometry_grace_v3",
+            "target_termination_version": "public_success_or_original_timeout_v1",
             "rl_interface_version": action_interface_version(args.action_mode),
             "observation_interface_version": "target_node_state_v1" if env.goal else "baseline_state_v1",
             "task_definition": (
@@ -935,10 +961,11 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
         workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
         workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
+        workspace_reset_seed_pool=getattr(args, 'workspace_reset_seed_pool', None),
         replay_bank_dir=getattr(args, "replay_bank_dir", None),
         replay_seed_fallback=getattr(args, "replay_seed_fallback", "resample"),
     )
-    configure_target_evaluation(env, args)
+    configure_target_evaluation(env, args, model)
 
 
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
@@ -1388,10 +1415,11 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
         workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
         workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
+        workspace_reset_seed_pool=getattr(args, 'workspace_reset_seed_pool', None),
         replay_bank_dir=getattr(args, "replay_bank_dir", None),
         replay_seed_fallback=getattr(args, "replay_seed_fallback", "resample"),
     )
-    configure_target_evaluation(env, args)
+    configure_target_evaluation(env, args, model)
 
     observation, info = env.reset(seed=args.seed)
     episode = 1
@@ -1466,6 +1494,8 @@ def parse_args() -> argparse.Namespace:
     add_workspace_arguments(parser)
     parser.add_argument("--workspace-scene-family", choices=tuple(WORKSPACE_SCENE_FAMILIES))
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument('--evaluation-protocol', choices=('saved-stage', 'six-scenes'),
+        default='saved-stage', help='target-node default: saved workspace/course; six-scenes is a separate full-scene test')
     parser.add_argument("--target-node-index", type=int, default=None,
                         help="force a material node in a target-node checkpoint evaluation")
     parser.add_argument("--headless", action="store_true")
@@ -1546,7 +1576,10 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(robot=None, controller_profile=None, table_execution_guard=None)
     args = parser.parse_args()
     from .target_defaults import configure_saved_evaluation_defaults
-    configure_saved_evaluation_defaults(args, sys.argv[1:])
+    try:
+        configure_saved_evaluation_defaults(args, sys.argv[1:])
+    except ValueError as error:
+        parser.error(str(error))
     args.speed = float(np.clip(args.speed, 0.25, 8.0))
     if args.episodes < 1:
         parser.error("--episodes must be at least 1")

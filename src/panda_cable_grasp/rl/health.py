@@ -37,6 +37,8 @@ class TrainingHealthCallback(BaseCallback):
                       completed_episodes=self.completed_episodes, parameters_finite=finite,
                       optimization_metrics=metrics,
                       normal_training=int(self.model._n_updates) > self.starting_updates and bool(metrics))
+        record['penalty_ramp_schedule'] = getattr(self.model, 'penalty_ramp_schedule', None)
+        record['target_evaluation_stage'] = getattr(self.model, 'target_evaluation_stage', None)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix('.tmp')
         temporary.write_text(json.dumps(record, indent=2), encoding='utf-8')
