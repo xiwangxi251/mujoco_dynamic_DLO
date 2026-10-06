@@ -1494,7 +1494,8 @@ def main() -> None:
         "penalty_ramp_start_scales": {kind: vector_env.env_method('_penalty_ramp_scale', kind)[0]
                                        for kind in ('height', 'safety')},
         "lift_progress_accounting_version": (
-            "episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"}
+            "physical_node_release_bounded_debit_v2" if args.target_reward_profile == "tolerance_progress_v6"
+            else "episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"}
             else "episode_high_water_unbounded_debit_v2" if args.target_reward_profile == "tolerance_progress_v2"
             else "legacy"
         ),

@@ -1,5 +1,9 @@
 # 指定点奖励v6与公共成功计时恢复
 
+2026-10-06随后修正了失去夹持后漏扣抬升收益的问题；v6默认使用
+`physical_node_release_bounded_debit_v2`，见[松爪后抬升收益扣回](target_node_lift_release_fix.md)。
+下文“v3抬升扣回预算保留”描述的是该修正之前的实现。
+
 2026-10-06后续审查又修正了首次抓偏提前终止、续训惩罚爬坡及评估配置继承；
 见[训练连续性与评估修正](target_node_training_continuity.md)。这些修正继承v6奖励与公共保持口径。
 

@@ -2026,6 +2026,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._lift_progress_credit = (HighWaterLiftCredit(
             self._lift_credit_heights(), self._cable_lift_credit_high_water,
             bounded_debits=self.rl_config.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"},
+            release_debits=self.rl_config.target_reward_profile == "tolerance_progress_v6",
         ) if self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} else None)
         self._secured_session_active = False
         self._secured_session_target_match = False
