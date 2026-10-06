@@ -125,7 +125,7 @@ class PolicyConfig:
     # the fold-adjacency guard measurable rather than assumed.
     intercept_segment_tolerance: int = 4
     # A folded cable puts two material-distant strands inside the pad travel at
-    # once.  Two 28 mm strands need >= 56 mm of aperture, so the 40 mm grasp
+    # once.  Two 28 mm strands need >= 56 mm of aperture, so the 50 mm grasp
     # gate can never confirm and the episode is lost before the fingers move.
     # The isotropic table-plane clearance used by middle_geometry scores a
     # harmless neighbour offset along the jaw's long axis the same as a fatal

@@ -407,11 +407,10 @@ class EnvConfig:
     grasp_contact_index_radius: int = 5
     confirmed_grasp_contact_index_radius: int = 5
     grasp_loss_seconds: float = 0.35   
-    # A 20 mm cable can hold the Panda fingers near 39 mm when it enters the
-    # pads obliquely.  Bilateral pad force and center-distance checks below
-    # still reject an empty/open gripper, so 40 mm is the appropriate upper
-    # bound for a physically trapped cable rather than the old 34 mm cutoff.
-    max_grasp_aperture: float = 0.040
+    # User-selected 50 mm total finger aperture for oblique cable grasps.
+    # Bilateral pad force, local material neighborhood and center-distance
+    # checks remain required; aperture alone never confirms a grasp.
+    max_grasp_aperture: float = 0.050
     max_pad_distance: float = 0.055   
     min_pad_normal_force: float = 0.20 
 
@@ -852,7 +851,7 @@ class _ObjectRuntime:
     shape_family: str = "none"
     rotation_sign: float = 1.0
     # 抓取确认孔径上限：按对象局部厚度放宽（细对象收紧、粗对象放宽）。
-    aperture_limit: float = 0.040
+    aperture_limit: float = 0.050
     # sine_servo 伺服锚定：初始主轴/静止构型/静止高度，首次驱动时惰性初始化。
     sine_axis: np.ndarray | None = None
     sine_rest_xy: np.ndarray | None = None

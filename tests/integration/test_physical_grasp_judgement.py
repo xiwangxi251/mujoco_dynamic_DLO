@@ -53,7 +53,7 @@ class PhysicalGraspJudgementTests(unittest.TestCase):
 
     def test_real_opening_clears_once_and_reward_event_is_consumed_once(self):
         self.base._update_physical_grasp_state(gripper_closed=False)
-        self.base.data.qpos[self.base.finger_qpos_adr] = [.025,-.025]
+        self.base.data.qpos[self.base.finger_qpos_adr] = [.026,-.026]
         self.rl._secured_session_active = True
         self.base._update_physical_grasp_state(gripper_closed=False)
         self.assertIsNone(self.base.grasp_state)
@@ -70,6 +70,13 @@ class PhysicalGraspJudgementTests(unittest.TestCase):
         self.assertIsNone(self.base.grasp_state)
         self.assertEqual(self.base.last_grasp_break['causal_class'],'physical_slip')
 
+    def test_oblique_48mm_aperture_keeps_confirmed_hold(self):
+        self.base.data.qpos[self.base.finger_qpos_adr] = [.024,-.024]
+        self.base._update_physical_grasp_state(gripper_closed=True)
+        self.assertTrue(self.base.grasp_confirmed)
+        self.assertTrue(self.base._physical_grasp_geometry_valid())
+        self.assertEqual(self.base.grasp_break_history, [])
+
     def test_success_independent_of_command_tolerates_contact_grace(self):
         self.base.data.xpos[np.asarray(self.base.cable_ids),2] = .22
         with patch.object(type(self.base),'pad_center_position',new_callable=lambda:property(lambda _:self.base.data.xpos[self.base.target_body_id].copy())):
@@ -83,7 +90,7 @@ class PhysicalGraspJudgementTests(unittest.TestCase):
     def test_public_success_rejects_real_opening_despite_contact_grace(self):
         self.base.data.xpos[np.asarray(self.base.cable_ids),2] = .22
         with patch.object(type(self.base),'pad_center_position',new_callable=lambda:property(lambda _:self.base.data.xpos[self.base.target_body_id].copy())):
-            self.base.data.qpos[self.base.finger_qpos_adr] = [.025,-.025]
+            self.base.data.qpos[self.base.finger_qpos_adr] = [.026,-.026]
             self.assertFalse(self.base._success_qualification(gripper_closed=True))
 
     def test_secured_contact_grace_and_strict_hold_do_not_depend_on_command(self):
