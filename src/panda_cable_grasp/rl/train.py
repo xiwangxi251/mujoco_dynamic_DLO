@@ -232,7 +232,7 @@ def make_configured_env(
         target_workspace=getattr(args, "target_workspace", None),
         workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
         workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
-        workspace_start_protocol=getattr(args, "workspace_start_protocol", "policy_from_initial_v3"),
+        workspace_start_protocol=getattr(args, "workspace_start_protocol", "policy_from_initial_v2"),
         workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
         workspace_reset_seed_pool=getattr(args, "workspace_reset_seed_pool", None),
         replay_bank_dir=getattr(args, "replay_bank_dir", None),

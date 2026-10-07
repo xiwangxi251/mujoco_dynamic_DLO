@@ -317,7 +317,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         target_workspace: str | Path | None = None,
         workspace_mask_key: str = "interior",
         workspace_entry_seconds: float = 8.,
-        workspace_start_protocol: str = "policy_from_initial_v3",
+        workspace_start_protocol: str = "policy_from_initial_v2",
         workspace_reset_attempts: int = 50,
         workspace_reset_seed_pool: tuple[int, int] | None = None,
         replay_bank_dir: str | Path | None = None,

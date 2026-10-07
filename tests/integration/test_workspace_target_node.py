@@ -283,7 +283,7 @@ def test_initial_policy_reset_does_not_advance_or_fallback_when_all_nodes_outsid
         assert info['requested_seed'] == info['actual_seed'] == info['episode_seed'] == 81
         assert info['workspace_reset_attempts'] == 1 and info['workspace_reset_rejections'] == 0
         assert info['workspace_prefix_seconds'] == 0.
-        assert info['workspace_start_protocol'] == 'policy_from_initial_v3'
+        assert info['workspace_start_protocol'] == 'policy_from_initial_v2'
         assert info['workspace_candidate_count'] == 40 and env.goal.index == 39
         assert not info['workspace_goal_ever_inside'] and info['workspace_goal_first_entry_seconds'] is None
         np.testing.assert_array_equal(env._episode_initial_cable_z,
@@ -323,7 +323,7 @@ def test_workspace_entry_is_latched_without_switching_goal(mask_path):
 def test_initial_start_and_episode_budget_defaults_preserve_explicit_legacy_options():
     with patch('sys.argv', ['train', '--target-node-task']):
         args = parse_args()
-    assert args.workspace_start_protocol == 'policy_from_initial_v3' and args.episode_seconds == 15.
+    assert args.workspace_start_protocol == 'policy_from_initial_v2' and args.episode_seconds == 15.
     with patch('sys.argv', ['train', '--target-node-task', '--workspace-start-protocol', 'physical_entry_v1']):
         args = parse_args()
     assert args.episode_seconds == 15.

@@ -7,7 +7,7 @@ node entered the workspace, then selected a goal and started PPO. This prevented
 learning or evaluating observation, waiting and approach before entry. The user
 accepted that some assigned nodes may never enter, provided most have opportunities.
 
-## Current default: `policy_from_initial_v3`
+## Current default: `policy_from_initial_v2`
 
 - Reset initializes the requested scene/seed once and immediately returns the first
   policy observation. It does not call `prepare_workspace_entry` or a hidden control
@@ -15,7 +15,11 @@ accepted that some assigned nodes may never enter, provided most have opportunit
 - Uniformly sample one of all material nodes (the preceding workspace protocol also
   allowed all material identities), or honor an explicit valid node index even when
   outside the workspace. Keep that identity for the entire episode. No future motion
-  prediction, forced robot waiting, target replacement or new observation is added.
+  prediction, new forced robot waiting, target replacement or new observation is added.
+  The original intentional rigid/combined arm-release timing remains: ready targets
+  until cable motion start (0.80 s) plus one control cycle (0.02 s), i.e. 0.82 s.
+  PPO still observes and trains from t=0 during that interval; this is independent
+  of workspace entry and does not run hidden physics in reset.
 - The existing rectangle X=0.60–0.84/Y=-0.22–0.30/Z=-0.005–0.10 m is a diagnostic
   region. It neither starts the policy nor certifies that an outside point is
   physically unreachable. A goal that never enters remains in the total denominator.
@@ -90,26 +94,27 @@ the launch manifest. Saved intermediate weights still inherit their recorded
 23-second duration when reproducing that experiment.
 
 
-## Executor startup correction (2026-10-07 15:30 audit)
+## Preserve the intentional arm delay (user correction, 2026-10-07)
 
-The v2 wrapper starts PPO at time zero but the inherited base executor still
-replaces rigid/combined arm commands with ready targets until 0.82 seconds.
-This contradicts the initial-state control contract. `policy_from_initial_v3`
-sets the task-scoped `arm_motion_start_immediate` flag so `_arm_motion_start_time`
-returns zero and the first requested arm command enters the original limit/guard
-pipeline. It does not remove joint speed/position limits, table protection,
-change cable drive timing, extend the 15-second episode, add observations,
-force an upward action or alter rewards/physics/success/curriculum gates.
+The 15:30 audit incorrectly called the original rigid/combined 0.82-second arm
+release a defect and deployed `policy_from_initial_v3`. The user confirmed that
+this timing was deliberately set to let the cable begin moving before releasing
+the arm. The authorized removal was workspace-entry pre-simulation, not this
+independent execution timing. Restore `policy_from_initial_v2` as the default
+and use it for current training. Do not remove the delay again without an explicit
+user instruction; low success is not evidence that this intentional timing is a bug.
 
-Default base environments retain `arm_motion_start_immediate=False`.
-`physical_entry_v1` and saved `policy_from_initial_v2` remain selectable for
-archived reproduction, including their executor delay. The v3 protocol and
-actual executor flag are recorded in training configuration. Tests check the
-actual requested arm target at t=0 for all three protocols, plus historical
-saved evaluation inheritance. Safely resume the latest complete checkpoint in
-a new run, preserve stage and cumulative schedules, and clear only evaluation
-pass history across this execution protocol change.
+PPO starts observation, action generation, rewards and samples at t=0; the base
+executor retains ready arm targets until 0.82 s for rigid/combined scenes. There
+is no workspace-entry startup gate, hidden reset prefix or extra episode time.
+The full episode remains 15 seconds from the initial state. Cable drive timing,
+original limits/guards, reward, physics, observation and curriculum gates remain.
 
-This is a proven execution inconsistency, not proof that the 0.82-second delay
-causes all low success. The current stage-4 evaluations remain weak in shape,
-combined and complex-static tasks; reward weights and exploration are unchanged.
+Keep explicit v3 selection solely to reproduce the archived short immediate-arm
+experiment and its saved configuration; it is not the recommended/default setup.
+The base `arm_motion_start_immediate` flag defaults false. Regression tests verify
+actual t=0 targets for v2/v1 (ready) and archived v3 (immediate), plus saved protocol
+inheritance and 15-second defaults. Archive the erroneous v3 run and safely resume
+the latest complete checkpoint in a new restored-delay output, preserving the
+optimizer, stage, cumulative 20M budget and schedules; clear only cross-protocol
+promotion history. Keep all historical configurations and evaluations unchanged.
