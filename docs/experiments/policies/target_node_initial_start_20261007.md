@@ -26,10 +26,13 @@ accepted that some assigned nodes may never enter, provided most have opportunit
 - `workspace_prefix_seconds=0`, actual=requested seed, attempts=1, rejections=0.
   Reward ledgers initialize from the real initial cable positions. All actual policy
   steps receive the existing rewards and count as PPO samples, including pre-entry.
-- New target-workspace CLI training defaults to a full 23-second episode measured
-  from the initial state. This explicitly covers the previous upper budget of an
-  8-second hidden prefix plus 15-second policy period. Explicit episode duration is
-  authoritative; this continuation sets 23 seconds for both train and evaluation.
+- The complete episode is **15 seconds from the initial state**, for all scenes,
+  including observation, waiting, approach, grasp and lift. No hidden prefix or
+  extra 8-second allowance remains. Training and evaluation use the same duration;
+  explicit CLI episode duration remains authoritative for separate experiments.
+  The first deployment incorrectly used 23 seconds by adding the old maximum
+  prefix to the configured policy duration. The user corrected this to 15 seconds
+  on 2026-10-07; that intermediate run is archived, not retroactively relabelled.
 - Keep 109 observations, 5 actions, ordinary PPO, reward v6 and its paid-progress
   ledgers/contact grace, enhanced6 bounded DLS, TableExecutionGuard on, old filter
   off, contact cache, 48 train/13 evaluation workers, current motion/physics and
@@ -55,7 +58,8 @@ known weakness is not silently addressed here.
 Removing the entry loop removes its reset-time simulation and the associated
 synchronous wait. It does not eliminate other physics costs or SB3 synchronous
 sampling. FPS is policy samples/wall time; pre-entry policy samples now count.
-Full 23-second episodes and a broader target population change the learning task.
+The broader target population and initial-state control change the learning task;
+the configured episode duration remains the original 15 seconds.
 Improved speed and per-scene entry/success rates must be measured after restart;
 no return to 150 samples/s or majority-entry guarantee is asserted from source alone.
 
@@ -65,10 +69,22 @@ Targeted regressions cover: no hidden steps or seed fallback with every cable no
 outside; outside explicit material goal accepted; all-node candidates and fixed
 identity; a never-entered goal still executes and times out unsuccessfully;
 latched entry diagnostics; initial reward height baseline; train/eval factories;
-new 23-second default and explicit overrides; historical evaluation protocol.
+15-second default and explicit overrides; saved historical durations/protocols.
 
 The authorized 151 continuation archives the verified training process and newest
 complete checkpoint with optimizer/config/course/code. Resume in a new output
 folder, preserve the cumulative 20M sample budget and learning/entropy/penalty
 schedules, and clear old-protocol promotion history. Record actual checkpoint and
 commit in the new launch manifest. Old unsaved progress cannot be recovered.
+
+
+## 15-second correction deployment
+
+Only the full episode time changes from the intermediate 23-second run to 15
+seconds. The initial-state protocol, all-node goal population, control, reward,
+physics, stage, workers and cumulative budget remain. Archive the intermediate
+run and resume its newest complete checkpoint in a new `initial_policy_15s` run.
+Clear old time-budget evaluation pass history while preserving the checkpoint
+stage and learning schedules. Record the actual checkpoint and code commit in
+the launch manifest. Saved intermediate weights still inherit their recorded
+23-second duration when reproducing that experiment.

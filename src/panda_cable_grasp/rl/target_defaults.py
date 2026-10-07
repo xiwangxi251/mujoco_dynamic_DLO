@@ -42,10 +42,6 @@ def configure_target_training_defaults(args, argv):
             and args.workspace_scene_family == 'cable_x075_v1'):
         from .workspace import DEFAULT_TARGET_WORKSPACE
         args.target_workspace = DEFAULT_TARGET_WORKSPACE
-    if (target and args.target_workspace is not None
-            and args.workspace_start_protocol == "policy_from_initial_v2"
-            and "--episode-seconds" not in supplied):
-        args.episode_seconds = 23.
 
 
 def configure_saved_evaluation_defaults(args, argv):

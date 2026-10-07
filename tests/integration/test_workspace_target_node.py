@@ -323,7 +323,7 @@ def test_workspace_entry_is_latched_without_switching_goal(mask_path):
 def test_initial_start_and_episode_budget_defaults_preserve_explicit_legacy_options():
     with patch('sys.argv', ['train', '--target-node-task']):
         args = parse_args()
-    assert args.workspace_start_protocol == 'policy_from_initial_v2' and args.episode_seconds == 23.
+    assert args.workspace_start_protocol == 'policy_from_initial_v2' and args.episode_seconds == 15.
     with patch('sys.argv', ['train', '--target-node-task', '--workspace-start-protocol', 'physical_entry_v1']):
         args = parse_args()
     assert args.episode_seconds == 15.
@@ -335,7 +335,7 @@ def test_saved_evaluation_keeps_start_protocol_and_budget(tmp_path, mask_path):
     model = tmp_path / 'model.zip'
     saved = dict(target_node_task=True, target_workspace=WorkspaceMask(mask_path).manifest(),
                  workspace_scene_family='cable_x075_v1', episode_seconds=15., workspace_entry_seconds=8.)
-    for protocol, seconds in [(None, 15.), ('policy_from_initial_v2', 23.)]:
+    for protocol, seconds in [(None, 15.), ('policy_from_initial_v2', 15.), ('policy_from_initial_v2', 23.)]:
         cfg = dict(saved, episode_seconds=seconds)
         if protocol is not None:
             cfg['workspace_start_protocol'] = protocol
