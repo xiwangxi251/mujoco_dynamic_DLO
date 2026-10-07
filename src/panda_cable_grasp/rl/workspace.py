@@ -93,21 +93,28 @@ class WorkspaceMask:
 
 
 class WorkspaceTargetNode(TargetNodeTask):
-    """Select any initially eligible node; retain material identity afterwards."""
+    """Select a material node once; workspace membership is diagnostic in v2."""
     def __init__(self, wrapper, seed, workspace):
         super().__init__(wrapper, seed)
         self.workspace = workspace
+        self.start_protocol = wrapper._workspace_start_protocol
+        self.ever_inside = False
+        self.first_entry_seconds = None
         self.candidates = np.array([], dtype=int)
         self.first_grasp_correct = None
         self.first_grasp_index = None
 
     def reset(self, seed, options):
-        self.candidates = np.flatnonzero(self.workspace.contains(self.base.data.xpos[self.base.cable_ids]))
+        self.candidates = (np.arange(len(self.base.cable_ids))
+            if self.start_protocol == "policy_from_initial_v2" else
+            np.flatnonzero(self.workspace.contains(self.base.data.xpos[self.base.cable_ids])))
         if not len(self.candidates):
             raise NoWorkspaceTarget("No material node inside the selected workspace")
         fixed = (options or {}).get("goal_node_index", self.fixed_index)
         if fixed is not None and (isinstance(fixed, bool) or not isinstance(fixed, (int, np.integer))):
             raise ValueError("goal_node_index must be an integer")
+        if fixed is not None and not 0 <= fixed < len(self.base.cable_ids):
+            raise ValueError("goal_node_index outside the cable")
         if fixed is not None and fixed not in self.candidates:
             raise NoWorkspaceTarget("Explicit goal is outside the selected workspace")
         if seed is not None:
@@ -115,10 +122,24 @@ class WorkspaceTargetNode(TargetNodeTask):
         goal = int(fixed) if fixed is not None else int(self.rng.choice(self.candidates))
         super().reset(seed, dict(options or {}, goal_node_index=goal))
         self.first_grasp_correct = self.first_grasp_index = None
+        self.ever_inside = False
+        self.first_entry_seconds = None
+        self.observe_workspace_goal()
+
+    def observe_workspace_goal(self):
+        inside = bool(self.workspace.contains(
+            self.base.data.xpos[self.base.cable_ids[self.index]])[0])
+        if inside and not self.ever_inside:
+            self.first_entry_seconds = float(self.base.data.time)
+        self.ever_inside |= inside
+        return inside
 
     def info(self):
         info = super().info()
         info.update(workspace_candidate_count=len(self.candidates),
+                    workspace_start_protocol=self.start_protocol,
+                    workspace_goal_ever_inside=self.ever_inside,
+                    workspace_goal_first_entry_seconds=self.first_entry_seconds,
                     workspace_goal_current_inside=bool(self.workspace.contains(
                         self.base.data.xpos[self.base.cable_ids[self.index]])[0]),
                     first_grasp_index=self.first_grasp_index,
@@ -216,7 +237,12 @@ class WorkspaceCurriculumCallback(BaseCallback):
 def add_workspace_arguments(parser):
     parser.add_argument("--target-workspace", type=Path, help="NPZ containing xs, ys and the selected XY mask")
     parser.add_argument("--workspace-mask-key", default="interior")
-    parser.add_argument("--workspace-entry-seconds", type=float, default=8.)
+    parser.add_argument("--workspace-start-protocol",
+                        choices=("policy_from_initial_v2", "physical_entry_v1"),
+                        default="policy_from_initial_v2",
+                        help="v2: policy starts immediately, all material nodes eligible; v1: archived entry-conditioned protocol")
+    parser.add_argument("--workspace-entry-seconds", type=float, default=8.,
+                        help="legacy physical_entry_v1 only; v2 never performs an entry wait")
     parser.add_argument("--workspace-reset-attempts", type=int, default=50,
                         help="maximum conditioned reset attempts; use 1 to prohibit seed fallback")
     parser.add_argument("--replay-bank-dir", type=Path)

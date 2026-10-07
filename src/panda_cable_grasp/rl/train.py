@@ -232,6 +232,7 @@ def make_configured_env(
         target_workspace=getattr(args, "target_workspace", None),
         workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
         workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
+        workspace_start_protocol=getattr(args, "workspace_start_protocol", "policy_from_initial_v2"),
         workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
         workspace_reset_seed_pool=getattr(args, "workspace_reset_seed_pool", None),
         replay_bank_dir=getattr(args, "replay_bank_dir", None),
@@ -661,7 +662,9 @@ class StrictSuccessEvalCallback(BaseCallback):
                             record = {key: info.get(key) for key in (
                                 "requested_seed", "actual_seed", "scenario_name", "goal_node_index",
                                 "first_grasp_correct", "workspace_reset_rejections", "workspace_prefix_seconds",
-                                "workspace_inside_fraction", "workspace_initial_goal_xyz", "workspace_mask")}
+                                "workspace_inside_fraction", "workspace_initial_goal_xyz", "workspace_mask",
+                                "workspace_start_protocol", "workspace_goal_ever_inside",
+                                "workspace_goal_first_entry_seconds")}
                             record.update(success=bool(info["success"]), timesteps=self.num_timesteps,
                                           seed_offset=seed_offset,
                                           phase=self.curriculum.phase_index if self.curriculum else 0)
@@ -1555,7 +1558,10 @@ def main() -> None:
             else "strict_height_band_hold_v1"),
         "arm_acceleration_limit_enabled": args.controller_profile == "legacy",
         "target_workspace": (None if args.target_workspace is None else WorkspaceMask(args.target_workspace, args.workspace_mask_key).manifest()),
-        "workspace_entry_seconds": args.workspace_entry_seconds,
+        "workspace_start_protocol": args.workspace_start_protocol,
+        "workspace_goal_sampling": ("all_material_nodes_at_initial_state_v2"
+            if args.workspace_start_protocol == "policy_from_initial_v2" else "entry_workspace_nodes_v1"),
+        "workspace_entry_seconds": (0. if args.workspace_start_protocol == "policy_from_initial_v2" else args.workspace_entry_seconds),
         "workspace_reset_attempts": args.workspace_reset_attempts,
         "workspace_curriculum": args.workspace_curriculum,
         "workspace_scene_family": args.workspace_scene_family,

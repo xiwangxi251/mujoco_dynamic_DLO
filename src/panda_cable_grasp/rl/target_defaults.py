@@ -42,6 +42,10 @@ def configure_target_training_defaults(args, argv):
             and args.workspace_scene_family == 'cable_x075_v1'):
         from .workspace import DEFAULT_TARGET_WORKSPACE
         args.target_workspace = DEFAULT_TARGET_WORKSPACE
+    if (target and args.target_workspace is not None
+            and args.workspace_start_protocol == "policy_from_initial_v2"
+            and "--episode-seconds" not in supplied):
+        args.episode_seconds = 23.
 
 
 def configure_saved_evaluation_defaults(args, argv):
@@ -68,6 +72,10 @@ def configure_saved_evaluation_defaults(args, argv):
     if not target:
         return
     workspace = saved.get('target_workspace')
+    if "--workspace-start-protocol" not in supplied:
+        # Old weights/configs must keep their archived conditioned protocol.
+        args.workspace_start_protocol = saved.get("workspace_start_protocol",
+            "physical_entry_v1" if workspace else "policy_from_initial_v2")
     if '--target-workspace' not in supplied and workspace:
         path = Path(workspace['path'])
         if not path.is_file():

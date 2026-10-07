@@ -39,3 +39,11 @@
 主动释放惩罚只消费一次，以及OPEN命令本身不清除真实持有。
 
 旧录像和训练统计保持冻结口径。本地dev的修改不会自动进入151已启动的训练进程。
+
+
+## Subsequent start-protocol correction (2026-10-07)
+
+New target-node training starts policy control at the scene initial state and samples
+all material nodes without workspace entry conditioning. See
+[target_node_initial_start_20261007.md](target_node_initial_start_20261007.md).
+This does not restore aperture qualification or change grasp/success thresholds.

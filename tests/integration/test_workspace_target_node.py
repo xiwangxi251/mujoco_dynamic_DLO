@@ -88,7 +88,7 @@ def test_invalid_explicit_node_is_not_coerced_or_resampled(mask_path, index):
 
 
 def test_requested_and_fallback_seed_are_recorded(mask_path):
-    env = make(mask_path, workspace_reset_attempts=2)
+    env = make(mask_path, workspace_reset_attempts=2, workspace_start_protocol="physical_entry_v1")
     calls = []
 
     def entry(base, workspace, maximum_seconds, episode_seconds):
@@ -267,3 +267,84 @@ def test_eval_csv_accepts_recorded_conditioned_seed_but_rejects_silent_mismatch(
             _episode_row(**kwargs)
     finally:
         env.close()
+
+
+def test_initial_policy_reset_does_not_advance_or_fallback_when_all_nodes_outside(tmp_path):
+    path = tmp_path / 'outside.npz'
+    np.savez(path, xs=[10., 10.1], ys=[10., 10.1], interior=np.ones((2, 2), bool))
+    env = make(path, workspace_reset_attempts=50)
+    try:
+        with patch('panda_cable_grasp.rl.workspace.prepare_workspace_entry',
+                   side_effect=AssertionError('hidden entry simulation')), \
+             patch.object(env.base_env, 'step', side_effect=AssertionError('hidden control step')):
+            observation, info = env.reset(seed=81, options={'goal_node_index': 39})
+        assert observation.shape == (109,) and env.action_space.shape == (5,)
+        assert env.data.time == 0.
+        assert info['requested_seed'] == info['actual_seed'] == info['episode_seed'] == 81
+        assert info['workspace_reset_attempts'] == 1 and info['workspace_reset_rejections'] == 0
+        assert info['workspace_prefix_seconds'] == 0.
+        assert info['workspace_start_protocol'] == 'policy_from_initial_v2'
+        assert info['workspace_candidate_count'] == 40 and env.goal.index == 39
+        assert not info['workspace_goal_ever_inside'] and info['workspace_goal_first_entry_seconds'] is None
+        np.testing.assert_array_equal(env._episode_initial_cable_z,
+                                      env.data.xpos[env.base_env.cable_ids, 2])
+        for _ in range(2):
+            _, reward, terminated, truncated, info = env.step(np.zeros(5))
+            assert np.isfinite(reward)
+            assert env.goal.index == 39
+        assert truncated and not info['success']
+        assert not info['workspace_goal_ever_inside'] and info['workspace_inside_fraction'] == 0.
+        assert info['episode_steps'] == 2
+    finally:
+        env.close()
+
+
+def test_workspace_entry_is_latched_without_switching_goal(mask_path):
+    env = make(mask_path)
+    try:
+        env.reset(seed=81, options={'goal_node_index': 39})
+        env.goal.ever_inside = False
+        env.goal.first_entry_seconds = None
+        with patch.object(env.goal.workspace, 'contains', return_value=np.array([False])):
+            _, _, _, _, outside = env.step(np.zeros(5))
+        assert not outside['workspace_goal_ever_inside']
+        with patch.object(env.goal.workspace, 'contains', return_value=np.array([True])):
+            _, _, _, _, entered = env.step(np.zeros(5))
+        assert entered['workspace_goal_ever_inside']
+        assert entered['workspace_goal_first_entry_seconds'] == pytest.approx(.04)
+        with patch.object(env.goal.workspace, 'contains', return_value=np.array([False])):
+            assert not env.goal.observe_workspace_goal()
+            assert env.goal.info()['workspace_goal_ever_inside']
+        assert env.goal.index == 39
+    finally:
+        env.close()
+
+
+def test_initial_start_and_episode_budget_defaults_preserve_explicit_legacy_options():
+    with patch('sys.argv', ['train', '--target-node-task']):
+        args = parse_args()
+    assert args.workspace_start_protocol == 'policy_from_initial_v2' and args.episode_seconds == 23.
+    with patch('sys.argv', ['train', '--target-node-task', '--workspace-start-protocol', 'physical_entry_v1']):
+        args = parse_args()
+    assert args.episode_seconds == 15.
+    with patch('sys.argv', ['train', '--target-node-task', '--episode-seconds', '17']):
+        assert parse_args().episode_seconds == 17.
+
+
+def test_saved_evaluation_keeps_start_protocol_and_budget(tmp_path, mask_path):
+    model = tmp_path / 'model.zip'
+    saved = dict(target_node_task=True, target_workspace=WorkspaceMask(mask_path).manifest(),
+                 workspace_scene_family='cable_x075_v1', episode_seconds=15., workspace_entry_seconds=8.)
+    for protocol, seconds in [(None, 15.), ('policy_from_initial_v2', 23.)]:
+        cfg = dict(saved, episode_seconds=seconds)
+        if protocol is not None:
+            cfg['workspace_start_protocol'] = protocol
+        (tmp_path / 'training_config.json').write_text(json.dumps(cfg))
+        with patch('sys.argv', ['eval', '--model', str(model)]):
+            args = eval_args()
+        assert args.workspace_start_protocol == (protocol or 'physical_entry_v1')
+        assert args.episode_seconds == seconds
+    with patch('sys.argv', ['eval', '--model', str(model), '--workspace-start-protocol', 'physical_entry_v1',
+                           '--episode-seconds', '15']):
+        args = eval_args()
+    assert args.workspace_start_protocol == 'physical_entry_v1' and args.episode_seconds == 15.

@@ -317,6 +317,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         target_workspace: str | Path | None = None,
         workspace_mask_key: str = "interior",
         workspace_entry_seconds: float = 8.,
+        workspace_start_protocol: str = "policy_from_initial_v2",
         workspace_reset_attempts: int = 50,
         workspace_reset_seed_pool: tuple[int, int] | None = None,
         replay_bank_dir: str | Path | None = None,
@@ -334,6 +335,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             start, count = workspace_reset_seed_pool
             if start < 0 or count < 1:
                 raise ValueError("Invalid workspace reset seed pool")
+        if workspace_start_protocol not in {"policy_from_initial_v2", "physical_entry_v1"}:
+            raise ValueError("Invalid workspace start protocol")
+        self._workspace_start_protocol = workspace_start_protocol
         self._workspace_reset_seed_pool = workspace_reset_seed_pool
         self._workspace = None
         self._workspace_entry_seconds = float(workspace_entry_seconds)
@@ -1939,7 +1943,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         else:
             from .workspace import NoWorkspaceTarget, prepare_workspace_entry
             requested_seed = seed
-            for attempt in range(self._workspace_reset_attempts):
+            attempts = (1 if self._workspace_start_protocol == "policy_from_initial_v2"
+                        else self._workspace_reset_attempts)
+            for attempt in range(attempts):
                 actual_seed = (None if requested_seed is None else
                                int(requested_seed) + attempt * 100003)
                 if attempt and requested_seed is not None and self._workspace_reset_seed_pool is not None:
@@ -1949,14 +1955,15 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 self.base_env.config.episode_seconds = self._workspace_episode_seconds
                 _, info = self.base_env.reset(randomize=True, seed=actual_seed)
                 try:
-                    prefix = prepare_workspace_entry(self.base_env, self._workspace,
-                        self._workspace_entry_seconds, self._workspace_episode_seconds)
+                    prefix = (0. if self._workspace_start_protocol == "policy_from_initial_v2"
+                        else prepare_workspace_entry(self.base_env, self._workspace,
+                            self._workspace_entry_seconds, self._workspace_episode_seconds))
                     self.goal.reset(actual_seed, options)
                 except NoWorkspaceTarget:
                     # Explicit material identities must never be replaced.
                     if (options or {}).get("goal_node_index") is not None or self.goal.fixed_index is not None:
                         raise
-                    if attempt + 1 == self._workspace_reset_attempts:
+                    if attempt + 1 == attempts:
                         raise
                     continue
                 self._workspace_reset_info = dict(
@@ -1966,7 +1973,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                     workspace_initial_goal_xyz=self.data.xpos[
                         self.base_env.cable_ids[self.goal.index]].tolist(),
                     workspace_mask=self._workspace.manifest())
-                self._workspace_inside_steps = self._workspace_sample_steps = 1
+                self._workspace_sample_steps = 1
+                self._workspace_inside_steps = int(self.goal.info()["workspace_goal_current_inside"])
                 info = self.base_env.info()
                 break
         self._episode_return = 0.0
@@ -2110,9 +2118,12 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
 
         self._episode_return += reward
         self._episode_steps += 1
-        if self._workspace is not None and self.goal.first_grasp_correct is None:
-            self._workspace_sample_steps += 1
-            self._workspace_inside_steps += int(self.goal.info()["workspace_goal_current_inside"])
+        if self._workspace is not None:
+            inside = self.goal.observe_workspace_goal()
+            if (self._workspace_start_protocol == "policy_from_initial_v2"
+                    or self.goal.first_grasp_correct is None):
+                self._workspace_sample_steps += 1
+                self._workspace_inside_steps += int(inside)
         info = self._augment_info(info, base_success=base_success)
         info.update(reward_components)
         info["episode_return"] = self._episode_return

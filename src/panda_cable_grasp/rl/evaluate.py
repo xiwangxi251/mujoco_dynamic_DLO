@@ -61,6 +61,7 @@ FAILURE_TYPES = (
 WORKSPACE_EPISODE_FIELDS = (
     "requested_seed", "workspace_reset_attempts", "workspace_reset_rejections",
     "workspace_prefix_seconds", "workspace_inside_fraction", "workspace_initial_goal_xyz",
+    "workspace_start_protocol", "workspace_goal_ever_inside", "workspace_goal_first_entry_seconds",
     "first_grasp_correct", "first_grasp_index",
 )
 
@@ -575,9 +576,12 @@ def _manifest(
         },
         "workspace_conditioning": (None if env._workspace is None else {
             "mask": env._workspace.manifest(),
-            "entry_seconds": env._workspace_entry_seconds,
+            "start_protocol": env._workspace_start_protocol,
+            "entry_seconds": (0. if env._workspace_start_protocol == "policy_from_initial_v2" else env._workspace_entry_seconds),
             "reset_attempts": env._workspace_reset_attempts,
-            "evaluation_population": "episodes with an eligible workspace goal; not an unconditional benchmark",
+            "evaluation_population": ("all requested episodes; goals sampled before motion, never-entered goals remain in denominator"
+                if env._workspace_start_protocol == "policy_from_initial_v2"
+                else "episodes with an eligible workspace goal; not an unconditional benchmark"),
         }),
         "episode_seed_rule": {
             "first_seed": args.seed,
@@ -961,6 +965,7 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         target_workspace=getattr(args, "target_workspace", None),
         workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
         workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
+        workspace_start_protocol=getattr(args, "workspace_start_protocol", "policy_from_initial_v2"),
         workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
         workspace_reset_seed_pool=getattr(args, 'workspace_reset_seed_pool', None),
         replay_bank_dir=getattr(args, "replay_bank_dir", None),
@@ -1415,6 +1420,7 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         target_workspace=getattr(args, "target_workspace", None),
         workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
         workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
+        workspace_start_protocol=getattr(args, "workspace_start_protocol", "policy_from_initial_v2"),
         workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
         workspace_reset_seed_pool=getattr(args, 'workspace_reset_seed_pool', None),
         replay_bank_dir=getattr(args, "replay_bank_dir", None),
