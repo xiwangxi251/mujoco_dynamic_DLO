@@ -232,7 +232,7 @@ def make_configured_env(
         target_workspace=getattr(args, "target_workspace", None),
         workspace_mask_key=getattr(args, "workspace_mask_key", "interior"),
         workspace_entry_seconds=getattr(args, "workspace_entry_seconds", 8.),
-        workspace_start_protocol=getattr(args, "workspace_start_protocol", "policy_from_initial_v2"),
+        workspace_start_protocol=getattr(args, "workspace_start_protocol", "policy_from_initial_v3"),
         workspace_reset_attempts=getattr(args, "workspace_reset_attempts", 50),
         workspace_reset_seed_pool=getattr(args, "workspace_reset_seed_pool", None),
         replay_bank_dir=getattr(args, "replay_bank_dir", None),
@@ -1559,9 +1559,11 @@ def main() -> None:
         "arm_acceleration_limit_enabled": args.controller_profile == "legacy",
         "target_workspace": (None if args.target_workspace is None else WorkspaceMask(args.target_workspace, args.workspace_mask_key).manifest()),
         "workspace_start_protocol": args.workspace_start_protocol,
+        "arm_motion_start_immediate": bool(args.target_workspace is not None
+            and args.workspace_start_protocol == "policy_from_initial_v3"),
         "workspace_goal_sampling": ("all_material_nodes_at_initial_state_v2"
-            if args.workspace_start_protocol == "policy_from_initial_v2" else "entry_workspace_nodes_v1"),
-        "workspace_entry_seconds": (0. if args.workspace_start_protocol == "policy_from_initial_v2" else args.workspace_entry_seconds),
+            if args.workspace_start_protocol != "physical_entry_v1" else "entry_workspace_nodes_v1"),
+        "workspace_entry_seconds": (0. if args.workspace_start_protocol != "physical_entry_v1" else args.workspace_entry_seconds),
         "workspace_reset_attempts": args.workspace_reset_attempts,
         "workspace_curriculum": args.workspace_curriculum,
         "workspace_scene_family": args.workspace_scene_family,

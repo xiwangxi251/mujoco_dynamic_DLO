@@ -106,7 +106,7 @@ class WorkspaceTargetNode(TargetNodeTask):
 
     def reset(self, seed, options):
         self.candidates = (np.arange(len(self.base.cable_ids))
-            if self.start_protocol == "policy_from_initial_v2" else
+            if self.start_protocol != "physical_entry_v1" else
             np.flatnonzero(self.workspace.contains(self.base.data.xpos[self.base.cable_ids])))
         if not len(self.candidates):
             raise NoWorkspaceTarget("No material node inside the selected workspace")
@@ -238,11 +238,11 @@ def add_workspace_arguments(parser):
     parser.add_argument("--target-workspace", type=Path, help="NPZ containing xs, ys and the selected XY mask")
     parser.add_argument("--workspace-mask-key", default="interior")
     parser.add_argument("--workspace-start-protocol",
-                        choices=("policy_from_initial_v2", "physical_entry_v1"),
-                        default="policy_from_initial_v2",
-                        help="v2: policy starts immediately, all material nodes eligible; v1: archived entry-conditioned protocol")
+                        choices=("policy_from_initial_v3", "policy_from_initial_v2", "physical_entry_v1"),
+                        default="policy_from_initial_v3",
+                        help="v3: initial-state policy and immediate arm commands; v2/v1: archived startup protocols")
     parser.add_argument("--workspace-entry-seconds", type=float, default=8.,
-                        help="legacy physical_entry_v1 only; v2 never performs an entry wait")
+                        help="legacy physical_entry_v1 only; initial-state protocols never perform an entry wait")
     parser.add_argument("--workspace-reset-attempts", type=int, default=50,
                         help="maximum conditioned reset attempts; use 1 to prohibit seed fallback")
     parser.add_argument("--replay-bank-dir", type=Path)

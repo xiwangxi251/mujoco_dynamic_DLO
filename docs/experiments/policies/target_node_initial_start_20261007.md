@@ -7,7 +7,7 @@ node entered the workspace, then selected a goal and started PPO. This prevented
 learning or evaluating observation, waiting and approach before entry. The user
 accepted that some assigned nodes may never enter, provided most have opportunities.
 
-## Current default: `policy_from_initial_v2`
+## Current default: `policy_from_initial_v3`
 
 - Reset initializes the requested scene/seed once and immediately returns the first
   policy observation. It does not call `prepare_workspace_entry` or a hidden control
@@ -88,3 +88,28 @@ Clear old time-budget evaluation pass history while preserving the checkpoint
 stage and learning schedules. Record the actual checkpoint and code commit in
 the launch manifest. Saved intermediate weights still inherit their recorded
 23-second duration when reproducing that experiment.
+
+
+## Executor startup correction (2026-10-07 15:30 audit)
+
+The v2 wrapper starts PPO at time zero but the inherited base executor still
+replaces rigid/combined arm commands with ready targets until 0.82 seconds.
+This contradicts the initial-state control contract. `policy_from_initial_v3`
+sets the task-scoped `arm_motion_start_immediate` flag so `_arm_motion_start_time`
+returns zero and the first requested arm command enters the original limit/guard
+pipeline. It does not remove joint speed/position limits, table protection,
+change cable drive timing, extend the 15-second episode, add observations,
+force an upward action or alter rewards/physics/success/curriculum gates.
+
+Default base environments retain `arm_motion_start_immediate=False`.
+`physical_entry_v1` and saved `policy_from_initial_v2` remain selectable for
+archived reproduction, including their executor delay. The v3 protocol and
+actual executor flag are recorded in training configuration. Tests check the
+actual requested arm target at t=0 for all three protocols, plus historical
+saved evaluation inheritance. Safely resume the latest complete checkpoint in
+a new run, preserve stage and cumulative schedules, and clear only evaluation
+pass history across this execution protocol change.
+
+This is a proven execution inconsistency, not proof that the 0.82-second delay
+causes all low success. The current stage-4 evaluations remain weak in shape,
+combined and complex-static tasks; reward weights and exploration are unchanged.

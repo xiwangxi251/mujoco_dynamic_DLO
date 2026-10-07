@@ -358,6 +358,8 @@ class EnvConfig:
     # arm_motion_start_delay 秒后才放开机械臂目标，模拟"接住已经在
     # 运动中的物体"。rigid/combined 仍用固定的 RIGID_MOTION_START_TIME。
     arm_motion_start_delay: float = 0.0
+    # Opt-in initial-state policy execution; archived benchmarks keep the delay.
+    arm_motion_start_immediate: bool = False
 
     # rigid 轨迹控制参数
     rigid_path_position_gain: float = 20.0
@@ -2270,6 +2272,8 @@ class CableGraspEnv:
 
     def _arm_motion_start_time(self) -> float:
         """Release arm joint targets one control cycle after rigid motion starts."""
+        if self.config.arm_motion_start_immediate:
+            return 0.0
         if self.config.motion_mode not in {"rigid", "combined"}:
             return float(self.config.arm_motion_start_delay)
         control_dt = float(

@@ -283,7 +283,7 @@ def test_initial_policy_reset_does_not_advance_or_fallback_when_all_nodes_outsid
         assert info['requested_seed'] == info['actual_seed'] == info['episode_seed'] == 81
         assert info['workspace_reset_attempts'] == 1 and info['workspace_reset_rejections'] == 0
         assert info['workspace_prefix_seconds'] == 0.
-        assert info['workspace_start_protocol'] == 'policy_from_initial_v2'
+        assert info['workspace_start_protocol'] == 'policy_from_initial_v3'
         assert info['workspace_candidate_count'] == 40 and env.goal.index == 39
         assert not info['workspace_goal_ever_inside'] and info['workspace_goal_first_entry_seconds'] is None
         np.testing.assert_array_equal(env._episode_initial_cable_z,
@@ -323,7 +323,7 @@ def test_workspace_entry_is_latched_without_switching_goal(mask_path):
 def test_initial_start_and_episode_budget_defaults_preserve_explicit_legacy_options():
     with patch('sys.argv', ['train', '--target-node-task']):
         args = parse_args()
-    assert args.workspace_start_protocol == 'policy_from_initial_v2' and args.episode_seconds == 15.
+    assert args.workspace_start_protocol == 'policy_from_initial_v3' and args.episode_seconds == 15.
     with patch('sys.argv', ['train', '--target-node-task', '--workspace-start-protocol', 'physical_entry_v1']):
         args = parse_args()
     assert args.episode_seconds == 15.
@@ -335,7 +335,7 @@ def test_saved_evaluation_keeps_start_protocol_and_budget(tmp_path, mask_path):
     model = tmp_path / 'model.zip'
     saved = dict(target_node_task=True, target_workspace=WorkspaceMask(mask_path).manifest(),
                  workspace_scene_family='cable_x075_v1', episode_seconds=15., workspace_entry_seconds=8.)
-    for protocol, seconds in [(None, 15.), ('policy_from_initial_v2', 15.), ('policy_from_initial_v2', 23.)]:
+    for protocol, seconds in [(None, 15.), ('policy_from_initial_v2', 15.), ('policy_from_initial_v2', 23.), ('policy_from_initial_v3', 15.)]:
         cfg = dict(saved, episode_seconds=seconds)
         if protocol is not None:
             cfg['workspace_start_protocol'] = protocol
@@ -348,3 +348,27 @@ def test_saved_evaluation_keeps_start_protocol_and_budget(tmp_path, mask_path):
                            '--episode-seconds', '15']):
         args = eval_args()
     assert args.workspace_start_protocol == 'physical_entry_v1' and args.episode_seconds == 15.
+
+
+@pytest.mark.parametrize('protocol,immediate', [
+    ('policy_from_initial_v3', True), ('policy_from_initial_v2', False), ('physical_entry_v1', False)])
+def test_initial_protocol_releases_actual_arm_command_at_time_zero(mask_path, protocol, immediate):
+    env = make_rl_env(robot='nero', action_mode='task_space_vertical_down',
+        scenario_names=['dev_combined_l1_nominal_x075_v1'], episode_seconds=.04,
+        target_workspace=mask_path, workspace_start_protocol=protocol, workspace_entry_seconds=0.,
+        rl_config=RLConfig(target_node_task=True))
+    try:
+        _, info = env.reset(seed=81, options={'goal_node_index': 20})
+        assert env.data.time == 0.
+        assert env.base_env.config.arm_motion_start_immediate is immediate
+        assert info['arm_motion_delayed'] is (not immediate)
+        assert info['arm_motion_start_time'] == pytest.approx(0. if immediate else .82)
+        requested = env.base_env.ready_ctrl.copy()
+        requested[0] += .001
+        applied = env.base_env._limit_robot_action(requested)
+        if immediate:
+            assert abs(applied[0] - env.base_env.ready_ctrl[0]) > 1e-12
+        else:
+            np.testing.assert_array_equal(applied[:7], env.base_env.ready_ctrl[:7])
+    finally:
+        env.close()
