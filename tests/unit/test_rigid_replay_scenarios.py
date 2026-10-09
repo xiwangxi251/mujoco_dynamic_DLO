@@ -2,9 +2,38 @@ import unittest
 
 from panda_cable_grasp.env.environment import EnvConfig
 from panda_cable_grasp.scenarios import get_scenario, list_scenarios
+from panda_cable_grasp.scenarios.registry import SCENARIO_FAMILIES
 
 
 class ReplayScenarioRegistryTests(unittest.TestCase):
+    def test_x075_complex_replay_pairs_snapshot_shape_and_position(self) -> None:
+        name = "dev_rigid_replay_midshape_v1_x075_v1"
+        self.assertNotIn(name, SCENARIO_FAMILIES["cable_x075_v1"])
+        replay = get_scenario(name)
+        static = get_scenario("dev_static_midshape_v1_x075_v1")
+        self.assertEqual(replay.initial_shape_bank, static.initial_shape_bank)
+        self.assertEqual(replay.replay_bank, static.initial_shape_bank)
+        self.assertEqual(replay.initial_cable_center_x, static.initial_cable_center_x)
+        config = EnvConfig(**replay.to_env_overrides())
+        self.assertTrue(config.replay_use_snapshot_position)
+        self.assertFalse(get_scenario("id_rigid_replay_midshape_v1").replay_use_snapshot_position)
+
+    def test_x075_seventh_scene_has_complex_shape_and_simple_motion(self) -> None:
+        names = SCENARIO_FAMILIES["cable_x075_v1"]
+        self.assertEqual(len(names), 7)
+        self.assertEqual(names[-1], "dev_rigid_l1_midshape_v1_x075_v1")
+        simple = get_scenario("dev_rigid_l1_nominal_x075_v1")
+        complex_scene = get_scenario(names[-1])
+        static = get_scenario("dev_static_midshape_v1_x075_v1")
+        self.assertEqual(complex_scene.initial_shape_bank, static.initial_shape_bank)
+        self.assertEqual(complex_scene.motion_profile_version, simple.motion_profile_version)
+        self.assertEqual(complex_scene.motion_type, simple.motion_type)
+        self.assertEqual(complex_scene.frequency_scale, simple.frequency_scale)
+        self.assertEqual(complex_scene.amplitude_level, simple.amplitude_level)
+        self.assertEqual(complex_scene.initial_cable_center_x, .75)
+        self.assertIsNone(complex_scene.replay_bank)
+        EnvConfig(**complex_scene.to_env_overrides())
+
     def test_replay_scenarios_registered_with_expected_banks(self) -> None:
         shape = get_scenario("id_rigid_replay_shape_nominal")
         combined = get_scenario("id_rigid_replay_combined_nominal")

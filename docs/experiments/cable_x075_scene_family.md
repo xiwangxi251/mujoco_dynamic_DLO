@@ -1,93 +1,78 @@
-# 指定点策略训练、测试场景族：`cable_x075_v1`
+# 场景族 `cable_x075_v1`
 
-## 用途与历史实验归属（2026-10-04）
+用于规则方法及指定点策略的训练、测试。初始 X 摆放基准为 0.75 m，
+靠近当前工作区 X=0.60～0.84 m、Y=−0.22～0.30 m。
 
-本场景族目前用于**指定点策略的后续训练和测试**。它将线缆初始 X
-摆放基准从原来的约 0.620 m 调整到 0.750 m，使线缆分布更接近当前
-选定的机械臂工作区（X=0.60～0.84 m、Y=−0.22～0.30 m）。
-这是独立的摆放场景族，不改变指定材料点任务、策略动作接口或成功标准。
+## 当前七场景（2026-10-09）
 
-**此前的权重、训练运行和实验结果仍使用旧场景定义。**新增场景族不改变
-这些历史产物的场景归属，不修改其冻结源码、训练配置、轨迹库或已有统计。
-旧权重若在本场景族测试，须记录为一次新的评测，不能归入原实验结果；
-以旧权重初始化新族训练时，也须单独记录新的训练运行和场景列表。
+场景名称按三个维度说明：**初始形状、整体运动、形状变化**。
+“简单整体运动”指预设单程平移和有限转动；“复杂整体运动”指轨迹库中的
+位移、转角回放。这是运动规则的区分，不是经过测量的难度评级。
+“无形状变化”指没有自主形变驱动，仍允许接触造成的物理变形。
 
-后续使用本场景族时，训练和测试应显式选择下面六个 `dev_*_x075_v1`
-名称，记录场景 ID/hash、种子及轨迹库来源。当前原 PPO 训练入口的六场景
-列表保留原设置，尚未自动切换到新族。代码中的 `DEV` 分区标识这批独立
-开发场景，并不妨碍显式选择它们进行指定点策略训练和测试。
+| 场景 | 初始形状 | 整体运动 | 形状变化 |
+| --- | --- | --- | --- |
+| `dev_static_x075_v1` | 简单 | 无 | 无 |
+| `dev_rigid_l1_nominal_x075_v1` | 简单 | 简单 | 无 |
+| `dev_shape_nominal_current_x075_v1` | 简单 | 无 | 有 |
+| `dev_combined_l1_nominal_x075_v1` | 简单 | 简单 | 有 |
+| `dev_static_midshape_v1_x075_v1` | 复杂 | 无 | 无 |
+| `dev_rigid_replay_shape_nominal_x075_v1` | 简单 | 复杂 | 无 |
+| `dev_rigid_l1_midshape_v1_x075_v1` | 复杂 | 简单 | 无 |
 
-## 六场景定义
+第七项改为**复杂初始形状＋简单整体运动＋无形状变化**。
 
-Separate development family requested on 2026-10-04. Select its scene names
-explicitly; the original PPO training scene list is unchanged.
+- 初始构型取自 `replay_src_shape_nominal_v1`；同种子与复杂静态场景选择
+  同一源条目、同一快照帧（有效时段的 30%～70%），中心化后的构型相同。
+- 整体运动沿用简单初始形状的简单整体运动：相同平移、转动规则、速度和
+  同种子旋转方向；机械臂默认在 0.82 s 解锁。没有自主形变驱动。
+- 摆放沿用简单整体运动的起点：质心 Y=−0.70 m，X 基准 0.75 m 加随机
+  偏移 ±0.10 m，并接受原有桌面扫掠检查。因此与复杂静态比较时，
+  **构型相同，绝对位置不要求相同**。
+- 沿用简单整体运动的形状保持控制；不启用轨迹回放的刚化焊接约束。
 
-| Original scene | New scene |
-| --- | --- |
-| `id_static` | `dev_static_x075_v1` |
-| `id_rigid_l1_nominal` | `dev_rigid_l1_nominal_x075_v1` |
-| `id_shape_nominal_current` | `dev_shape_nominal_current_x075_v1` |
-| `id_combined_l1_nominal` | `dev_combined_l1_nominal_x075_v1` |
-| `id_static_midshape_v1` | `dev_static_midshape_v1_x075_v1` |
-| `id_rigid_replay_shape_nominal` | `dev_rigid_replay_shape_nominal_x075_v1` |
+## 位置与轨迹库
 
-- New family: `initial_cable_center_x=0.75` m, retaining random X offset
-  ±0.10 m. Initial random center request is 0.65–0.85 m for ordinary scenes,
-  subject to the existing table sweep/placement checks.
-- Original scenes and default `EnvConfig`: override is `None`, preserving
-  original model and bank positions exactly.
-- Bank scenes: shift the source positions by `0.75 - source_basis_x`.
-  Existing banks without basis metadata use their original 0.62 m basis.
-  Thus their snapshots retain source drift and random displacement; their
-  individual centers are not forced to 0.75 m.
-- Bank files remain intact. Newly generated banks record
-  `source_initial_cable_center_x` to prevent a second shift when loaded.
-- Motion definitions, random draws, cable material, Y/Z positions and robot
-  controls are inherited from the corresponding original scenes.
-- This family is registered under the DEV split with separate scenario
-  identities. Generic registry `all`/`motion_sweep` lists include these
-  development variants; the explicit PPO six-scene list is unchanged.
+- 原六场景定义及身份标识保持不变；原始非摆放变体保留原位置。
+- 静态快照和整体回放加载旧库时，按 `0.75-source_basis_x` 平移 X。
+  旧库缺少基准元数据时使用 0.62 m；保留源轨迹的随机位移。
+  新第七项只使用库的构型，位置按上述简单整体运动起点设置。
+- 不覆盖、不重录旧库。训练库为 300 条；近期配对评测库为 50 条；
+  实际使用哪个库由 `replay_bank_dir` 决定。本族使用 50 Hz 兼容库。
+- 近期 50 条库目录：
+  `outputs/rl/train/ppo_nero_targetnode_state6_warmstart3m_20260928/eval_banks`。
+- 工作区仅按具体策略配置使用；本次场景调整不改变材料、成功标准或控制器。
 
-Example:
+## 训练与历史兼容
 
-```python
-from panda_cable_grasp.scenarios.registry import (
-    SCENARIO_FAMILIES, get_scenario,
-)
-from panda_cable_grasp.env.environment import CableGraspEnv, EnvConfig
+指定点 PPO 新训练默认选择当前七场景；`legacy_ppo_six` 保留旧六场景。
+课程前五阶段保持原比例，最后两阶段将原第六项总权重 0.30 分为
+第六项 0.15、第七项 0.15；阶段数量及运动难度不变。
 
-names = SCENARIO_FAMILIES["cable_x075_v1"]
-scene = get_scenario(names[0])
-env = CableGraspEnv(EnvConfig(
-    robot="nero", scenario_name=scene.name,
-    scenario_id=scene.scenario_id, scenario_split=scene.split.value,
-    **scene.to_env_overrides(),
-))
-```
+旧权重按保存的场景列表及课程评测；保存了旧七场景的配置仍可使用原列表。
+续训时若列表发生变化，拒绝直接恢复旧课程状态。旧权重在当前新族测试，
+须另记新评测。记录完整场景列表、ID/hash、种子、库来源及源码版本。
 
-Bank scenes additionally require the same compatible replay bank directory
-and seed selection used by their original counterparts.
+旧第七项 `dev_rigid_replay_midshape_v1_x075_v1` 继续注册，定义和身份标识
+不变，**不在当前七场景族中**。它属于复杂初始形状＋复杂整体运动＋无形状变化：
+初始位置与复杂静态快照配对，随后从源轨迹 t=0 回放位移和转角。
+历史录像、冻结源码及统计保留原归属，不能作为新第七项的结果。
 
-Verification: all 53 pre-existing scenario hashes remain identical; the six
-original scenes' initial full MuJoCo states exactly match the archived
-videos at seed 20260804. Each new variant is translated +0.13 m in X,
-within 4e-9 m numerical error. Report:
-`outputs/vertical_workspace/scripted_136_retest_20261004/cable_ppo_six_scenes/cable_x075_v1/verification.json`.
-## 当前布置录像与轨迹库来源
+## 已有录像
 
-已录制本场景族六场景各 20 回合，共 120 回合；配对种子为
-20260804～20260823，每回合提供俯视、全局和腕部三种视角。
-机械臂固定，未运行指定点策略，也未执行 PPO 工作区条件筛选。
-这些录像用于检查线缆活动范围与黄色工作区的关系，**不属于策略训练或
-策略成功率评测结果**。
+- 原六场景的布置检查：各 20 回合，种子 20260804～20260823，机械臂固定。
+  `outputs/vertical_workspace/scripted_136_retest_20261004/cable_x075_20episodes/index.html`。
+  此批只用于查看线缆与工作区的位置关系，不是策略成功率评测。
+- 原七场景的规则方法评测：各 10 回合，种子 20260804～20260813。
+  `outputs/scripted_seven_default_20261009/index.html`。
+  其中第七项是上述历史复杂整体运动场景。
+- 闭爪硬超时修复后的形状变化 10 回合：
+  `outputs/scripted_shape_close_deadline_20261009/index.html`。
+- 当前新第七项尚无抓取成功率和评测录像；页面已明确标注历史场景。
 
-当前复杂静态和刚体回放仍使用原轨迹库
-`replay_src_shape_nominal_v1`。加载时将绝对摆位向 +X 平移 0.13 m；
-构型与相对运动参考沿用旧库，未从新族重新生成形变源轨迹。
-本批录像使用的库目录为
-`outputs/rl/train/ppo_nero_targetnode_state6_warmstart3m_20260928/eval_banks`。
-后续训练、测试须明确记录所用库及其摆放基准；重新生成参考源库时
-应另存版本，不能覆盖旧实验使用的库。
+注册入口：`SCENARIO_FAMILIES["cable_x075_v1"]`；
+场景参数：`get_scenario(name).to_env_overrides()`。
 
-- 新族录像：`outputs/vertical_workspace/scripted_136_retest_20261004/cable_x075_20episodes/index.html`
-- 原摆放录像：`outputs/vertical_workspace/scripted_136_retest_20261004/cable_ppo_six_scenes/index.html`
+验证：原有 60 个场景 ID 全部保留；实际评测库的 20260804～20260813
+十个种子均通过初始化、快照构型及运动规则配对检查，中心化构型最大差异
+小于 6e-16 m。记录：`outputs/tmp/complex_simple_motion_20261009/verification.json`。

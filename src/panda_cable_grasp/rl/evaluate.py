@@ -222,15 +222,16 @@ def configure_target_evaluation(env, args, model=None):
     if env.goal is not None and getattr(args, 'saved_stage_evaluation', False):
         if saved.get('workspace_curriculum'):
             from .target_defaults import saved_curriculum_stage
-            from .workspace import WORKSPACE_STAGES
+            from .workspace import workspace_stages
             stage, source = saved_curriculum_stage(args.model, saved, model)
-            if not 0 <= stage < len(WORKSPACE_STAGES):
-                raise ValueError('Invalid saved curriculum stage')
             names = tuple(saved['training_scenario_names'])
-            env.set_training_scenario_distribution(names, WORKSPACE_STAGES[stage][1])
-            env.set_motion_difficulty(WORKSPACE_STAGES[stage][2])
+            stages = saved.get('workspace_stages') or workspace_stages(names)
+            if not 0 <= stage < len(stages):
+                raise ValueError('Invalid saved curriculum stage')
+            env.set_training_scenario_distribution(names, stages[stage][1])
+            env.set_motion_difficulty(stages[stage][2])
             args.resolved_evaluation_stage = dict(stage=stage, source=source,
-                weights=WORKSPACE_STAGES[stage][1], motion_difficulty=WORKSPACE_STAGES[stage][2])
+                weights=stages[stage][1], motion_difficulty=stages[stage][2])
         elif saved.get('eval_scenario_names'):
             env.set_training_scenario_distribution(tuple(saved['eval_scenario_names']),
                 saved.get('eval_scenario_weights'))
@@ -1605,6 +1606,13 @@ def parse_args() -> argparse.Namespace:
         args.scenario_names = resolve_scenario_names(
             args.scenario, args.distribution or "l1",
         )
+    if args.saved_stage_evaluation:
+        saved = args.saved_evaluation_config
+        names = (saved.get('training_scenario_names') if saved.get('workspace_curriculum')
+                 else saved.get('eval_scenario_names'))
+        if names:
+            args.scenario_names = list(names)
+            args.distribution = None
     return args
 
 

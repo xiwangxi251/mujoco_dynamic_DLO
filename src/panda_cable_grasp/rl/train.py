@@ -240,15 +240,16 @@ def make_configured_env(
     )
     env.base_env.config.contact_read_cache_enabled = getattr(args, 'contact_read_cache', True)
     if getattr(args, "workspace_curriculum", False):
-        from .workspace import WORKSPACE_STAGES, WorkspaceCurriculumCallback
+        from .workspace import WorkspaceCurriculumCallback
         # SB3 resets environments before callback startup; resumed first episodes
         # must already use the restored curriculum distribution.
-        stage = WorkspaceCurriculumCallback(
+        curriculum = WorkspaceCurriculumCallback(
             args.training_scenario_names, args.output / "evaluation/workspace_curriculum.json",
             resume=getattr(args, "resume", None) is not None,
-        ).stage_index
-        env.set_training_scenario_distribution(tuple(args.training_scenario_names), WORKSPACE_STAGES[stage][1])
-        env.set_motion_difficulty(WORKSPACE_STAGES[stage][2])
+        )
+        stage = curriculum.stages[curriculum.stage_index]
+        env.set_training_scenario_distribution(tuple(args.training_scenario_names), stage[1])
+        env.set_motion_difficulty(stage[2])
     if pointcloud:
         return DLOPointCloudObservation(env, pointcloud_config_from_args(args))
     return env
@@ -1508,7 +1509,8 @@ def main() -> None:
             seed_pool_size=args.eval_seed_pool_size,
         ))
     callbacks = CallbackList(callback_items)
-    from .workspace import WorkspaceMask, WORKSPACE_STAGES
+    from .workspace import WorkspaceMask, workspace_stages
+    resolved_workspace_stages = workspace_stages(args.training_scenario_names) if args.workspace_curriculum else None
     from .affinity import bind_learner
     bind_learner(args)
     configuration = {
@@ -1567,7 +1569,7 @@ def main() -> None:
         "workspace_reset_attempts": args.workspace_reset_attempts,
         "workspace_curriculum": args.workspace_curriculum,
         "workspace_scene_family": args.workspace_scene_family,
-        "workspace_stages": (WORKSPACE_STAGES if args.workspace_curriculum else None),
+        "workspace_stages": resolved_workspace_stages,
         "replay_bank_dir": (str(args.replay_bank_dir.resolve()) if args.replay_bank_dir else None),
         "replay_seed_fallback": args.replay_seed_fallback,
         "eval_replay_bank_dir": str(args.eval_replay_bank_dir.resolve()) if args.eval_replay_bank_dir else None,
@@ -1719,9 +1721,9 @@ def main() -> None:
         ),
     }
     if args.workspace_curriculum:
-        configuration["curriculum_stages"] = WORKSPACE_STAGES
+        configuration["curriculum_stages"] = resolved_workspace_stages
         configuration["curriculum_training_mixes"] = [
-            list(zip(args.training_scenario_names, stage[1])) for stage in WORKSPACE_STAGES
+            list(zip(args.training_scenario_names, stage[1])) for stage in resolved_workspace_stages
         ]
         configuration["curriculum_required_evals"] = "2 passing evaluations in last 3"
         configuration["curriculum_success_rate"] = .40

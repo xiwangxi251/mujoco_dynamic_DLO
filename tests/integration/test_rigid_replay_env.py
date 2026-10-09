@@ -174,6 +174,79 @@ class ReplayPairingTests(unittest.TestCase):
     def make_replay_env(self) -> CableGraspEnv:
         return CableGraspEnv(self.replay_config)
 
+    def test_complex_simple_motion_pairs_shape_and_motion_independently(self) -> None:
+        environments = []
+        try:
+            for name in (
+                "dev_static_midshape_v1_x075_v1", "dev_rigid_l1_nominal_x075_v1",
+                "dev_rigid_l1_midshape_v1_x075_v1",
+            ):
+                config = env_config_for_scenario(get_scenario(name), seed=0, episode_seconds=4.)
+                if config.initial_shape_bank:
+                    config.initial_shape_bank = BANK_NAME
+                    config.replay_bank_dir = str(self.bank_dir)
+                    config.replay_seed_fallback = "error"
+                env = CableGraspEnv(config)
+                environments.append(env)
+                env.reset(randomize=True, seed=SEED)
+            static, simple, complex_scene = environments
+            self.assertEqual(static._initial_shape_step, complex_scene._initial_shape_step)
+            self.assertEqual(static._initial_shape_entry, complex_scene._initial_shape_entry)
+            static_xyz = static.data.xpos[static.cable_ids].copy()
+            complex_xyz = complex_scene.data.xpos[complex_scene.cable_ids].copy()
+            np.testing.assert_allclose(
+                static_xyz - static_xyz.mean(axis=0),
+                complex_xyz - complex_xyz.mean(axis=0), atol=1e-10, rtol=0,
+            )
+            self.assertAlmostEqual(float(complex_xyz[:, 1].mean()), -.70)
+            self.assertEqual(simple._rigid_motion_rotation_sign, complex_scene._rigid_motion_rotation_sign)
+            self.assertEqual(simple.rng.bit_generator.state, complex_scene.rng.bit_generator.state)
+            self.assertEqual(simple._arm_motion_start_time(), complex_scene._arm_motion_start_time())
+            self.assertAlmostEqual(complex_scene._arm_motion_start_time(), .82)
+            for t in (0., .8, 1., 2., 4.):
+                np.testing.assert_array_equal(simple._rigid_motion_target(t), complex_scene._rigid_motion_target(t))
+                self.assertEqual(simple._rigid_motion_rotation_target(t), complex_scene._rigid_motion_rotation_target(t))
+            self.assertFalse(np.any(complex_scene.data.eq_active[complex_scene._replay_weld_eq_ids]))
+            for _ in range(int(1. / self.control_dt)):
+                complex_scene.step(complex_scene.ready_ctrl)
+            self.assertEqual(complex_scene.info()["shape_acceleration_rms"], 0.)
+            self.assertGreater(float(complex_scene.data.xpos[complex_scene.cable_ids, 1].mean() - complex_xyz[:, 1].mean()), .01)
+        finally:
+            for env in environments:
+                env.close()
+
+    def test_x075_complex_static_and_replay_share_initial_geometry(self) -> None:
+        environments = []
+        try:
+            for name in ("dev_static_midshape_v1_x075_v1", "dev_rigid_replay_midshape_v1_x075_v1"):
+                config = env_config_for_scenario(get_scenario(name), seed=0, episode_seconds=4.)
+                config.initial_shape_bank = BANK_NAME
+                if config.replay_bank:
+                    config.replay_bank = BANK_NAME
+                config.replay_bank_dir = str(self.bank_dir)
+                config.replay_seed_fallback = "error"
+                env = CableGraspEnv(config)
+                environments.append(env)
+                env.reset(randomize=True, seed=SEED)
+            static, replay = environments
+            self.assertEqual(static._initial_shape_step, replay._initial_shape_step)
+            self.assertEqual(static._initial_shape_entry, replay._replay_entry)
+            xyz0 = static.data.xpos[static.cable_ids].copy()
+            np.testing.assert_allclose(xyz0, replay.data.xpos[replay.cable_ids], atol=1e-10, rtol=0)
+            self.assertGreater(np.linalg.norm(replay._initial_shape_com - replay._replay_placed_com), .01)
+            self.assertTrue(np.all(replay.data.eq_active[replay._replay_weld_eq_ids]))
+            self.assertFalse(np.any(static.data.eq_active[static._replay_weld_eq_ids]))
+            pair0 = np.linalg.norm(xyz0[:, None] - xyz0[None, :], axis=-1)
+            for _ in range(int(1. / self.control_dt)):
+                replay.step(replay.ready_ctrl)
+            xyz1 = replay.data.xpos[replay.cable_ids]
+            pair1 = np.linalg.norm(xyz1[:, None] - xyz1[None, :], axis=-1)
+            self.assertLess(float(np.abs(pair1 - pair0).max()), .01)
+            self.assertGreater(float(replay._replay_elapsed), .5)
+        finally:
+            for env in environments:
+                env.close()
+
     def test_paired_seed_produces_identical_initial_state(self) -> None:
         env = self.make_replay_env()
         try:

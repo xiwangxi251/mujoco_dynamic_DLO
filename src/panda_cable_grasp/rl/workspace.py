@@ -7,10 +7,12 @@ import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 from .target_node import TargetNodeTask
-from ..scenarios.registry import CABLE_X075_SOURCE_NAMES, SCENARIO_FAMILIES
+from ..scenarios.registry import (
+    CABLE_X075_REPLAY_SCENARIO_NAMES, LEGACY_PPO_SIX_SOURCE_NAMES, SCENARIO_FAMILIES,
+)
 
 WORKSPACE_SCENE_FAMILIES = {
-    "legacy_ppo_six": CABLE_X075_SOURCE_NAMES,
+    "legacy_ppo_six": LEGACY_PPO_SIX_SOURCE_NAMES,
     "cable_x075_v1": SCENARIO_FAMILIES["cable_x075_v1"],
 }
 DEFAULT_TARGET_WORKSPACE = Path(__file__).with_name("workspaces") / "rectangle_060_084_m022_030.npz"
@@ -24,6 +26,21 @@ WORKSPACE_STAGES = (
     ("six_scenes_replay_low", (.1,.1,.1,.1,.3,.3), 1/3),
     ("six_scenes_full", (.1,.1,.1,.1,.3,.3), 1.),
 )
+
+
+def workspace_stages(scene_names):
+    """Keep archived mixes; share the final comparison mass across seven scenes."""
+    if len(scene_names) == 6:
+        return WORKSPACE_STAGES
+    if tuple(scene_names) not in (
+        WORKSPACE_SCENE_FAMILIES["cable_x075_v1"], CABLE_X075_REPLAY_SCENARIO_NAMES,
+    ):
+        raise ValueError("Workspace curriculum requires six ordered scenes or cable_x075_v1")
+    return tuple(
+        (name.replace("six_scenes", "seven_scenes"),
+         weights[:5] + (weights[5] / 2, weights[5] / 2), difficulty)
+        for name, weights, difficulty in WORKSPACE_STAGES
+    )
 
 
 class NoWorkspaceTarget(ValueError):
@@ -168,9 +185,8 @@ class WorkspaceCurriculumCallback(BaseCallback):
     """Promote on first-correct >=60% and success >=40%, two of last three."""
     def __init__(self, scene_names, state_path, *, resume=False):
         super().__init__()
-        if len(scene_names) != 6:
-            raise ValueError("Workspace curriculum requires six ordered scenes")
         self.scene_names = tuple(scene_names)
+        self.stages = workspace_stages(self.scene_names)
         self.state_path = Path(state_path)
         self.phase_index = 0
         self.history = []
@@ -179,7 +195,7 @@ class WorkspaceCurriculumCallback(BaseCallback):
             if tuple(state["scene_names"]) != self.scene_names:
                 raise ValueError("Workspace curriculum scene family changed")
             self.phase_index, self.history = int(state["stage"]), state["history"]
-        if not 0 <= self.phase_index < len(WORKSPACE_STAGES):
+        if not 0 <= self.phase_index < len(self.stages):
             raise ValueError("Invalid saved workspace stage")
 
     @property
@@ -188,24 +204,24 @@ class WorkspaceCurriculumCallback(BaseCallback):
 
     @property
     def difficulty(self):
-        return WORKSPACE_STAGES[self.stage_index][2]
+        return self.stages[self.stage_index][2]
 
     def _apply(self):
         # Serialized with each PPO checkpoint, so an older checkpoint is not
         # evaluated using a later stage from the run's mutable curriculum file.
         self.model.target_evaluation_stage = self.stage_index
         self.training_env.env_method("set_training_scenario_distribution", self.scene_names,
-                                     WORKSPACE_STAGES[self.stage_index][1])
+                                     self.stages[self.stage_index][1])
         self.training_env.env_method("set_motion_difficulty", self.difficulty)
         self.logger.record("curriculum/stage", self.stage_index)
 
     def configure_evaluation_env(self, env):
         env.env_method("set_training_scenario_distribution", self.scene_names,
-                       WORKSPACE_STAGES[self.stage_index][1])
+                       self.stages[self.stage_index][1])
         env.env_method("set_motion_difficulty", self.difficulty)
 
     def restore_phase(self, phase_index):
-        if not 0 <= int(phase_index) < len(WORKSPACE_STAGES):
+        if not 0 <= int(phase_index) < len(self.stages):
             raise ValueError("Invalid workspace curriculum phase")
         if self.phase_index != int(phase_index):
             self.history = []
@@ -217,7 +233,7 @@ class WorkspaceCurriculumCallback(BaseCallback):
         self.logger.record("eval/first_grasp_correct_rate", metrics["first_grasp_correct_rate"])
         passed = metrics["first_grasp_correct_rate"] >= .60 and metrics["success_rate"] >= .40
         self.history = (self.history + [bool(passed)])[-3:]
-        if sum(self.history) >= 2 and self.stage_index < len(WORKSPACE_STAGES)-1:
+        if sum(self.history) >= 2 and self.stage_index < len(self.stages)-1:
             self.phase_index += 1
             self.history = []
             self._apply()

@@ -147,9 +147,10 @@ class ScenarioConfig:
     motion_profile_version: str = "factorized_v2"
     # rigid_replay_v1 场景专用的轨迹库名；非回放场景必须为 None。
     replay_bank: str | None = None
-    # static 场景专用的初始形状库名（与回放库同格式）：reset 时按 seed
+    # static / 简单整体运动 / 复杂整体回放的初始形状库名：reset 时按 seed
     # 取条目、在有效区间采一个中间帧构型作为初始线缆形状。
     initial_shape_bank: str | None = None
+    replay_use_snapshot_position: bool = False
     # None preserves the original model/bank placement. Used only by an
     # explicitly selected placement variant such as cable_x075_v1.
     initial_cable_center_x: float | None = None
@@ -282,11 +283,20 @@ class ScenarioConfig:
                         "replay_bank so the frozen shape snapshot and the "
                         "replayed motion share one source episode"
                     )
-            elif self.motion_type is not MotionType.STATIC:
+            elif self.motion_type is not MotionType.STATIC and not (
+                self.motion_type is MotionType.RIGID
+                and self.motion_profile_version == "rigid_level1_single_pass_v2"
+            ):
                 raise ValueError(
-                    "initial_shape_bank is only valid for static or "
-                    "rigid_replay_v1 scenarios"
+                    "initial_shape_bank requires static, simple rigid motion "
+                    "or rigid_replay_v1"
                 )
+        if not isinstance(self.replay_use_snapshot_position, bool):
+            raise TypeError("replay_use_snapshot_position must be bool")
+        if self.replay_use_snapshot_position and (
+            self.motion_profile_version != "rigid_replay_v1" or self.initial_shape_bank is None
+        ):
+            raise ValueError("replay_use_snapshot_position requires replay and initial_shape_bank")
         if not isinstance(self.cable_material_profile, str) or not _NAME_PATTERN.fullmatch(
             self.cable_material_profile
         ):
@@ -605,6 +615,7 @@ class ScenarioConfig:
             "gait_swim_speed": None,
             "replay_bank": None,
             "initial_shape_bank": None,
+            "replay_use_snapshot_position": False,
             "initial_cable_center_x": None,
             "arm_motion_start_delay": 0.0,
         }
@@ -653,6 +664,7 @@ class ScenarioConfig:
             "motion_profile_version": self.motion_profile_version,
             "replay_bank": self.replay_bank,
             "initial_shape_bank": self.initial_shape_bank,
+            "replay_use_snapshot_position": self.replay_use_snapshot_position,
             "initial_cable_center_x": self.initial_cable_center_x,
             "motion_regularity": self.regularity.value,
             "motion_frequency_scale": self.frequency_scale,
@@ -1285,27 +1297,53 @@ def _registered_scenarios() -> list[ScenarioConfig]:
     # Separate placement family: explicit names, never selected by the
     # original PPO six-scene list. Keep original scene identities intact.
     by_name = {scenario.name: scenario for scenario in scenarios}
-    for source_name, variant_name in zip(CABLE_X075_SOURCE_NAMES, CABLE_X075_SCENARIO_NAMES):
+    complex_simple = replace(
+        by_name["id_rigid_l1_nominal"],
+        name="id_rigid_l1_midshape_v1",
+        initial_shape_bank="replay_src_shape_nominal_v1",
+        description=(
+            "Complex initial snapshot shape with the same simple translation "
+            "and rotation rules as id_rigid_l1_nominal; no shape-change driver."
+        ),
+        tags=by_name["id_rigid_l1_nominal"].tags + ("initial_shape",),
+    )
+    scenarios.append(complex_simple)
+    by_name[complex_simple.name] = complex_simple
+    # Keep the former seventh scene registered with its original identity.
+    placements = list(zip(CABLE_X075_SOURCE_NAMES, CABLE_X075_SCENARIO_NAMES))
+    placements.append(("id_rigid_replay_midshape_v1", CABLE_X075_REPLAY_SCENARIO_NAMES[-1]))
+    for source_name, variant_name in placements:
         source = by_name[source_name]
         scenarios.append(replace(
             source,
             name=variant_name,
             split=ScenarioSplit.DEV,
             initial_cable_center_x=0.75,
-            description=f"{source_name} with initial X placement basis 0.75 m.",
+            replay_use_snapshot_position=source_name == "id_rigid_replay_midshape_v1",
+            description=(
+                "Complex snapshot shape and placement paired with dev_static_midshape_v1_x075_v1; "
+                "rigid motion replays the same source entry from t=0, with X placement basis 0.75 m."
+                if source_name == "id_rigid_replay_midshape_v1"
+                else f"{source_name} with initial X placement basis 0.75 m."
+            ),
             tags=source.tags + ("cable_x075_v1", "placement_variant"),
         ))
     return scenarios
 
 
 DEFAULT_SCENARIO_NAME = "id_shape_nominal_current"
-CABLE_X075_SOURCE_NAMES = (
+LEGACY_PPO_SIX_SOURCE_NAMES = (
     "id_static", "id_rigid_l1_nominal", "id_shape_nominal_current",
     "id_combined_l1_nominal", "id_static_midshape_v1", "id_rigid_replay_shape_nominal",
 )
+CABLE_X075_SOURCE_NAMES = LEGACY_PPO_SIX_SOURCE_NAMES + ("id_rigid_l1_midshape_v1",)
 CABLE_X075_SCENARIO_NAMES = tuple(
     "dev_" + name.removeprefix("id_") + "_x075_v1"
     for name in CABLE_X075_SOURCE_NAMES
+)
+# Saved runs using the former seven-scene list must keep their own curriculum.
+CABLE_X075_REPLAY_SCENARIO_NAMES = CABLE_X075_SCENARIO_NAMES[:6] + (
+    "dev_rigid_replay_midshape_v1_x075_v1",
 )
 SCENARIO_FAMILIES = {"cable_x075_v1": CABLE_X075_SCENARIO_NAMES}
 SCENARIO_REGISTRY = ScenarioRegistry(_registered_scenarios())
@@ -1481,6 +1519,8 @@ __all__ = [
     "CORE_SCENARIO_NAMES",
     "CABLE_X075_SOURCE_NAMES",
     "CABLE_X075_SCENARIO_NAMES",
+    "CABLE_X075_REPLAY_SCENARIO_NAMES",
+    "LEGACY_PPO_SIX_SOURCE_NAMES",
     "SCENARIO_FAMILIES",
     "DEFAULT_SCENARIO",
     "DEFAULT_SCENARIO_NAME",

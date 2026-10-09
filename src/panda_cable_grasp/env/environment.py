@@ -352,6 +352,8 @@ class EnvConfig:
     # replay_bank（midshape 回放：冻结快照与回放运动同源）；
     # initial_shape_time_range 为快照时刻在有效步数内的采样比例。
     initial_shape_bank: str | None = None
+    # New paired midshape replay uses the snapshot placement, not the source t=0 COM.
+    replay_use_snapshot_position: bool = False
     initial_shape_time_range: tuple[float, float] = (0.30, 0.70)
 
     # 非 rigid/combined 场景的机械臂启动延迟（秒）：线缆先自由运动
@@ -545,6 +547,10 @@ class EnvConfig:
             raise ValueError(
                 "replay_seed_fallback must be 'resample' or 'error'"
             )
+        if not isinstance(self.replay_use_snapshot_position, bool):
+            raise TypeError("replay_use_snapshot_position must be bool")
+        if self.replay_use_snapshot_position and (not uses_replay or self.initial_shape_bank is None):
+            raise ValueError("replay_use_snapshot_position requires replay and initial_shape_bank")
         if self.initial_shape_bank is not None:
             if (
                 self.motion_profile_version == REPLAY_MOTION_PROFILE
@@ -1975,8 +1981,12 @@ class CableGraspEnv:
                 desired_com_xy = base_com_xy + np.array([dx, dy])
                 self.initial_cable_translation[:] = [dx, dy]
             elif self._uses_replay_motion:
-                # 采用源回合实际落位，保证配对 seed 下与形变场景逐点一致。
-                desired_com_xy = self._replay_placed_com.copy()
+                # 普通回放取源起点位置；新复杂回放取快照位置，与复杂静态配对。
+                desired_com_xy = (
+                    self._initial_shape_com.copy()
+                    if self.config.replay_use_snapshot_position
+                    else self._replay_placed_com.copy()
+                )
                 self.initial_cable_translation[:] = (
                     desired_com_xy - base_com_xy
                 )
@@ -3477,7 +3487,7 @@ class CableGraspEnv:
 
         ``sweep`` 为 ``(path_xy, yaw)`` 采样序列；``None`` 时对象 0 沿用
         L1/L2 扫掠校验（``check_rigid_motion_sweep=True``），否则仅检查
-        静止构型占位。``tangents_override`` 非空时跳过参数化形状采样，
+        静止构型占位。``tangents_override`` 非空时覆盖参数化初始形状，
         直接使用给定的各段平面朝向角（如轨迹库中间帧构型）。
         """
 
@@ -3495,13 +3505,22 @@ class CableGraspEnv:
                     "tangents_override must contain node_count-1 angles, "
                     f"got {tangents.shape}"
                 )
+            if check_rigid_motion_sweep:
+                # Snapshot sampling uses an independent RNG. Consume the same
+                # preset-shape draws as the simple-shape counterpart so paired
+                # seeds retain its rotation direction and subsequent RNG state.
+                self._sample_initial_tangents(
+                    randomize, obj=obj if obj is not self._objects[0] else None,
+                )
             if obj is self._objects[0]:
                 self._rigid_initial_shape_family = "bank"
-                self._rigid_motion_rotation_sign = 1.0
+                if not check_rigid_motion_sweep:
+                    self._rigid_motion_rotation_sign = 1.0
                 self._rigid_initial_tangent_angles[: tangents.size] = tangents
             else:
                 obj.shape_family = "bank"
-                obj.rotation_sign = 1.0
+                if not check_rigid_motion_sweep:
+                    obj.rotation_sign = 1.0
                 obj.initial_tangent_angles = tangents
         root_quaternion = self.data.qpos[
             obj.free_qadr + 3:obj.free_qadr + 7

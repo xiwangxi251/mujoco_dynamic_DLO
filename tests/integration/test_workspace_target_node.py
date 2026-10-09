@@ -14,7 +14,7 @@ from panda_cable_grasp.rl.train import parse_args, make_configured_env, StrictSu
 from panda_cable_grasp.rl.evaluate import parse_args as eval_args, _episode_row, EpisodeDiagnostics
 from panda_cable_grasp.rl.workspace import (
     WorkspaceMask, NoWorkspaceTarget, WorkspaceCurriculumCallback,
-    WORKSPACE_STAGES, WORKSPACE_SCENE_FAMILIES, prepare_workspace_entry,
+    WORKSPACE_STAGES, WORKSPACE_SCENE_FAMILIES, prepare_workspace_entry, workspace_stages,
 )
 
 
@@ -168,13 +168,37 @@ def test_curriculum_two_of_three_and_saved_history(tmp_path):
     assert resumed.stage_index == 1 and resumed.history == []
     assert json.loads(path.read_text())['last_evaluation']['stage'] == 0
     assert WorkspaceCurriculumCallback(names, path).stage_index == 0
-    for stage, (_, weights, difficulty) in enumerate(WORKSPACE_STAGES):
+    for stage, (_, weights, difficulty) in enumerate(workspace_stages(names)):
         resumed.restore_phase(stage)
         assert abs(sum(weights)-1.) < 1e-12
         vec = Mock()
         resumed.configure_evaluation_env(vec)
         vec.env_method.assert_any_call('set_training_scenario_distribution', tuple(names), weights)
         vec.env_method.assert_any_call('set_motion_difficulty', difficulty)
+
+
+def test_expanded_family_preserves_legacy_curriculum_and_rejects_silent_resume(tmp_path):
+    from panda_cable_grasp.scenarios.registry import CABLE_X075_REPLAY_SCENARIO_NAMES
+    names = WORKSPACE_SCENE_FAMILIES['cable_x075_v1']
+    assert len(WORKSPACE_SCENE_FAMILIES['legacy_ppo_six']) == 6
+    assert workspace_stages(names[:6]) == WORKSPACE_STAGES
+    stages = workspace_stages(names)
+    for old, new in zip(WORKSPACE_STAGES, stages):
+        assert new[1][:5] == old[1][:5]
+        assert sum(new[1][5:]) == old[1][5]
+        assert len(new[1]) == len(names)
+        assert new[2] == old[2]
+    assert stages[-1][1][-2:] == (.15, .15)
+    path = tmp_path / 'state.json'
+    path.write_text(json.dumps(dict(scene_names=names[:6], stage=5, history=[])))
+    with pytest.raises(ValueError, match='scene family changed'):
+        WorkspaceCurriculumCallback(names, path, resume=True)
+    path.write_text(json.dumps(dict(scene_names=CABLE_X075_REPLAY_SCENARIO_NAMES, stage=5, history=[])))
+    archived = WorkspaceCurriculumCallback(CABLE_X075_REPLAY_SCENARIO_NAMES, path, resume=True)
+    assert archived.scene_names[-1] == 'dev_rigid_replay_midshape_v1_x075_v1'
+    assert archived.stages == stages
+    with pytest.raises(ValueError, match='scene family changed'):
+        WorkspaceCurriculumCallback(names, path, resume=True)
 
 
 def test_formal_training_factory_and_strict_eval_use_workspace(mask_path, tmp_path):
@@ -211,7 +235,7 @@ def test_formal_training_factory_and_strict_eval_use_workspace(mask_path, tmp_pa
     resumed = make_configured_env(args, seed=81, scenario_names=args.training_scenario_names)
     try:
         assert resumed._motion_difficulty == 1.
-        np.testing.assert_allclose(resumed._active_scenario_probabilities, WORKSPACE_STAGES[3][1])
+        np.testing.assert_allclose(resumed._active_scenario_probabilities, workspace_stages(args.training_scenario_names)[3][1])
     finally:
         resumed.close()
 
@@ -240,11 +264,12 @@ def test_replay_settings_are_applied_before_constructor_reset(tmp_path):
     env.close()
 
 
-def test_evaluation_family_resolves_six_new_scenes():
+def test_evaluation_family_resolves_seven_new_scenes():
     with patch('sys.argv', ['eval', '--model', 'model.zip',
                             '--workspace-scene-family', 'cable_x075_v1']):
         args = eval_args()
     assert tuple(args.scenario_names) == WORKSPACE_SCENE_FAMILIES['cable_x075_v1']
+    assert len(args.scenario_names) == 7
     assert args.distribution is None
 
 

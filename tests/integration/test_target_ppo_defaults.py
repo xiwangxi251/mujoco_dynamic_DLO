@@ -6,7 +6,7 @@ from panda_cable_grasp.rl.evaluate import parse_args as evaluation_args
 from panda_cable_grasp.rl.workspace import WORKSPACE_SCENE_FAMILIES
 
 
-def test_target_training_enables_validated_stack_and_new_six_scenes_by_default():
+def test_target_training_enables_validated_stack_and_new_seven_scenes_by_default():
     with patch('sys.argv', ['train', '--target-node-task']):
         args = parse_args()
     assert args.robot == 'nero'
@@ -21,6 +21,7 @@ def test_target_training_enables_validated_stack_and_new_six_scenes_by_default()
     assert mask.manifest()['accepted_cells']==78
     assert args.workspace_scene_family == 'cable_x075_v1'
     assert tuple(args.training_scenario_names) == tuple(args.eval_scenario_names) == WORKSPACE_SCENE_FAMILIES['cable_x075_v1']
+    assert len(args.training_scenario_names) == 7
 
 
 def test_non_target_training_retains_existing_defaults():

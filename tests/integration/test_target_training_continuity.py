@@ -10,6 +10,7 @@ from stable_baselines3 import PPO
 from panda_cable_grasp.rl.environment import RLConfig, make_rl_env
 from panda_cable_grasp.rl.penalty_ramp import resolve_schedule, apply_progress
 from panda_cable_grasp.rl.workspace import WorkspaceMask, DEFAULT_TARGET_WORKSPACE, WORKSPACE_STAGES
+from panda_cable_grasp.rl.workspace import WORKSPACE_SCENE_FAMILIES, workspace_stages
 from panda_cable_grasp.rl.evaluate import parse_args, configure_target_evaluation
 
 
@@ -82,6 +83,7 @@ def saved_args(tmp_path, monkeypatch, extra=()):
 
 def test_saved_stage_defaults_use_checkpoint_stage_not_later_run_stage(tmp_path, monkeypatch):
     args, config = saved_args(tmp_path, monkeypatch)
+    assert args.scenario_names == config['training_scenario_names']
     assert WorkspaceMask(args.target_workspace).manifest()['xy_bounds_m'] == [.60,.84,-.22,.30]
     calls = {}
     env = SimpleNamespace(goal=SimpleNamespace(), rl_config=RLConfig(),
@@ -94,6 +96,27 @@ def test_saved_stage_defaults_use_checkpoint_stage_not_later_run_stage(tmp_path,
     assert calls['difficulty'] == WORKSPACE_STAGES[2][2]
     assert args.resolved_evaluation_stage['source'] == 'checkpoint'
     assert calls['ramp'][1] == 0
+
+
+@pytest.mark.parametrize('historical', [False, True])
+def test_saved_seven_scene_curriculum_restores_its_original_list(tmp_path, monkeypatch, historical):
+    from panda_cable_grasp.scenarios.registry import CABLE_X075_REPLAY_SCENARIO_NAMES
+    args, config = saved_args(tmp_path, monkeypatch)
+    names = CABLE_X075_REPLAY_SCENARIO_NAMES if historical else WORKSPACE_SCENE_FAMILIES['cable_x075_v1']
+    config['training_scenario_names'] = list(names)
+    if not historical:
+        config['workspace_stages'] = workspace_stages(names)
+    (tmp_path/'training_config.json').write_text(json.dumps(config))
+    args = parse_args()
+    calls = {}
+    env = SimpleNamespace(goal=SimpleNamespace(), rl_config=RLConfig(),
+        set_penalty_ramp_progress=lambda *values: None,
+        set_training_scenario_distribution=lambda names, weights: calls.update(names=names, weights=weights),
+        set_motion_difficulty=lambda value: calls.update(difficulty=value))
+    configure_target_evaluation(env, args, SimpleNamespace(num_timesteps=100000, target_evaluation_stage=6))
+    assert tuple(args.scenario_names) == calls['names'] == names
+    assert list(calls['weights']) == [.1, .1, .1, .1, .3, .15, .15]
+    assert calls['difficulty'] == 1.
 
 
 @pytest.mark.parametrize('extra', [('--evaluation-protocol', 'six-scenes'), ('--scenario', 'id_static')])
