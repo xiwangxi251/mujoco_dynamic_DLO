@@ -607,7 +607,51 @@ class EnvironmentScenarioTests(unittest.TestCase):
         finally:
             del env
 
-    def test_close_hard_timeout_does_not_open_during_pad_contact(self) -> None:
+    def test_close_hard_timeout_retries_despite_pad_contact_or_candidate(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1014)
+            env.config.episode_seconds = 15.0
+            for candidate in (False, True):
+                with self.subTest(candidate=candidate):
+                    env.grasp_state = (
+                        GraspState(env.target_body_id, float(env.data.time),
+                                   False, float(env.data.time), 0.0)
+                        if candidate else None
+                    )
+                    policy = DynamicCableGraspPolicy(env)
+                    policy.phase = Phase.CLOSE
+                    policy.phase_start = (
+                        float(env.data.time) - policy.config.close_hard_timeout - 0.1
+                    )
+                    policy.last_close_contact_time = float(env.data.time)
+                    env.finger_contacts = lambda cable_body=None: [env.target_body_id]
+
+                    action = policy.action()
+
+                    self.assertIs(policy.phase, Phase.RECOVER)
+                    self.assertEqual(policy.retry_count, 1)
+                    self.assertEqual(action[7], env.gripper_open_ctrl)
+        finally:
+            del env
+
+    def test_close_contact_can_extend_short_timeout_before_hard_deadline(self) -> None:
+        env = self.make("id_static")
+        try:
+            env.reset(randomize=False, seed=1014)
+            policy = DynamicCableGraspPolicy(env)
+            policy.phase = Phase.CLOSE
+            policy.phase_start = float(env.data.time) - 1.0
+            env.finger_contacts = lambda cable_body=None: [env.target_body_id]
+
+            action = policy.action()
+
+            self.assertIs(policy.phase, Phase.CLOSE)
+            self.assertEqual(action[7], policy.HOLD_GRIPPER_CTRL)
+        finally:
+            del env
+
+    def test_confirmed_grasp_lifts_even_after_close_hard_deadline(self) -> None:
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1014)
@@ -616,12 +660,15 @@ class EnvironmentScenarioTests(unittest.TestCase):
             policy.phase_start = (
                 float(env.data.time) - policy.config.close_hard_timeout - 0.1
             )
-            policy.last_close_contact_time = float(env.data.time)
-            env.finger_contacts = lambda cable_body=None: [env.target_body_id]
+            env.grasp_state = GraspState(
+                env.target_body_id, float(env.data.time), True,
+                float(env.data.time), 0.0,
+            )
 
             action = policy.action()
 
-            self.assertIs(policy.phase, Phase.CLOSE)
+            self.assertIs(policy.phase, Phase.LIFT)
+            self.assertEqual(policy.retry_count, 0)
             self.assertEqual(action[7], policy.HOLD_GRIPPER_CTRL)
         finally:
             del env

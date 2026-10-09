@@ -1333,10 +1333,10 @@ class DynamicCableGraspPolicy:
                 self.lift_goal = hand + np.array([0.0, 0.0, self.config.lift_distance])
                 self._transition(Phase.LIFT)
             else:
-                # Never actively open while the simulator still reports pad
-                # contact or an in-progress grasp candidate.  Previously the
-                # unconditional hard timeout overrode this evidence at 3 s,
-                # producing the visible "grasp, open, lift away" failure.
+                # Contact can extend the short confirmation window, but it
+                # cannot waive the hard deadline: separate strands or one pad
+                # can remain in contact indefinitely without a valid grasp.
+                # Confirmed grasps take the LIFT branch above before timeout.
                 contact_evidence = bool(
                     close_contacts or self.env.grasp_state is not None
                 )
@@ -1344,10 +1344,7 @@ class DynamicCableGraspPolicy:
                     (self.config.target_selection_mode == "middle_geometry"
                      and self.phase_time > self.config.close_invalid_contact_timeout)
                     or
-                    (
-                        self.phase_time > self.config.close_hard_timeout
-                        and not contact_evidence
-                    )
+                    self.phase_time > self.config.close_hard_timeout
                     or (
                         self.phase_time > self.config.close_timeout
                         and self.env.data.time - self.last_close_contact_time
