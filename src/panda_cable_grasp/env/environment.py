@@ -356,11 +356,10 @@ class EnvConfig:
     replay_use_snapshot_position: bool = False
     initial_shape_time_range: tuple[float, float] = (0.30, 0.70)
 
-    # 非 rigid/combined 场景的机械臂启动延迟（秒）：线缆先自由运动
-    # arm_motion_start_delay 秒后才放开机械臂目标，模拟"接住已经在
-    # 运动中的物体"。rigid/combined 仍用固定的 RIGID_MOTION_START_TIME。
+    # 显式机械臂启动等待（秒）；>0 时优先于运动模式及立即启动选项。
+    # 等待期间只保持机械臂目标，线缆按场景规则继续运动。
     arm_motion_start_delay: float = 0.0
-    # Opt-in initial-state policy execution; archived benchmarks keep the delay.
+    # Opt-in immediate execution only when no explicit scene wait is configured.
     arm_motion_start_immediate: bool = False
 
     # rigid 轨迹控制参数
@@ -2281,7 +2280,9 @@ class CableGraspEnv:
         return self.observation(), reward, success, truncated, info
 
     def _arm_motion_start_time(self) -> float:
-        """Release arm joint targets one control cycle after rigid motion starts."""
+        """Honor an explicit scene wait before legacy mode/start-protocol rules."""
+        if self.config.arm_motion_start_delay > 0.0:
+            return float(self.config.arm_motion_start_delay)
         if self.config.arm_motion_start_immediate:
             return 0.0
         if self.config.motion_mode not in {"rigid", "combined"}:

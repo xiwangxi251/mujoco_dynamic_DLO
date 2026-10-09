@@ -157,8 +157,8 @@ class ScenarioConfig:
     disturbance_strength: float = 1.50
     frequency_scale: float = 1.0
     shape_motion_scale: float = SHAPE_MOTION_SCALE
-    # 机械臂启动延迟（秒）：>0 时非 rigid/combined 场景的线缆先自由
-    # 运动该时长后才放开机械臂目标。默认 0 不改变既有场景行为。
+    # 显式机械臂启动等待（秒）：>0 时覆盖各运动模式原来的启动规则。
+    # 默认 0 保留历史场景行为；当前 cable_x075_v1 全部设为 0.82。
     arm_motion_start_delay: float = 0.0
 
     cable_length_scale: float = 1.0
@@ -1319,6 +1319,9 @@ def _registered_scenarios() -> list[ScenarioConfig]:
             name=variant_name,
             split=ScenarioSplit.DEV,
             initial_cable_center_x=0.75,
+            arm_motion_start_delay=(
+                0.82 if variant_name in CABLE_X075_SCENARIO_NAMES else source.arm_motion_start_delay
+            ),
             replay_use_snapshot_position=source_name == "id_rigid_replay_midshape_v1",
             description=(
                 "Complex snapshot shape and placement paired with dev_static_midshape_v1_x075_v1; "

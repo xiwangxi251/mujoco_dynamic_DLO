@@ -377,21 +377,23 @@ def test_saved_evaluation_keeps_start_protocol_and_budget(tmp_path, mask_path):
 
 @pytest.mark.parametrize('protocol,immediate', [
     ('policy_from_initial_v3', True), ('policy_from_initial_v2', False), ('physical_entry_v1', False)])
-def test_initial_protocol_releases_actual_arm_command_at_time_zero(mask_path, protocol, immediate):
+@pytest.mark.parametrize('scene', ['dev_combined_l1_nominal_x075_v1', 'id_combined_l1_nominal'])
+def test_explicit_scene_wait_overrides_initial_protocol(mask_path, protocol, immediate, scene):
     env = make_rl_env(robot='nero', action_mode='task_space_vertical_down',
-        scenario_names=['dev_combined_l1_nominal_x075_v1'], episode_seconds=.04,
+        scenario_names=[scene], episode_seconds=.04,
         target_workspace=mask_path, workspace_start_protocol=protocol, workspace_entry_seconds=0.,
         rl_config=RLConfig(target_node_task=True))
     try:
         _, info = env.reset(seed=81, options={'goal_node_index': 20})
         assert env.data.time == 0.
         assert env.base_env.config.arm_motion_start_immediate is immediate
-        assert info['arm_motion_delayed'] is (not immediate)
-        assert info['arm_motion_start_time'] == pytest.approx(0. if immediate else .82)
+        released = immediate and scene == 'id_combined_l1_nominal'
+        assert info['arm_motion_delayed'] is (not released)
+        assert info['arm_motion_start_time'] == pytest.approx(0. if released else .82)
         requested = env.base_env.ready_ctrl.copy()
         requested[0] += .001
         applied = env.base_env._limit_robot_action(requested)
-        if immediate:
+        if released:
             assert abs(applied[0] - env.base_env.ready_ctrl[0]) > 1e-12
         else:
             np.testing.assert_array_equal(applied[:7], env.base_env.ready_ctrl[:7])

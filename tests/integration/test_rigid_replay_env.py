@@ -31,6 +31,7 @@ from panda_cable_grasp.perception.rendering import (
     GripperVisibilityToggle,
 )
 from panda_cable_grasp.scenarios import get_scenario
+from panda_cable_grasp.scenarios.registry import SCENARIO_FAMILIES
 
 
 SEED = 4242
@@ -173,6 +174,34 @@ class ReplayPairingTests(unittest.TestCase):
 
     def make_replay_env(self) -> CableGraspEnv:
         return CableGraspEnv(self.replay_config)
+
+    def test_all_current_family_scenes_hold_arm_until_082_seconds(self) -> None:
+        for name in SCENARIO_FAMILIES["cable_x075_v1"]:
+            with self.subTest(scene=name):
+                config = env_config_for_scenario(get_scenario(name), seed=SEED, episode_seconds=4.)
+                config.replay_bank_dir = str(self.bank_dir)
+                config.replay_seed_fallback = "error"
+                if config.replay_bank:
+                    config.replay_bank = BANK_NAME
+                if config.initial_shape_bank:
+                    config.initial_shape_bank = BANK_NAME
+                env = CableGraspEnv(config)
+                try:
+                    env.reset(randomize=True, seed=SEED)
+                    requested = env.ready_ctrl.copy()
+                    requested[0] += .001
+                    for immediate in (False, True):
+                        env.config.arm_motion_start_immediate = immediate
+                        self.assertEqual(env._arm_motion_start_time(), .82)
+                        for t in (0., .80, .819999):
+                            env.data.time = t
+                            self.assertTrue(env.info()["arm_motion_delayed"])
+                            np.testing.assert_array_equal(env._limit_robot_action(requested)[:7], env.ready_ctrl[:7])
+                        env.data.time = .82
+                        self.assertFalse(env.info()["arm_motion_delayed"])
+                        self.assertGreater(abs(env._limit_robot_action(requested)[0] - env.ready_ctrl[0]), 1e-12)
+                finally:
+                    env.close()
 
     def test_complex_simple_motion_pairs_shape_and_motion_independently(self) -> None:
         environments = []
