@@ -51,7 +51,7 @@ panda-cable-diffusion-eval = "panda_cable_grasp.cli.run_diffusion_policy:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-panda_cable_grasp = ["rl/workspaces/*.npz"]
+panda_cable_grasp = ["rl/workspaces/*.npz", "rl/workspaces/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

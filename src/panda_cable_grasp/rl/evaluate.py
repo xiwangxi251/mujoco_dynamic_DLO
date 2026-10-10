@@ -203,7 +203,7 @@ def evaluation_rl_config(args) -> RLConfig:
         if config_path.is_file():
             saved = json.loads(config_path.read_text(encoding="utf-8")).get("rl_config", {})
             break
-    if saved.get("target_node_task", False):
+    if saved:
         allowed = {field.name for field in fields(RLConfig)}
         return RLConfig(**{key: value for key, value in saved.items() if key in allowed})
     if getattr(args, "target_node_index", None) is not None:
@@ -219,6 +219,17 @@ def configure_target_evaluation(env, args, model=None):
         from .penalty_ramp import resolve_schedule, apply_progress
         schedule = resolve_schedule(model, env.rl_config, int(saved.get('workers', 1)), saved)
         apply_progress(env, model, schedule)
+    if (env.goal is None and saved.get('ordinary_family_curriculum')
+            and getattr(args, 'saved_stage_evaluation', False)):
+        names = getattr(model, 'ordinary_evaluation_scenarios', None)
+        if names is None:
+            raise ValueError('Ordinary curriculum checkpoint lacks saved phase')
+        difficulty = float(model.ordinary_evaluation_difficulty)
+        env.set_training_scenarios(tuple(names))
+        env.set_motion_difficulty(difficulty)
+        args.resolved_evaluation_stage = dict(phase=int(model.ordinary_evaluation_phase),
+                                             scenarios=names, motion_difficulty=difficulty,
+                                             source='checkpoint')
     if env.goal is not None and getattr(args, 'saved_stage_evaluation', False):
         if saved.get('workspace_curriculum'):
             from .target_defaults import saved_curriculum_stage

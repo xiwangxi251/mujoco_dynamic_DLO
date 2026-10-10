@@ -58,14 +58,15 @@ def configure_saved_evaluation_defaults(args, argv):
     if args.robot is None:
         args.robot = saved.get('robot', 'nero' if args.controller_profile != 'legacy' else 'panda')
     supplied = {item.split('=', 1)[0] for item in argv if item.startswith('--')}
-    if (target and args.workspace_scene_family is None
+    ordinary = bool(saved.get("ordinary_family_curriculum", False))
+    if ((target or ordinary) and args.workspace_scene_family is None
             and not supplied.intersection({'--scenario', '--distribution'})):
         args.workspace_scene_family = saved.get('workspace_scene_family')
     args.saved_evaluation_config = saved
-    args.saved_stage_evaluation = bool(target
+    args.saved_stage_evaluation = bool((target or ordinary)
         and getattr(args, 'evaluation_protocol', 'saved-stage') == 'saved-stage'
         and not supplied.intersection({'--scenario', '--distribution', '--workspace-scene-family'}))
-    if not target:
+    if not target and not ordinary:
         return
     workspace = saved.get('target_workspace')
     if "--workspace-start-protocol" not in supplied:

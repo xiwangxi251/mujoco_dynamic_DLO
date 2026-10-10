@@ -161,8 +161,16 @@ def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
             values.update(target_node_task=True, target_node_tolerance=2,
                           target_position_reward_radius=4,
                           target_wrong_event_penalty=2., target_wrong_event_cap=8.)
+        if getattr(args, 'ordinary_reward_profile', 'legacy') != 'legacy':
+            values['ordinary_reward_profile'] = args.ordinary_reward_profile
+        if getattr(args, 'action_workspace', None):
+            values['action_workspace_path'] = str(args.action_workspace.resolve())
+            values['action_workspace_sha256'] = __import__('hashlib').sha256(args.action_workspace.read_bytes()).hexdigest()
         return RLConfig(**values)
     return RLConfig(
+        ordinary_reward_profile=getattr(args, "ordinary_reward_profile", "legacy"),
+        action_workspace_path=str(args.action_workspace.resolve()) if getattr(args, 'action_workspace', None) else None,
+        action_workspace_sha256=(__import__('hashlib').sha256(args.action_workspace.read_bytes()).hexdigest() if getattr(args, 'action_workspace', None) else None),
         target_reward_profile=getattr(args, "target_reward_profile", "legacy"),
         target_node_task=getattr(args, "target_node_task", False),
         target_u_min=getattr(args, "target_u_min", 1.0 / 6.0),
@@ -406,6 +414,9 @@ class MotionCurriculumCallback(BaseCallback):
         self.logger.record(
             "curriculum/qualifying_evaluations", self.qualifying_evaluations
         )
+        self.model.ordinary_evaluation_scenarios = self.current_scenarios
+        self.model.ordinary_evaluation_difficulty = self.difficulty
+        self.model.ordinary_evaluation_phase = self.phase_index
         self._last_update = self.num_timesteps
 
     def configure_evaluation_env(self, env: RLCableGraspEnv | VecEnv) -> None:
@@ -658,15 +669,18 @@ class StrictSuccessEvalCallback(BaseCallback):
                 for worker in finished:
                     info = infos[int(worker)]
                     first_correct += int(info.get("first_grasp_correct") is True)
-                    if "workspace_mask" in info:
+                    if "workspace_mask" in info or info.get("action_workspace_enabled", False):
                         with (self.output_dir / "workspace_eval_episodes.jsonl").open("a", encoding="utf-8") as stream:
                             record = {key: info.get(key) for key in (
+                                "action_workspace_projection_count", "action_workspace_projection_distance_m",
+                                "ever_pinched", "ever_aligned_pinch", "ever_grasped", "loaded_lift",
+                                "success_hold", "strict_hold_credit_high_water",
                                 "requested_seed", "actual_seed", "scenario_name", "goal_node_index",
                                 "first_grasp_correct", "workspace_reset_rejections", "workspace_prefix_seconds",
                                 "workspace_inside_fraction", "workspace_initial_goal_xyz", "workspace_mask",
                                 "workspace_start_protocol", "workspace_goal_ever_inside",
                                 "workspace_goal_first_entry_seconds")}
-                            record.update(success=bool(info["success"]), timesteps=self.num_timesteps,
+                            record.update(success=bool(info["success"]), seed=batch_seed+int(worker), timesteps=self.num_timesteps,
                                           seed_offset=seed_offset,
                                           phase=self.curriculum.phase_index if self.curriculum else 0)
                             stream.write(json.dumps(record) + "\n")
@@ -1074,6 +1088,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(robot=None, action_mode=None, controller_profile=None,
                         table_execution_guard=None)
+    parser.add_argument('--ordinary-reward-profile', choices=('legacy', 'physical_progress_v1'), default='legacy')
+    parser.add_argument('--action-workspace', type=Path, help='Measured TCP execution map; does not enable target-node task')
+    parser.add_argument('--ordinary-family-curriculum', action='store_true', help='Map ordinary L1 curriculum to the selected placement family')
     args = parser.parse_args()
     from .target_defaults import configure_target_training_defaults
     configure_target_training_defaults(args, sys.argv[1:])
@@ -1089,10 +1106,21 @@ def parse_args() -> argparse.Namespace:
         except (ValueError, OSError, TypeError) as error:
             parser.error(str(error))
     if args.workspace_scene_family:
-        args.curriculum_stage_steps = 0
+        if not args.ordinary_family_curriculum:
+            args.curriculum_stage_steps = 0
         if args.training_scenarios or args.eval_scenarios:
             parser.error("Workspace scene family cannot be combined with explicit scenario lists")
         args.training_scenarios = ",".join(WORKSPACE_SCENE_FAMILIES[args.workspace_scene_family])
+    if args.action_workspace is not None:
+        if args.target_node_task or args.action_mode != 'task_space_vertical_down':
+            parser.error('Action workspace requires ordinary vertical-down task space')
+        from .action_workspace import ActionWorkspace
+        try:
+            ActionWorkspace(args.action_workspace)
+        except (ValueError, KeyError, OSError) as error:
+            parser.error(str(error))
+    if args.ordinary_family_curriculum and (args.target_node_task or args.workspace_scene_family != 'cable_x075_v1'):
+        parser.error('Ordinary family curriculum requires ordinary cable_x075_v1')
     if args.target_workspace is not None:
         if not args.target_node_task or args.observation_mode != "state":
             parser.error("Target workspace requires target-node task and state observations")
@@ -1276,6 +1304,22 @@ def parse_args() -> argparse.Namespace:
         )
     except ValueError as error:
         parser.error(str(error))
+    args.curriculum_stages = RL_L1_CURRICULUM_STAGES
+    if args.ordinary_family_curriculum:
+        variant = lambda name: 'dev_' + name.removeprefix('id_') + '_x075_v1'
+        static = (variant('id_static'), variant('id_static_midshape_v1'))
+        component = (variant('id_shape_nominal_current'), variant('id_rigid_l1_nominal'),
+                     variant('id_rigid_l1_midshape_v1'), variant('id_rigid_replay_shape_nominal'))
+        combined = (variant('id_combined_l1_nominal'),)
+        args.curriculum_stages = (static, component, combined)
+        a = args.curriculum_stage1_static_replay
+        b = args.curriculum_stage2_static_replay
+        c = args.curriculum_stage2_component_replay
+        args.curriculum_training_mixes = (
+            tuple((n, 1 / len(static)) for n in static),
+            tuple((n, a / len(static)) for n in static) + tuple((n, (1-a) / len(component)) for n in component),
+            tuple((n, b / len(static)) for n in static) + tuple((n, c / len(component)) for n in component) + ((combined[0], 1-b-c),),
+        )
     if (
         args.training_distribution != "l1"
         and args.curriculum_stage_steps > 0
@@ -1480,7 +1524,7 @@ def main() -> None:
         and args.curriculum_stage_steps > 0
     ):
         curriculum_callback = MotionCurriculumCallback(
-            stages=RL_L1_CURRICULUM_STAGES,
+            stages=args.curriculum_stages,
             update_every=args.curriculum_update_steps,
             required_evaluations=args.curriculum_required_evals,
             aligned_pinch_rate=args.curriculum_aligned_pinch_rate,
@@ -1528,25 +1572,25 @@ def main() -> None:
         "penalty_ramp_start_scales": {kind: vector_env.env_method('_penalty_ramp_scale', kind)[0]
                                        for kind in ('height', 'safety')},
         "lift_progress_accounting_version": (
-            "physical_node_release_bounded_debit_v2" if args.target_reward_profile == "tolerance_progress_v6"
+            "physical_node_release_bounded_debit_v2" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1")
             else "episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"}
             else "episode_high_water_unbounded_debit_v2" if args.target_reward_profile == "tolerance_progress_v2"
             else "legacy"
         ),
         "approach_progress_accounting_version": ("episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} else "legacy_phase_gated"),
         "lift_reward_holding_version": (
-            "confirmed_distance_contact_grace_v3_no_aperture" if args.target_reward_profile == "tolerance_progress_v6"
+            "confirmed_distance_contact_grace_v3_no_aperture" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1")
             else "current_bilateral_distance_v2_no_aperture" if args.target_reward_profile == "tolerance_progress_v5"
             else "confirmed_grasp_grace_v1"),
         "lift_reward_contact_grace_seconds": (
             vector_env.env_method('_lift_reward_contact_grace_seconds')[0]
-            if args.target_reward_profile == "tolerance_progress_v6" else 0.0),
+            if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1") else 0.0),
         "secured_grasp_accounting_version": (
-            "confirmed_distance_contact_grace_v3_no_aperture" if args.target_reward_profile == "tolerance_progress_v6"
+            "confirmed_distance_contact_grace_v3_no_aperture" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1")
             else "raw_confirm_then_secured_grace_v2_no_aperture"),
         "secured_contact_grace_seconds": (
             vector_env.env_method('_lift_reward_contact_grace_seconds')[0]
-            if args.target_reward_profile == "tolerance_progress_v6" else None),
+            if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1") else None),
         "reference_rl_config_file": str(args.rl_config_file.resolve()) if args.rl_config_file else None,
         "resume_legacy_full6_requested": args.resume_legacy_full6,
         "resume_interface_migration": ("frozen full6_workspace_target_node_v1 -> formal bounded DLS and physical_holding_v2" if args.resume_legacy_full6 else None),
@@ -1556,14 +1600,14 @@ def main() -> None:
         "public_success_version": "confirmed_distance_grace_v4_no_aperture",
         "grasp_aperture_qualification_enabled": False,
         "hold_reward_timer_version": (
-            "public_success_hold_v1" if args.target_reward_profile == "tolerance_progress_v6"
+            "public_success_hold_v1" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1")
             else "strict_height_band_hold_v1"),
         "arm_acceleration_limit_enabled": args.controller_profile == "legacy",
         "target_workspace": (None if args.target_workspace is None else WorkspaceMask(args.target_workspace, args.workspace_mask_key).manifest()),
         "workspace_start_protocol": args.workspace_start_protocol,
         "arm_motion_start_immediate": bool(args.target_workspace is not None
             and args.workspace_start_protocol == "policy_from_initial_v3"),
-        "workspace_goal_sampling": ("all_material_nodes_at_initial_state_v2"
+        "workspace_goal_sampling": (None if not args.target_node_task else "all_material_nodes_at_initial_state_v2"
             if args.workspace_start_protocol != "physical_entry_v1" else "entry_workspace_nodes_v1"),
         "workspace_entry_seconds": (0. if args.workspace_start_protocol != "physical_entry_v1" else args.workspace_entry_seconds),
         "workspace_reset_attempts": args.workspace_reset_attempts,
@@ -1636,7 +1680,10 @@ def main() -> None:
             if args.observation_mode == "pointcloud"
             else None
         ),
-        "curriculum_stages": RL_L1_CURRICULUM_STAGES,
+        "curriculum_stages": args.curriculum_stages,
+        "ordinary_family_curriculum": args.ordinary_family_curriculum,
+        "ordinary_reward_profile": args.ordinary_reward_profile,
+        "action_workspace": (dict(path=str(args.action_workspace.resolve()), sha256=__import__("hashlib").sha256(args.action_workspace.read_bytes()).hexdigest(), version="measured_polar_cells_v1") if args.action_workspace else None),
         "curriculum_training_mixes": args.curriculum_training_mixes,
         "curriculum_stage1_static_replay": args.curriculum_stage1_static_replay,
         "curriculum_stage2_static_replay": args.curriculum_stage2_static_replay,

@@ -37,6 +37,9 @@ class RLConfig:
     target_u_min: float = 1.0 / 6.0
     target_u_max: float = 5.0 / 6.0
     target_node_tolerance: int = 2
+    ordinary_reward_profile: str = "legacy"
+    action_workspace_path: str | None = None
+    action_workspace_sha256: str | None = None
     target_reward_profile: str = "legacy"
     target_position_reward_radius: int = 4
     target_wrong_event_penalty: float = 2.0
@@ -136,6 +139,10 @@ class RLConfig:
     safety_penalty_ramp_env_steps: int = 5_000
 
     def __post_init__(self) -> None:
+        if self.ordinary_reward_profile not in {"legacy", "physical_progress_v1"}:
+            raise ValueError("Unknown ordinary reward profile")
+        if self.ordinary_reward_profile != "legacy" and self.target_node_task:
+            raise ValueError("Ordinary reward profile cannot enable target-node task")
         if not isinstance(self.target_node_task, bool):
             raise ValueError("target_node_task must be boolean")
         if not (np.isfinite(self.target_u_min) and np.isfinite(self.target_u_max)
@@ -325,6 +332,19 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
     ):
         super().__init__()
         self.rl_config = rl_config or RLConfig()
+        self._action_workspace = None
+        if self.rl_config.action_workspace_path:
+            from .action_workspace import ActionWorkspace, DEFAULT_ACTION_WORKSPACE
+            path = Path(self.rl_config.action_workspace_path)
+            if not path.is_file():
+                path = DEFAULT_ACTION_WORKSPACE
+            self._action_workspace = ActionWorkspace(path)
+            if self.rl_config.action_workspace_sha256 != self._action_workspace.sha256:
+                raise ValueError("Action workspace hash mismatch")
+        self._workspace_projection_count = 0
+        self._workspace_projection_distance = 0.
+        self._last_workspace_request = np.zeros(3)
+        self._last_workspace_execution = np.zeros(3)
         if target_workspace is not None and not self.rl_config.target_node_task:
             raise ValueError("Workspace sampling requires target-node task")
         if not np.isfinite(workspace_entry_seconds) or workspace_entry_seconds < 0:
@@ -1020,6 +1040,16 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         world_translation = (
             self.rl_config.translation_delta_scale * base_direction
         )
+        self._last_workspace_request = world_translation.copy()
+        if self._action_workspace is not None:
+            point = self.base_env.hand_position.copy()
+            table = self.base_env.table_geom_id
+            point[2] -= self.data.geom_xpos[table, 2] + self.model.geom_size[table, 2]
+            world_translation = self._action_workspace.constrain(point, world_translation)
+            correction = float(np.linalg.norm(world_translation - self._last_workspace_request))
+            self._workspace_projection_count += int(correction > 1e-10)
+            self._workspace_projection_distance += correction
+        self._last_workspace_execution = world_translation.copy()
         self._last_commanded_world_translation = world_translation.copy()
         linear_velocity = world_translation / control_dt
 
@@ -1204,7 +1234,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         # grace during BOTH initial loaded confirmation and subsequent retention.
         # Raw-contact continuity remains a separate strict diagnostic.
         grace_secured_candidate = bool(
-            self.rl_config.target_reward_profile == "tolerance_progress_v6"
+            self._contact_grace_rewards
             and secured_geometry_valid
         )
         secured_was_confirmed = bool(
@@ -1455,8 +1485,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         physical_pinch = bool(grasp_status["pinch_confirmed"])
         goal_match = self.goal is None or self.goal.matches()
         pinch_confirmed = physical_pinch and goal_match
-        revised_progress = self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"}
-        lift_scale = self.goal.lift_reward_scale() if revised_progress else float(goal_match)
+        revised_progress = self._ordinary_progress or self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"}
+        lift_scale = self.goal.lift_reward_scale() if revised_progress and self.goal is not None else float(goal_match)
         height_pinched = physical_pinch and lift_scale > 0. if revised_progress else pinch_confirmed
         pregrasp = not physical_pinch
         progress = self._previous_distance - distance if pregrasp else 0.0
@@ -1681,9 +1711,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         if revised_progress:
             heights = self._lift_credit_heights()
             lift_holding = physical_pinch
-            if self.rl_config.target_reward_profile in {"tolerance_progress_v5", "tolerance_progress_v6"}:
+            if self._ordinary_progress or self.rl_config.target_reward_profile in {"tolerance_progress_v5", "tolerance_progress_v6"}:
                 lift_holding = self._current_lift_reward_holding(grasp_status)
-            held_index = self.goal.actual_index() if lift_holding else None
+            held_index = (self.goal.actual_index() if self.goal is not None else
+                          self.base_env.cable_index[self.base_env.grasp_state.body_id]) if lift_holding else None
             lift_progress, cable_lift_progress = self._lift_progress_credit.update(
                 heights, capped_lifted_fraction, held_index, lift_scale,
             )
@@ -1721,7 +1752,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._contact_loss_penalty_applied = True
         penalize_physical_slip = bool(penalize_contact_loss)
 
-        if self.rl_config.target_reward_profile == "tolerance_progress_v6":
+        if self._contact_grace_rewards:
             # The task's 500 Hz timer already includes goal matching, lift
             # geometry and confirmed physical retention with contact grace.
             # Raw bilateral/height-band timers remain diagnostics only.
@@ -1815,6 +1846,14 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self.goal.finish_reward(components, grasp_status)
         return float(sum(components.values())), components
 
+    @property
+    def _ordinary_progress(self):
+        return self.rl_config.ordinary_reward_profile == "physical_progress_v1"
+
+    @property
+    def _contact_grace_rewards(self):
+        return self._ordinary_progress or self.rl_config.target_reward_profile == "tolerance_progress_v6"
+
     def _lift_reward_contact_grace_seconds(self):
         return float(self.base_env.config.grasp_loss_seconds)
 
@@ -1823,7 +1862,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         state = self.base_env.grasp_state
         if state is None or not grasp_status["pinch_confirmed"]:
             return False
-        if self.rl_config.target_reward_profile == "tolerance_progress_v6":
+        if self._contact_grace_rewards:
             if not self.base_env.grasp_confirmed:
                 return False
         elif not grasp_status.get("raw_bilateral_contact", False):
@@ -2040,6 +2079,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._premature_close_event = False
         self._premature_close_penalty_total = 0.0
         self._secured_rewarded = False
+        self._workspace_projection_count = 0
+        self._workspace_projection_distance = 0.
         self._lift_credit_high_water = 0.0
         self._cable_lift_credit_high_water = float(np.clip(
             float(info["lifted_fraction"]),
@@ -2051,9 +2092,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         from .lift_credit import HighWaterLiftCredit
         self._lift_progress_credit = (HighWaterLiftCredit(
             self._lift_credit_heights(), self._cable_lift_credit_high_water,
-            bounded_debits=self.rl_config.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"},
-            release_debits=self.rl_config.target_reward_profile == "tolerance_progress_v6",
-        ) if self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} else None)
+            bounded_debits=self._ordinary_progress or self.rl_config.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"},
+            release_debits=self._contact_grace_rewards,
+        ) if self._ordinary_progress or self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} else None)
         self._secured_session_active = False
         self._secured_session_target_match = False
         self._last_grasp_break_key = None
@@ -2264,6 +2305,11 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._contact_loss_penalty_applied
             or self._active_open_penalty_applied
         )
+        result["action_workspace_enabled"] = self._action_workspace is not None
+        result["action_workspace_projection_count"] = self._workspace_projection_count
+        result["action_workspace_projection_distance_m"] = self._workspace_projection_distance
+        result["workspace_requested_delta"] = self._last_workspace_request.tolist()
+        result["workspace_executed_delta"] = self._last_workspace_execution.tolist()
         result["lift_credit_high_water"] = self._lift_credit_high_water
         result["cable_lift_credit_high_water"] = (
             self._cable_lift_credit_high_water
@@ -2282,7 +2328,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         result["height_band_hold"] = self._height_band_hold
         result["lift_reward_holding_qualified"] = (
             self._current_lift_reward_holding(self._last_grasp_status)
-            if self.rl_config.target_reward_profile in {"tolerance_progress_v5", "tolerance_progress_v6"}
+            if self._ordinary_progress or self.rl_config.target_reward_profile in {"tolerance_progress_v5", "tolerance_progress_v6"}
             else bool(self._last_grasp_status["pinch_confirmed"]))
         result["height_penalty_scale"] = self._last_height_penalty_scale
         result["overheight_severity"] = self._last_overheight_severity
