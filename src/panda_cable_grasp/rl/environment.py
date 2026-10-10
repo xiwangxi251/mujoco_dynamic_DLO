@@ -139,7 +139,7 @@ class RLConfig:
     safety_penalty_ramp_env_steps: int = 5_000
 
     def __post_init__(self) -> None:
-        if self.ordinary_reward_profile not in {"legacy", "physical_progress_v1"}:
+        if self.ordinary_reward_profile not in {"legacy", "physical_progress_v1", "physical_progress_v2"}:
             raise ValueError("Unknown ordinary reward profile")
         if self.ordinary_reward_profile != "legacy" and self.target_node_task:
             raise ValueError("Ordinary reward profile cannot enable target-node task")
@@ -1848,7 +1848,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
 
     @property
     def _ordinary_progress(self):
-        return self.rl_config.ordinary_reward_profile == "physical_progress_v1"
+        return self.rl_config.ordinary_reward_profile in {"physical_progress_v1", "physical_progress_v2"}
 
     @property
     def _contact_grace_rewards(self):
@@ -2094,6 +2094,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._lift_credit_heights(), self._cable_lift_credit_high_water,
             bounded_debits=self._ordinary_progress or self.rl_config.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"},
             release_debits=self._contact_grace_rewards,
+            first_holding_baseline=self.rl_config.ordinary_reward_profile == "physical_progress_v2",
         ) if self._ordinary_progress or self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} else None)
         self._secured_session_active = False
         self._secured_session_target_match = False

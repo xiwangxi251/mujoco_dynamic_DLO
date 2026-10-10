@@ -1088,7 +1088,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(robot=None, action_mode=None, controller_profile=None,
                         table_execution_guard=None)
-    parser.add_argument('--ordinary-reward-profile', choices=('legacy', 'physical_progress_v1'), default='legacy')
+    parser.add_argument('--ordinary-reward-profile', choices=('legacy', 'physical_progress_v1', 'physical_progress_v2'), default='legacy')
     parser.add_argument('--action-workspace', type=Path, help='Measured TCP execution map; does not enable target-node task')
     parser.add_argument('--ordinary-family-curriculum', action='store_true', help='Map ordinary L1 curriculum to the selected placement family')
     args = parser.parse_args()
@@ -1572,25 +1572,25 @@ def main() -> None:
         "penalty_ramp_start_scales": {kind: vector_env.env_method('_penalty_ramp_scale', kind)[0]
                                        for kind in ('height', 'safety')},
         "lift_progress_accounting_version": (
-            "physical_node_release_bounded_debit_v2" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1")
+            "physical_node_release_bounded_debit_v2" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile in {"physical_progress_v1", "physical_progress_v2"})
             else "episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5"}
             else "episode_high_water_unbounded_debit_v2" if args.target_reward_profile == "tolerance_progress_v2"
             else "legacy"
         ),
         "approach_progress_accounting_version": ("episode_credit_bounded_debit_v1" if args.target_reward_profile in {"tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} else "legacy_phase_gated"),
         "lift_reward_holding_version": (
-            "confirmed_distance_contact_grace_v3_no_aperture" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1")
+            "confirmed_distance_contact_grace_v3_no_aperture" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile in {"physical_progress_v1", "physical_progress_v2"})
             else "current_bilateral_distance_v2_no_aperture" if args.target_reward_profile == "tolerance_progress_v5"
             else "confirmed_grasp_grace_v1"),
         "lift_reward_contact_grace_seconds": (
             vector_env.env_method('_lift_reward_contact_grace_seconds')[0]
-            if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1") else 0.0),
+            if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile in {"physical_progress_v1", "physical_progress_v2"}) else 0.0),
         "secured_grasp_accounting_version": (
-            "confirmed_distance_contact_grace_v3_no_aperture" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1")
+            "confirmed_distance_contact_grace_v3_no_aperture" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile in {"physical_progress_v1", "physical_progress_v2"})
             else "raw_confirm_then_secured_grace_v2_no_aperture"),
         "secured_contact_grace_seconds": (
             vector_env.env_method('_lift_reward_contact_grace_seconds')[0]
-            if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1") else None),
+            if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile in {"physical_progress_v1", "physical_progress_v2"}) else None),
         "reference_rl_config_file": str(args.rl_config_file.resolve()) if args.rl_config_file else None,
         "resume_legacy_full6_requested": args.resume_legacy_full6,
         "resume_interface_migration": ("frozen full6_workspace_target_node_v1 -> formal bounded DLS and physical_holding_v2" if args.resume_legacy_full6 else None),
@@ -1600,7 +1600,7 @@ def main() -> None:
         "public_success_version": "confirmed_distance_grace_v4_no_aperture",
         "grasp_aperture_qualification_enabled": False,
         "hold_reward_timer_version": (
-            "public_success_hold_v1" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile == "physical_progress_v1")
+            "public_success_hold_v1" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile in {"physical_progress_v1", "physical_progress_v2"})
             else "strict_height_band_hold_v1"),
         "arm_acceleration_limit_enabled": args.controller_profile == "legacy",
         "target_workspace": (None if args.target_workspace is None else WorkspaceMask(args.target_workspace, args.workspace_mask_key).manifest()),
@@ -1683,6 +1683,7 @@ def main() -> None:
         "curriculum_stages": args.curriculum_stages,
         "ordinary_family_curriculum": args.ordinary_family_curriculum,
         "ordinary_reward_profile": args.ordinary_reward_profile,
+        "lift_height_baseline_version": ("first_confirmed_holding_v1" if args.ordinary_reward_profile == "physical_progress_v2" else "episode_initial_max_v1"),
         "action_workspace": (dict(path=str(args.action_workspace.resolve()), sha256=__import__("hashlib").sha256(args.action_workspace.read_bytes()).hexdigest(), version="measured_polar_cells_v1") if args.action_workspace else None),
         "curriculum_training_mixes": args.curriculum_training_mixes,
         "curriculum_stage1_static_replay": args.curriculum_stage1_static_replay,

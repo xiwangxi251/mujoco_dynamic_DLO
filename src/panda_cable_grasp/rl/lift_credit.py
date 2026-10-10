@@ -3,7 +3,8 @@ import numpy as np
 
 
 class HighWaterLiftCredit:
-    def __init__(self, heights, fraction, *, bounded_debits=False, release_debits=False):
+    def __init__(self, heights, fraction, *, bounded_debits=False, release_debits=False,
+                 first_holding_baseline=False):
         self.height_high_water = float(np.max(heights))
         self.fraction_high_water = float(fraction)
         self.previous_heights = np.asarray(heights, dtype=float).copy()
@@ -15,6 +16,11 @@ class HighWaterLiftCredit:
         if release_debits and not bounded_debits:
             raise ValueError('Release debits require bounded reward credit')
         self.release_debits = bool(release_debits)
+        # Spawn height is not earned lift. Latch once, using the physical
+        # node's previous control-step height so an already raised cable is
+        # not paid at acquisition. Never rebase after a release or node switch.
+        self.first_holding_baseline = bool(first_holding_baseline)
+        self.height_baseline_locked = not self.first_holding_baseline
         # Paid intervals belong to the physical material node, not the next
         # grasp session. Store the original discount so only paid credit returns.
         self.height_paid_intervals = [[] for _ in heights]
@@ -63,6 +69,9 @@ class HighWaterLiftCredit:
         fraction = float(fraction)
         lift = cable = 0.0
         eligible = held_index is not None and positive_scale > 0.
+        if eligible and not self.height_baseline_locked:
+            self.height_high_water = float(self.previous_heights[held_index])
+            self.height_baseline_locked = True
         if self.release_debits:
             lift, cable = self._update_release_debits(heights, fraction, held_index, positive_scale)
         elif eligible:
