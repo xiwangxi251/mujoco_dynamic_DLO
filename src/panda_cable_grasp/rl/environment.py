@@ -629,6 +629,15 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             elif name == "motion_frequency_scale":
                 value = scenario.frequency_scale * frequency_scale
             setattr(self.base_env.config, name, value)
+        if hasattr(self, '_range_specs'):
+            from .range_curriculum import sample_episode
+            self._range_episode = sample_episode(scenario, self.np_random,
+                self._range_specs[scenario.name], self._range_pending_phase)
+            for name, value in self._range_episode['overrides'].items():
+                setattr(self.base_env.config, name, value)
+            self._range_speed_sum = 0.0
+            self._range_speed_samples = 0
+            self._range_contact_seen = False
         self.base_env.config.scenario_name = scenario.name
         self.base_env.config.scenario_id = scenario.scenario_id
         self.base_env.config.scenario_split = scenario.split.value
@@ -2167,6 +2176,12 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         _, _, base_success, truncated, info = self.base_env.step(mujoco_action)
         self._total_env_steps += 1
         grasp_status = self._update_grasp_status(info)
+        if hasattr(self, '_range_episode'):
+            self._range_contact_seen = self._range_contact_seen or bool(self.base_env.finger_contacts())
+            if not self._range_contact_seen and self.data.time >= .82:
+                speeds = np.linalg.norm(self._cable_body_velocities(), axis=1)
+                self._range_speed_sum += float(np.average(speeds, weights=self.base_env.cable_mass))
+                self._range_speed_samples += 1
         # RL 的原始双侧接触/secured进度在50 Hz动作边界检查，作为训练漏斗
         # 和过程奖励诊断。跨方法共享的底层任务成功是唯一终止条件与终点奖励
         # 来源；PPO不能用额外条件改变任务定义。
@@ -2282,6 +2297,12 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             result['rollout_episode_phase'] = self._rollout_episode_phase
             result['rollout_episode_difficulty'] = self._rollout_episode_difficulty
         result["motion_curriculum_difficulty"] = self._motion_difficulty
+        if hasattr(self, '_range_episode'):
+            result['range_episode'] = dict(self._range_episode,
+                precontact_mean_speed=(self._range_speed_sum / self._range_speed_samples
+                    if self._range_speed_samples else None),
+                precontact_speed_samples=self._range_speed_samples,
+                speed_measurement='mass-weighted node speed at 50Hz from .82s until first finger contact')
         result["motion_curriculum_scenarios"] = self._active_scenario_names
         result["motion_curriculum_scenario_probabilities"] = (
             self._active_scenario_probabilities
@@ -2455,6 +2476,12 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._active_scenario_probabilities = tuple(
             float(value) for value in weights / total
         )
+
+    def set_range_curriculum(self, phase, names, probabilities, specs):
+        self.set_training_scenario_distribution(names, probabilities)
+        self._range_pending_phase = int(phase)
+        self._range_specs = specs
+        self.set_motion_difficulty(1.0)
 
     def set_rollout_curriculum(self, phase, names, probabilities, difficulties):
         """Set future-reset curriculum without relabelling an active episode."""

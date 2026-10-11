@@ -325,6 +325,9 @@ class EnvConfig:
 
     # 运动强度/速度相关参数
     motion_frequency_scale: float = 1.0
+    # Opt-in range PPO: None preserves the historical shared clock exactly.
+    rigid_frequency_scale: float | None = None
+    replay_time_scale: float = 1.0
     shape_motion_scale: float = 1.0
     rigid_translation_scale: float = 1.0
     rigid_rotation_scale: float = 1.0
@@ -587,6 +590,7 @@ class EnvConfig:
             "rigid_shape_max_acceleration",
         )
         positive = (
+            "replay_time_scale",
             "episode_seconds",
             "cable_length_scale",
             "cable_density_scale",
@@ -603,6 +607,9 @@ class EnvConfig:
                 raise ValueError(f"{name} must be non-negative")
             if name in positive and value <= 0.0:
                 raise ValueError(f"{name} must be positive")
+        if self.rigid_frequency_scale is not None and (
+            not math.isfinite(self.rigid_frequency_scale) or self.rigid_frequency_scale <= 0):
+            raise ValueError('rigid_frequency_scale must be positive or None')
         if not math.isfinite(self.rigid_motion_exit_y):
             raise ValueError("rigid_motion_exit_y must be finite")
         if (
@@ -3656,7 +3663,7 @@ class CableGraspEnv:
                 if self._uses_replay_motion:
                     # 回放时钟随真实驱动同步前进；悬挂期间暂停，语义与
                     # L1/L2 的进度式路径一致（抓取松开后续走而非补时）。
-                    self._replay_elapsed += float(self.model.opt.timestep)
+                    self._replay_elapsed += float(self.model.opt.timestep) * self.config.replay_time_scale
 
         if (
             self.config.rigid_motion_contact_only
@@ -4407,7 +4414,7 @@ class CableGraspEnv:
         desired_yaw = float(
             anchor_yaw + self._replay_yaw[index] - self._replay_yaw[anchor_index]
         )
-        desired_yaw_rate = float(self._replay_yaw_rate[index])
+        desired_yaw_rate = float(self._replay_yaw_rate[index]) * self.config.replay_time_scale
         current_xy = self.data.xpos[self.cable_ids, :2]
         current_com = np.average(current_xy, axis=0, weights=self.cable_mass)
         current_velocity = np.average(
@@ -4432,7 +4439,7 @@ class CableGraspEnv:
         rotation_rate_correction = desired_yaw_rate * (
             tracked_relative @ np.array([[-sine, cosine], [-cosine, -sine]])
         )
-        desired_velocity = self._replay_vel[index] @ (
+        desired_velocity = self.config.replay_time_scale * self._replay_vel[index] @ (
             self._planar_rotation(anchor_yaw)
         ) - rotation_rate_correction
         acceleration_xy = (
@@ -4489,7 +4496,8 @@ class CableGraspEnv:
     def _rigid_motion_speed(self) -> float:
         return (
             self.config.rigid_motion_nominal_speed
-            * self.config.motion_frequency_scale
+            * (self.config.motion_frequency_scale if self.config.rigid_frequency_scale is None
+               else self.config.rigid_frequency_scale)
         )
 
     def _rigid_motion_path_state(
@@ -4566,10 +4574,7 @@ class CableGraspEnv:
         """返回同起终点、无折返的L1直线或L2三次曲线质心位移。"""
 
         elapsed = max(0.0, float(time_value) - RIGID_MOTION_START_TIME)
-        speed = (
-            self.config.rigid_motion_nominal_speed
-            * self.config.motion_frequency_scale
-        )
+        speed = self._rigid_motion_speed()
         x_sign = 1.0 if math.cos(self.phase_offset) >= 0.0 else -1.0
 
         if self.config.motion_profile_version == "rigid_level1_single_pass_v2":
@@ -4590,11 +4595,8 @@ class CableGraspEnv:
 
     def _rigid_motion_duration(self) -> float:
         if self._uses_replay_motion:
-            return self._replay_valid_steps * self._replay_dt
-        speed = (
-            self.config.rigid_motion_nominal_speed
-            * self.config.motion_frequency_scale
-        )
+            return self._replay_valid_steps * self._replay_dt / self.config.replay_time_scale
+        speed = self._rigid_motion_speed()
         path_length = (
             RIGID_MOTION_TRAVEL
             if self.config.motion_profile_version == "rigid_level1_single_pass_v2"
