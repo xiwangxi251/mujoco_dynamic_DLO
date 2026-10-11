@@ -27,9 +27,28 @@ class TrainingHealthCallback(BaseCallback):
         return True
 
     def _on_rollout_start(self):
+        now = time.monotonic()
+        if hasattr(self, '_sampling_ended'):
+            self.optimizer_and_bookkeeping_seconds = now - self._sampling_ended
+        self._write_record()
+        self._sampling_started = time.monotonic()
+        self._sampling_start_steps = self.num_timesteps
+
+    def _on_rollout_end(self):
+        self._sampling_ended = time.monotonic()
+        self.rollout_sampling_seconds = self._sampling_ended - self._sampling_started
+        self.rollout_fps = (self.num_timesteps - self._sampling_start_steps) / self.rollout_sampling_seconds
+
+    def _on_training_end(self):
+        self._write_record()
+
+    def _write_record(self):
         metrics = {key: float(value) for key, value in self.logger.name_to_value.items()
                    if key.startswith('train/') and isinstance(value, (int, float, np.number))}
-        finite = all(bool(torch.isfinite(p).all()) for p in self.model.policy.parameters())
+        tensors = list(self.model.policy.parameters())
+        for state in self.model.policy.optimizer.state.values():
+            tensors.extend(v for v in state.values() if torch.is_tensor(v))
+        finite = all(bool(torch.isfinite(p).all()) for p in tensors)
         if not finite or not all(np.isfinite(value) for value in metrics.values()):
             raise FloatingPointError('nonfinite PPO parameters or optimization metrics')
         record = dict(updated_at=time.time(), timesteps=self.num_timesteps,
@@ -37,6 +56,13 @@ class TrainingHealthCallback(BaseCallback):
                       completed_episodes=self.completed_episodes, parameters_finite=finite,
                       optimization_metrics=metrics,
                       normal_training=int(self.model._n_updates) > self.starting_updates and bool(metrics))
+        record.update(worker_ready=True, ppo_rounds=int(self.model._n_updates) // self.model.n_epochs,
+                      optimizer_epochs=int(self.model._n_updates),
+                      phase=getattr(self.model, 'ordinary_evaluation_phase', None),
+                      difficulty=getattr(self.model, 'ordinary_evaluation_difficulty', None),
+                      rollout_sampling_seconds=getattr(self, 'rollout_sampling_seconds', None),
+                      rollout_fps=getattr(self, 'rollout_fps', None),
+                      optimizer_and_bookkeeping_seconds=getattr(self, 'optimizer_and_bookkeeping_seconds', None))
         record['penalty_ramp_schedule'] = getattr(self.model, 'penalty_ramp_schedule', None)
         record['target_evaluation_stage'] = getattr(self.model, 'target_evaluation_stage', None)
         self.path.parent.mkdir(parents=True, exist_ok=True)

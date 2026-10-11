@@ -147,6 +147,33 @@ def linear_schedule(
     return schedule
 
 
+def cumulative_linear_schedule(initial, final, horizon, cumulative_target):
+    """SB3 progress measures cumulative samples against this invocation's target."""
+    if horizon <= 0 or cumulative_target <= 0:raise ValueError('Schedule targets must be positive')
+    def schedule(progress_remaining):
+        samples = cumulative_target * (1 - float(progress_remaining))
+        fraction = float(np.clip(samples / horizon, 0, 1))
+        return float(initial + (final - initial) * fraction)
+    return schedule
+
+
+def resolve_global_schedule(args, saved, starting_timesteps):
+    if saved:
+        if args.restart_schedules_on_resume:
+            raise ValueError('Cannot restart a saved global schedule')
+        if args.schedule_total_timesteps and args.schedule_total_timesteps != saved['total_timesteps']:
+            raise ValueError('Global schedule horizon differs from checkpoint')
+        result = dict(saved)
+    elif args.schedule_total_timesteps:
+        result = dict(version='cumulative_samples_v1', total_timesteps=args.schedule_total_timesteps,
+            learning_rate_initial=args.learning_rate_initial, learning_rate_final=args.learning_rate_final,
+            entropy_coef_initial=args.entropy_coef_initial, entropy_coef_final=args.entropy_coef_final)
+    else:return None
+    if starting_timesteps + args.timesteps > result['total_timesteps']:
+        raise ValueError('Requested sample budget exceeds global schedule horizon')
+    return result
+
+
 def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
     """Build one immutable-by-convention reward/action configuration per env."""
     reference = getattr(args, "rl_config_file", None)
@@ -277,6 +304,10 @@ def make_worker(rank: int, args: argparse.Namespace):
             args.training_distribution == "l1"
             and args.curriculum_stage_steps > 0
         ):
+            if getattr(args, 'rollout_ability_curriculum', False):
+                from .rollout_curriculum import configure_env
+                configure_env(env, args.rollout_initial_phase)
+                return env
             initial_mix = args.curriculum_training_mixes[0]
             env.set_training_scenario_distribution(
                 tuple(name for name, _ in initial_mix),
@@ -479,12 +510,13 @@ class MotionCurriculumCallback(BaseCallback):
 class EntropyCoefficientScheduleCallback(BaseCallback):
     """Linearly update PPO's entropy coefficient at rollout boundaries."""
 
-    def __init__(self, initial: float, final: float, total_timesteps: int):
+    def __init__(self, initial: float, final: float, total_timesteps: int, *, cumulative: bool = False):
         super().__init__(verbose=0)
         self.initial = float(initial)
         self.final = float(final)
         self.total_timesteps = max(1, int(total_timesteps))
         self._start_timesteps = 0
+        self.cumulative = cumulative
 
     def _apply(self) -> None:
         elapsed = max(0, self.num_timesteps - self._start_timesteps)
@@ -494,7 +526,7 @@ class EntropyCoefficientScheduleCallback(BaseCallback):
         self.logger.record("train/entropy_coefficient", coefficient)
 
     def _on_training_start(self) -> None:
-        self._start_timesteps = self.num_timesteps
+        self._start_timesteps = 0 if self.cumulative else self.num_timesteps
         self._apply()
 
     def _on_rollout_end(self) -> None:
@@ -1090,6 +1122,10 @@ def parse_args() -> argparse.Namespace:
                         table_execution_guard=None)
     parser.add_argument('--ordinary-reward-profile', choices=('legacy', 'physical_progress_v1', 'physical_progress_v2', 'session_height_v1'), default='legacy')
     parser.add_argument('--ordered-ability-curriculum', action='store_true')
+    parser.add_argument('--rollout-ability-curriculum', action='store_true',
+                        help='Use independent training-episode windows for ordered scene promotion; no eval environments')
+    parser.add_argument('--schedule-total-timesteps', type=int, default=0,
+                        help='Global schedule horizon; preserved in checkpoint across continuations')
     parser.add_argument('--action-workspace', type=Path, help='Measured TCP execution map; does not enable target-node task')
     parser.add_argument('--ordinary-family-curriculum', action='store_true', help='Map ordinary L1 curriculum to the selected placement family')
     args = parser.parse_args()
@@ -1321,8 +1357,14 @@ def parse_args() -> argparse.Namespace:
             tuple((n, a / len(static)) for n in static) + tuple((n, (1-a) / len(component)) for n in component),
             tuple((n, b / len(static)) for n in static) + tuple((n, c / len(component)) for n in component) + ((combined[0], 1-b-c),),
         )
+    if args.rollout_ability_curriculum:
+        args.ordered_ability_curriculum = True
+        if args.eval_freq != 0:
+            parser.error('Rollout curriculum requires --eval-freq 0')
+    if args.schedule_total_timesteps < 0 or (args.schedule_total_timesteps and args.restart_schedules_on_resume):
+        parser.error('Global schedule horizon must be nonnegative and cannot restart on resume')
     if args.ordered_ability_curriculum:
-        if not args.ordinary_family_curriculum or args.curriculum_stage_steps <= 0 or args.eval_episodes != 20 or args.eval_seed_pool_size != 50:
+        if not args.ordinary_family_curriculum or args.curriculum_stage_steps <= 0 or (not args.rollout_ability_curriculum and (args.eval_episodes != 20 or args.eval_seed_pool_size != 50)):
             parser.error('Ordered curriculum requires ordinary family curriculum, enabled stages, 20 episodes per target and 50 seed pool')
         from .ordered_curriculum import GROUPS, MIXES
         args.curriculum_stages, args.curriculum_training_mixes = GROUPS, MIXES
@@ -1338,11 +1380,11 @@ def parse_args() -> argparse.Namespace:
         args.eval_freq < 0
         or args.eval_episodes < 1
         or args.eval_confirmation_episodes < 1
-        or args.eval_workers < 1
+        or args.eval_workers < 0 or (args.eval_freq > 0 and args.eval_workers < 1)
     ):
         parser.error(
-            "evaluation frequency must be non-negative; episode counts and "
-            "--eval-workers must be positive"
+            "evaluation frequency/workers must be non-negative; episode counts "
+            "must be positive, and enabled evaluation requires positive workers"
         )
     if args.target_node_task and args.observation_mode != "state":
         parser.error("target-node task currently requires state observations")
@@ -1369,6 +1411,9 @@ def parse_args() -> argparse.Namespace:
                 "--resume checkpoint uses a different RL action interface and "
                 "cannot be continued safely"
             )
+    if args.rollout_ability_curriculum:
+        from .rollout_curriculum import checkpoint_phase
+        args.rollout_initial_phase = checkpoint_phase(args.resume)
     return args
 
 
@@ -1492,6 +1537,16 @@ def main() -> None:
         model.learning_rate = learning_rate
         model.lr_schedule = learning_rate
 
+    saved_global_schedule = getattr(model, 'training_global_schedule', None)
+    global_schedule = resolve_global_schedule(args, saved_global_schedule, starting_timesteps)
+    if global_schedule:
+        horizon = global_schedule['total_timesteps']
+        model.training_global_schedule = global_schedule
+        learning_rate = cumulative_linear_schedule(global_schedule['learning_rate_initial'],
+            global_schedule['learning_rate_final'], horizon, starting_timesteps + args.timesteps)
+        model.learning_rate = model.lr_schedule = learning_rate
+        entropy_coef_initial = global_schedule['entropy_coef_initial']
+        entropy_coef_final = global_schedule['entropy_coef_final']
     if args.warm_start is not None:
         from .target_node import warm_start_policy
         warm_start_record = warm_start_policy(model, args.warm_start)
@@ -1516,7 +1571,8 @@ def main() -> None:
         EntropyCoefficientScheduleCallback(
             entropy_coef_initial,
             entropy_coef_final,
-            args.timesteps,
+            global_schedule['total_timesteps'] if global_schedule else args.timesteps,
+            cumulative=bool(global_schedule),
         ),
     ]
     curriculum_callback: MotionCurriculumCallback | None = None
@@ -1530,7 +1586,10 @@ def main() -> None:
         and args.curriculum_stage_steps > 0
     ):
         curriculum_class = MotionCurriculumCallback
-        if args.ordered_ability_curriculum:
+        if args.rollout_ability_curriculum:
+            from .rollout_curriculum import RolloutMotionCurriculum
+            curriculum_class = RolloutMotionCurriculum
+        elif args.ordered_ability_curriculum:
             from .ordered_curriculum import OrderedMotionCurriculum
             curriculum_class = OrderedMotionCurriculum
         curriculum_callback = curriculum_class(
@@ -1541,8 +1600,12 @@ def main() -> None:
             secured_rate=args.curriculum_secured_rate,
             success_rate=args.curriculum_success_rate,
             training_mixes=args.curriculum_training_mixes,
+            **(dict(output_dir=args.output, initial_phase=args.rollout_initial_phase) if args.rollout_ability_curriculum else {}),
         )
-        callback_items.append(curriculum_callback)
+        if args.rollout_ability_curriculum:
+            callback_items.insert(0, curriculum_callback)
+        else:
+            callback_items.append(curriculum_callback)
     eval_env: VecEnv | None = None
     if args.eval_freq > 0:
         eval_factories = [
@@ -1803,6 +1866,15 @@ def main() -> None:
     if args.ordered_ability_curriculum:
         from .ordered_curriculum import PROTOCOL
         configuration['ordered_curriculum'] = PROTOCOL
+    configuration.update(actual_eval_workers=args.eval_workers if args.eval_freq > 0 else 0,
+        independent_evaluation_enabled=args.eval_freq > 0,
+        rollout_ability_curriculum=args.rollout_ability_curriculum,
+        training_global_schedule=global_schedule)
+    if args.rollout_ability_curriculum:
+        from .rollout_curriculum import PROTOCOL, PHASES, GROUPS, MIXES
+        configuration['ordered_curriculum'] = dict(PROTOCOL, phases=PHASES, groups=GROUPS, training_mixes=MIXES)
+        configuration['statistics_source'] = 'stochastic training episodes'
+        configuration['rollout_initial_phase'] = args.rollout_initial_phase
     if args.ordinary_reward_profile == 'session_height_v1':
         configuration.update(lift_progress_accounting_version='session_reversible_bounded_balance_v1',
             lift_height_baseline_version='previous_control_step_per_session_v1',
@@ -1818,7 +1890,7 @@ def main() -> None:
     )
 
     try:
-        if args.ordinary_reward_profile == 'session_height_v1':
+        if args.ordinary_reward_profile == 'session_height_v1' or args.rollout_ability_curriculum:
             from .exact_budget import install_exact_budget
             install_exact_budget()
         model.learn(

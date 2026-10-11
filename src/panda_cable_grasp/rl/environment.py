@@ -611,6 +611,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 self.np_random.choice(len(active_configs), p=probabilities)
             )
         scenario = active_configs[index]
+        if hasattr(self, '_rollout_difficulties'):
+            self.set_motion_difficulty(self._rollout_difficulties[scenario.name])
+            self._rollout_episode_phase = self._rollout_pending_phase
+            self._rollout_episode_difficulty = self._motion_difficulty
         overrides = scenario.to_env_overrides()
         amplitude_scale = 0.5 + (
             self._final_disturbance_scale - 0.5
@@ -2274,6 +2278,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         result["commanded_world_translation"] = (
             self._last_commanded_world_translation.copy()
         )
+        if hasattr(self, '_rollout_episode_phase'):
+            result['rollout_episode_phase'] = self._rollout_episode_phase
+            result['rollout_episode_difficulty'] = self._rollout_episode_difficulty
         result["motion_curriculum_difficulty"] = self._motion_difficulty
         result["motion_curriculum_scenarios"] = self._active_scenario_names
         result["motion_curriculum_scenario_probabilities"] = (
@@ -2448,6 +2455,15 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._active_scenario_probabilities = tuple(
             float(value) for value in weights / total
         )
+
+    def set_rollout_curriculum(self, phase, names, probabilities, difficulties):
+        """Set future-reset curriculum without relabelling an active episode."""
+        values = {name: float(difficulties[name]) for name in names}
+        if any(not np.isfinite(v) or not 0 <= v <= 1 for v in values.values()):
+            raise ValueError('Scene difficulties must be finite and in [0, 1]')
+        self.set_training_scenario_distribution(names, probabilities)
+        self._rollout_pending_phase = int(phase)
+        self._rollout_difficulties = values
 
     def set_motion_difficulty(self, difficulty: float) -> None:
         """Set low-to-nominal motion difficulty for subsequent episode resets."""
