@@ -1124,6 +1124,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ordered-ability-curriculum', action='store_true')
     parser.add_argument('--rollout-ability-curriculum', action='store_true',
                         help='Use independent training-episode windows for ordered scene promotion; no eval environments')
+    parser.add_argument('--rollout-gate-profile', choices=('strict', 'fast'), default='strict',
+                        help='Per-scene promotion thresholds; fast uses 40/50/40%% and one complete window')
     parser.add_argument('--schedule-total-timesteps', type=int, default=0,
                         help='Global schedule horizon; preserved in checkpoint across continuations')
     parser.add_argument('--action-workspace', type=Path, help='Measured TCP execution map; does not enable target-node task')
@@ -1600,7 +1602,8 @@ def main() -> None:
             secured_rate=args.curriculum_secured_rate,
             success_rate=args.curriculum_success_rate,
             training_mixes=args.curriculum_training_mixes,
-            **(dict(output_dir=args.output, initial_phase=args.rollout_initial_phase) if args.rollout_ability_curriculum else {}),
+            **(dict(output_dir=args.output, initial_phase=args.rollout_initial_phase,
+                    gate_profile=args.rollout_gate_profile) if args.rollout_ability_curriculum else {}),
         )
         if args.rollout_ability_curriculum:
             callback_items.insert(0, curriculum_callback)
@@ -1870,9 +1873,13 @@ def main() -> None:
         independent_evaluation_enabled=args.eval_freq > 0,
         rollout_ability_curriculum=args.rollout_ability_curriculum,
         training_global_schedule=global_schedule)
+    if global_schedule:
+        configuration['learning_rate_schedule'] = 'linear over cumulative global samples'
+        configuration['entropy_coef_schedule'] = 'linear over cumulative global samples; updated per rollout'
     if args.rollout_ability_curriculum:
-        from .rollout_curriculum import PROTOCOL, PHASES, GROUPS, MIXES
-        configuration['ordered_curriculum'] = dict(PROTOCOL, phases=PHASES, groups=GROUPS, training_mixes=MIXES)
+        from .rollout_curriculum import protocol_for, PHASES, GROUPS, MIXES
+        configuration['ordered_curriculum'] = dict(protocol_for(args.rollout_gate_profile), phases=PHASES, groups=GROUPS, training_mixes=MIXES)
+        configuration['rollout_gate_profile'] = args.rollout_gate_profile
         configuration['statistics_source'] = 'stochastic training episodes'
         configuration['rollout_initial_phase'] = args.rollout_initial_phase
     if args.ordinary_reward_profile == 'session_height_v1':

@@ -8,7 +8,7 @@ import pytest
 from stable_baselines3 import PPO
 
 from panda_cable_grasp.rl import train
-from panda_cable_grasp.rl.rollout_curriculum import GROUPS, VERSION, difficulties, Windows
+from panda_cable_grasp.rl.rollout_curriculum import GROUPS, VERSION, FAST_PROTOCOL, difficulties, Windows
 
 
 def cli(output, extra=()):
@@ -83,6 +83,18 @@ def test_native_spawned_train_and_resume_without_eval(tmp_path, monkeypatch):
     health = json.loads((second / 'training_health.json').read_text())
     assert health['parameters_finite'] and health['rollout_fps'] > 0
     assert health['phase'] == 1
+
+    third = tmp_path / 'fast'
+    monkeypatch.setattr(sys, 'argv', cli(third, ['--resume', str(second / 'final_model.zip'),
+        '--timesteps', '6', '--schedule-total-timesteps', '0', '--rollout-gate-profile', 'fast']))
+    train.main()
+    fast = PPO.load(third / 'final_model.zip', device='cpu')
+    assert fast.num_timesteps == 32 and fast.rollout_gate_state['phase'] == 1
+    assert fast.rollout_gate_state['version'] == FAST_PROTOCOL['version']
+    assert fast.rollout_gate_migration['windows_reset']
+    assert len(fast.rollout_gate_state['windows']['queues'][GROUPS[1][0]]) == 0
+    cfg = json.loads((third / 'training_config.json').read_text())
+    assert cfg['rollout_gate_profile'] == 'fast' and cfg['actual_eval_workers'] == 0
 
 
 def test_rollout_cli_rejects_independent_eval(tmp_path, monkeypatch):

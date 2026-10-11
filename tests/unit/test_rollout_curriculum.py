@@ -4,7 +4,7 @@ import zipfile
 
 import pytest
 
-from panda_cable_grasp.rl.rollout_curriculum import Windows, checkpoint_phase, difficulties, VERSION, RolloutMotionCurriculum
+from panda_cable_grasp.rl.rollout_curriculum import Windows, checkpoint_phase, difficulties, VERSION, RolloutMotionCurriculum, FAST_PROTOCOL
 from panda_cable_grasp.rl.ordered_curriculum import GROUPS, MIXES
 from panda_cable_grasp.rl.train import cumulative_linear_schedule, resolve_global_schedule
 
@@ -60,6 +60,47 @@ def test_success_without_loaded_or_secured_cannot_pass(metric):
     w = Windows(('target',), ())
     fill(w, 'target', 100, dict(GOOD, **{metric: 0}))
     assert not w.decide()['passed']
+
+
+def test_fast_gate_boundary_and_separate_weak_scene():
+    w = Windows(('a', 'b'), ('replay',), protocol=FAST_PROTOCOL)
+    boundary = [dict(success=int(i < 40), loaded=int(i < 50), secured=int(i < 40), attempt=1)
+                for i in range(100)]
+    for row in boundary:
+        w.add('a', row)
+        w.add('b', row)
+    for i in range(19):
+        w.add('replay', dict(GOOD, success=int(i < 6)))
+    assert w.decide() is None
+    w.add('replay', BAD)
+    assert w.decide()['promote']
+    assert w.decide() is None
+    fill(w, 'a', 100)
+    fill(w, 'b', 100, BAD)
+    fill(w, 'replay', 20)
+    assert not w.decide()['passed']
+
+
+def test_rule_change_keeps_phase_but_clears_promotion_evidence(tmp_path):
+    c = RolloutMotionCurriculum(output_dir=tmp_path, initial_phase=0, gate_profile='fast',
+        stages=GROUPS, training_mixes=MIXES)
+    previous = Windows(GROUPS[1], GROUPS[0])
+    fill(previous, GROUPS[1][0], 100)
+    fill(previous, GROUPS[0][0], 50)
+    model = SimpleNamespace(rollout_gate_state=dict(version=VERSION, phase=1,
+        windows=previous.state(), episode_counter=150),
+        get_env=lambda: SimpleNamespace(env_method=lambda *a: None),
+        logger=SimpleNamespace(record=lambda *a: None))
+    c.model = model
+    c.num_timesteps = 1000
+    c._on_training_start()
+    try:
+        assert c.phase_index == 1 and c.episode_counter == 150
+        assert model.rollout_gate_migration['windows_reset']
+        assert all(len(q) == 0 for q in c.windows.queues.values())
+        assert model.rollout_gate_state['version'] == FAST_PROTOCOL['version']
+    finally:
+        c._on_training_end()
 
 
 def test_replay_uses_mastered_difficulty_and_targets_use_current_difficulty():

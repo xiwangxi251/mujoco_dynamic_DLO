@@ -13,15 +13,26 @@ PROTOCOL=dict(version=VERSION,target_episodes=100,replay_episodes=50,consecutive
     success=.6,loaded=.8,secured=.6,replay_success=.4,nonoverlapping=True,
     replay_difficulty='mastered: static 0, motion 1',all_replay_scenes_gated=True,
     independent_evaluation=False,statistics='stochastic training episodes; not held-out deterministic evaluation')
+FAST_PROTOCOL = dict(PROTOCOL, version='ordered_rollout_gate_fast_v2', replay_episodes=20,
+    consecutive_windows=1, success=.4, loaded=.5, secured=.4, replay_success=.3)
+PROFILES = {'strict': PROTOCOL, 'fast': FAST_PROTOCOL}
+
+
+def protocol_for(profile):
+    return dict(PROFILES[profile])
 
 class Windows:
-    def __init__(self, targets, replay, state=None):
+    def __init__(self, targets, replay, state=None, protocol=None):
         self.targets=tuple(targets);self.replay=tuple(replay)
+        self.protocol = dict(protocol or PROTOCOL)
         state=state or {}
-        self.queues={n:deque(state.get('queues',{}).get(n,[]),maxlen=100 if n in targets else 50)
+        self.queues={n:deque(state.get('queues',{}).get(n,[]),maxlen=self.required(n))
                      for n in (*self.targets,*self.replay)}
         self.fresh={n:state.get('fresh',{}).get(n,0) for n in self.queues}
         self.consecutive=state.get('consecutive',0)
+
+    def required(self, name):
+        return self.protocol['target_episodes' if name in self.targets else 'replay_episodes']
 
     def add(self, name, result):
         if name in self.queues:
@@ -31,18 +42,20 @@ class Windows:
         return dict(queues={n:list(q) for n,q in self.queues.items()},fresh=self.fresh.copy(),consecutive=self.consecutive)
 
     def decide(self):
-        required={n:100 if n in self.targets else 50 for n in self.queues}
+        required={n:self.required(n) for n in self.queues}
         if any(len(self.queues[n])<k or self.fresh[n]<k for n,k in required.items()): return None
         scenes=[];passed=True
         for n,k in required.items():
             q=list(self.queues[n]);counts={key:sum(r[key] for r in q) for key in ('success','loaded','secured','attempt')}
-            ok=counts['success']/k >= (.6 if n in self.targets else .4)
-            if n in self.targets: ok=ok and counts['loaded']/k>=.8 and counts['secured']/k>=.6
+            ok=counts['success']/k >= self.protocol['success' if n in self.targets else 'replay_success']
+            if n in self.targets:
+                ok=ok and counts['loaded']/k>=self.protocol['loaded'] and counts['secured']/k>=self.protocol['secured']
             passed=passed and ok
             scenes.append(dict(scenario=n,role='target' if n in self.targets else 'replay',episodes=k,counts=counts,passed=ok))
             self.fresh[n]=0
         self.consecutive=self.consecutive+1 if passed else 0
-        return dict(scenes=scenes,passed=passed,consecutive=self.consecutive,promote=self.consecutive>=2)
+        return dict(scenes=scenes,passed=passed,consecutive=self.consecutive,
+                    promote=self.consecutive>=self.protocol['consecutive_windows'])
 
 def difficulties(phase):
     group,difficulty=PHASES[phase]
@@ -60,15 +73,16 @@ def checkpoint_phase(path):
     if not path.is_file():path=Path(str(path)+'.zip')
     with zipfile.ZipFile(path) as z:data=json.loads(z.read('data'))
     state=data.get('rollout_gate_state',{})
-    if state and state.get('version')!=VERSION:
+    if state and state.get('version') not in {p['version'] for p in PROFILES.values()}:
         raise ValueError('Incompatible rollout curriculum checkpoint version')
     phase=int(state.get('phase',data.get('ordinary_evaluation_phase',0)))
     if not 0<=phase<len(PHASES):raise ValueError('Invalid checkpoint curriculum phase')
     return phase
 
 class RolloutMotionCurriculum(OrderedMotionCurriculum):
-    def __init__(self, output_dir, initial_phase=0, **kwargs):
+    def __init__(self, output_dir, initial_phase=0, gate_profile='strict', **kwargs):
         super().__init__(**kwargs)
+        self.protocol = protocol_for(gate_profile)
         self.output=Path(output_dir)
         self.initial_phase=int(initial_phase)
         if not 0<=self.initial_phase<len(self.phases):raise ValueError('Invalid initial curriculum phase')
@@ -86,13 +100,19 @@ class RolloutMotionCurriculum(OrderedMotionCurriculum):
 
     def _new_windows(self,state=None):
         replay=tuple(n for names in GROUPS[:self.stage_index] for n in names)
-        self.windows=Windows(self.current_scenarios,replay,state)
+        self.windows=Windows(self.current_scenarios,replay,state,self.protocol)
 
     def _on_training_start(self):
         saved=getattr(self.model,'rollout_gate_state',{})
-        if saved and saved.get('version')!=VERSION:raise ValueError('Incompatible rollout curriculum state')
+        if saved and saved.get('version') not in {p['version'] for p in PROFILES.values()}:
+            raise ValueError('Incompatible rollout curriculum state')
         self.phase_index=int(saved.get('phase',self.initial_phase))
-        self._new_windows(saved.get('windows'))
+        changed = bool(saved and saved.get('version') != self.protocol['version'])
+        self._new_windows(None if changed else saved.get('windows'))
+        if changed:
+            self.model.rollout_gate_migration = dict(from_version=saved['version'],
+                to_version=self.protocol['version'], phase=self.phase_index,
+                timesteps=self.num_timesteps, windows_reset=True)
         self.episode_counter=int(saved.get('episode_counter',0))
         self._apply()
         self.output.mkdir(parents=True,exist_ok=True)
@@ -105,15 +125,15 @@ class RolloutMotionCurriculum(OrderedMotionCurriculum):
         self._save_state()
 
     def _save_state(self,persist=True):
-        state=dict(version=VERSION,phase=self.phase_index,windows=self.windows.state(),episode_counter=self.episode_counter)
+        state=dict(version=self.protocol['version'],phase=self.phase_index,windows=self.windows.state(),episode_counter=self.episode_counter)
         self.model.rollout_gate_state=state
         if not persist:return
-        record=dict(version=VERSION,phase=self.phase_index,consecutive=self.windows.consecutive,
-            timesteps=self.num_timesteps,updated_at=time.time(),protocol=PROTOCOL,
+        record=dict(version=self.protocol['version'],phase=self.phase_index,consecutive=self.windows.consecutive,
+            timesteps=self.num_timesteps,updated_at=time.time(),protocol=self.protocol,
             episode_counter=self.episode_counter,target_scenes=self.current_scenarios,
             difficulties=difficulties(self.phase_index),scenes=[dict(scenario=n,
                 role='target' if n in self.windows.targets else 'replay',episodes=len(q),
-                fresh_episodes=self.windows.fresh[n],required_episodes=100 if n in self.windows.targets else 50,
+                fresh_episodes=self.windows.fresh[n],required_episodes=self.windows.required(n),
                 counts={k:sum(r[k] for r in q) for k in ('success','loaded','secured','attempt')})
                 for n,q in self.windows.queues.items()])
         p=self.output/'rollout_gate_status.json';tmp=p.with_suffix('.tmp')

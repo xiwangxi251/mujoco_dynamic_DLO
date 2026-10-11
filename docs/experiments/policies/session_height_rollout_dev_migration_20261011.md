@@ -10,6 +10,9 @@
 - `--rollout-ability-curriculum`：启用14阶段训练回合晋级，自动采用ordered能力组；要求普通cable_x075_v1课程和 `--eval-freq 0`。
 - `--eval-workers 0`：关闭评估时可显式使用0；有独立评估时仍要求正数。
 - `--schedule-total-timesteps 20000000`：LR/entropy使用原全局样本计划；调度元数据写入checkpoint，后续续训自动继承，拒绝扩展预算或重置已保存的全局调度。
+- `--rollout-gate-profile fast`：用户2026-10-11选择的更快晋级档。每个目标独立100回合，成功≥40%、承载≥50%、稳定夹持≥40%；每个回放独立20回合、成功≥30%。一个完整窗口全部达标即晋级。默认strict保留原两窗口规则。
+
+从strict切到fast时，保留checkpoint课程阶段、策略、价值、优化器与全局样本数；晋级窗口清空，以新规则下的训练回合重新计数。奖励、控制、地图及14阶段顺序不变。fast训练和续训均须显式传入该profile。
 
 例如，在新的独立输出目录从零训练：
 
