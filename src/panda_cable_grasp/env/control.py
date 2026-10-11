@@ -27,9 +27,9 @@ def configure_profile(config, profile):
         if config.robot != "nero":
             raise ValueError("enhanced6_bounded_dls_v1 requires NERO")
         config.frame_skip = 10
-        # Match the accepted enhanced6 experiment; keep original speed guards.
+        # The serialized arm switch also governs profile reconfiguration.
         config.arm_acceleration_limit_enabled = False
-        config.hand_cartesian_velocity_limit_enabled = True
+        config.hand_cartesian_velocity_limit_enabled = config.arm_velocity_limits_enabled
         config.hand_linear_velocity_limit = 0.90
         config.hand_angular_velocity_limit = 2.0
     config.controller_profile = profile
@@ -46,16 +46,21 @@ def absolute_pose_twist(position_error, orientation_error, profile=ENHANCED6_BOU
             limit_norm(profile.angular_gain * np.asarray(orientation_error), profile.angular_velocity_limit))
 
 
-def delta_pose_twist(translation_delta, policy_dt, orientation_error, profile=ENHANCED6_BOUNDED_DLS_V1):
+def delta_pose_twist(translation_delta, policy_dt, orientation_error, profile=ENHANCED6_BOUNDED_DLS_V1,
+                     *, velocity_limits_enabled=True):
     if policy_dt <= 0:
         raise ValueError("policy_dt must be positive")
-    return (limit_norm(np.asarray(translation_delta) / policy_dt, profile.linear_velocity_limit),
-            limit_norm(profile.angular_gain * np.asarray(orientation_error), profile.angular_velocity_limit))
+    linear = np.asarray(translation_delta, dtype=float) / policy_dt
+    angular = profile.angular_gain * np.asarray(orientation_error, dtype=float)
+    if velocity_limits_enabled:
+        linear = limit_norm(linear, profile.linear_velocity_limit)
+        angular = limit_norm(angular, profile.angular_velocity_limit)
+    return linear, angular
 
 
 def solve_bounded_full6(jacobian, linear_velocity, angular_velocity, q_current,
                        ready_q, joint_velocity_limits, joint_lower, joint_upper,
-                       profile=ENHANCED6_BOUNDED_DLS_V1):
+                       profile=ENHANCED6_BOUNDED_DLS_V1, *, velocity_limits_enabled=True):
     """Minimize ||Jv-twist||² + damping²||v-ready_bias||² under joint bounds.
 
     Both translation and rotation participate in the same six-dimensional task.
@@ -66,16 +71,19 @@ def solve_bounded_full6(jacobian, linear_velocity, angular_velocity, q_current,
     q = np.asarray(q_current, dtype=float)
     limits = np.asarray(joint_velocity_limits, dtype=float)
     lo, hi = np.asarray(joint_lower, dtype=float), np.asarray(joint_upper, dtype=float)
-    twist = np.r_[limit_norm(linear_velocity, profile.linear_velocity_limit),
-                  limit_norm(angular_velocity, profile.angular_velocity_limit)]
+    twist = np.r_[linear_velocity, angular_velocity].astype(float)
+    if velocity_limits_enabled:
+        twist = np.r_[limit_norm(linear_velocity, profile.linear_velocity_limit),
+                      limit_norm(angular_velocity, profile.angular_velocity_limit)]
     if j.shape != (6, 7) or any(a.shape != (7,) for a in (q, limits, lo, hi, np.asarray(ready_q))):
         raise ValueError("Expected a 6x7 Jacobian and seven joint values")
     if not all(np.all(np.isfinite(a)) for a in (j, q, limits, lo, hi, twist, ready_q)):
         raise ValueError("Full6 inputs must be finite")
     if np.any(limits <= 0) or np.any(lo >= hi):
         raise ValueError("Invalid joint bounds")
-    lower = np.maximum(-limits, (lo-q) / profile.target_horizon)
-    upper = np.minimum(limits, (hi-q) / profile.target_horizon)
+    lower, upper = (lo-q) / profile.target_horizon, (hi-q) / profile.target_horizon
+    if velocity_limits_enabled:
+        lower, upper = np.maximum(-limits, lower), np.minimum(limits, upper)
     if np.any(lower > upper):
         raise RuntimeError("Joint position/velocity bounds infeasible at actual state")
     bias = (np.eye(7)-np.linalg.pinv(j, rcond=1e-5) @ j) @ (

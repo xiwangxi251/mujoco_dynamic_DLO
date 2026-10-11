@@ -442,6 +442,7 @@ class EnvConfig:
     # 机器人运动能力限制
     robot_motion_limit_profile: str = "dynamicvla_panda_v4"
     arm_joint_velocity_limits: tuple[float, ...] = DEFAULT_ARM_JOINT_VELOCITY_LIMITS
+    arm_velocity_limits_enabled: bool = True
     arm_acceleration_limit_enabled: bool = False
     arm_joint_acceleration_limits: tuple[float, ...] = (
         15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0,
@@ -682,6 +683,8 @@ class EnvConfig:
             raise ValueError("table_execution_guard requires enhanced6_bounded_dls_v1")
         if not isinstance(self.arm_acceleration_limit_enabled, bool):
             raise ValueError("arm_acceleration_limit_enabled must be boolean")
+        if not isinstance(self.arm_velocity_limits_enabled, bool):
+            raise ValueError("arm_velocity_limits_enabled must be boolean")
         if not isinstance(self.hand_cartesian_velocity_limit_enabled, bool):
             raise ValueError(
                 "hand_cartesian_velocity_limit_enabled must be boolean"
@@ -2315,7 +2318,7 @@ class CableGraspEnv:
             arm_command - previous_position_target
         ) / control_dt
 
-        if self.config.arm_acceleration_limit_enabled:
+        if self.config.arm_velocity_limits_enabled and self.config.arm_acceleration_limit_enabled:
             velocity_delta = (
                 requested_velocity - self._previous_arm_command_velocity
             )
@@ -2345,6 +2348,8 @@ class CableGraspEnv:
                 / np.maximum(np.abs(acceleration_limited_velocity), 1e-12)
             )),
         )
+        if not self.config.arm_velocity_limits_enabled:
+            joint_velocity_scale = 1.0
         joint_limited_velocity = (
             acceleration_limited_velocity * joint_velocity_scale
         )
@@ -2360,7 +2365,7 @@ class CableGraspEnv:
         ) / control_dt
 
         jacp, jacr = self._hand_jacobian()
-        if self.config.hand_cartesian_velocity_limit_enabled:
+        if self.config.arm_velocity_limits_enabled and self.config.hand_cartesian_velocity_limit_enabled:
             linear_velocity = jacp[:, self.arm_dof_adr] @ bounded_velocity
             angular_velocity = jacr[:, self.arm_dof_adr] @ bounded_velocity
             linear_speed = float(np.linalg.norm(linear_velocity))
@@ -2462,6 +2467,8 @@ class CableGraspEnv:
         """达到逐关节速度上限后停止同向驱动。"""
 
         guarded_action = applied_action.copy()
+        if not self.config.arm_velocity_limits_enabled:
+            return guarded_action, False
         current_qpos = self.data.qpos[self.arm_qpos_adr]
         current_qvel = self.data.qvel[self.arm_dof_adr]
         guard_limits = (
@@ -2906,6 +2913,7 @@ class CableGraspEnv:
             "cable_friction_scale": self.config.cable_friction_scale,
             "robot_motion_limit_profile": self.config.robot_motion_limit_profile,
             "arm_joint_velocity_limits": self._arm_velocity_limits.copy(),
+            "arm_velocity_limits_enabled": self.config.arm_velocity_limits_enabled,
             "arm_acceleration_limit_enabled": (
                 self.config.arm_acceleration_limit_enabled
             ),

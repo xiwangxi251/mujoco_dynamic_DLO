@@ -182,7 +182,12 @@ def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
         saved = json.loads(Path(reference).read_text(encoding="utf-8"))
         saved = saved.get("rl_config", saved)
         accepted = {field.name for field in fields(RLConfig)}
+        unknown = set(saved) - accepted
+        if unknown:
+            raise ValueError(f"Unknown RLConfig fields: {sorted(unknown)}")
         values = {key: value for key, value in saved.items() if key in accepted}
+        if getattr(args, 'arm_velocity_limits', None) is not None:
+            values['arm_velocity_limits_enabled'] = args.arm_velocity_limits
         values["target_reward_profile"] = getattr(args, "target_reward_profile", "legacy")
         if values["target_reward_profile"] in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"}:
             values.update(target_node_task=True, target_node_tolerance=2,
@@ -195,6 +200,7 @@ def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
             values['action_workspace_sha256'] = __import__('hashlib').sha256(args.action_workspace.read_bytes()).hexdigest()
         return RLConfig(**values)
     return RLConfig(
+        arm_velocity_limits_enabled=(getattr(args, 'arm_velocity_limits', None) is not False),
         ordinary_reward_profile=getattr(args, "ordinary_reward_profile", "legacy"),
         action_workspace_path=str(args.action_workspace.resolve()) if getattr(args, 'action_workspace', None) else None,
         action_workspace_sha256=(__import__('hashlib').sha256(args.action_workspace.read_bytes()).hexdigest() if getattr(args, 'action_workspace', None) else None),
@@ -878,6 +884,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-reward-profile", choices=("legacy", "tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"), default=None)
     parser.add_argument("--rl-config-file", type=Path,
                         help="explicit reference RLConfig JSON; preserves its non-target reward/action values")
+    parser.add_argument('--arm-velocity-limits', action=argparse.BooleanOptionalAction, default=None,
+                        help='override saved arm speed guards; gripper speed and position bounds remain')
+    parser.add_argument('--penalty-ramp-reference-workers', type=int, default=None,
+                        help='scratch ramp duration reference, independent of actual worker count')
     parser.add_argument("--resume-legacy-full6", action="store_true",
                         help="explicitly migrate a frozen full6_workspace_target_node_v1 checkpoint")
     parser.add_argument("--target-u-min", type=float, default=1.0 / 6.0)
@@ -1416,6 +1426,13 @@ def parse_args() -> argparse.Namespace:
     if args.rollout_ability_curriculum:
         from .rollout_curriculum import checkpoint_phase
         args.rollout_initial_phase = checkpoint_phase(args.resume)
+    if not rl_config_from_args(args).arm_velocity_limits_enabled:
+        if (args.robot, args.controller_profile, args.action_mode) != (
+                'nero', 'enhanced6_bounded_dls_v1', 'task_space_vertical_down'):
+            parser.error('Uncapped arm execution is validated only for NERO enhanced6 vertical-down task space')
+    if args.penalty_ramp_reference_workers is not None:
+        if args.penalty_ramp_reference_workers < 1 or args.resume is not None:
+            parser.error('penalty-ramp-reference-workers requires a positive value and scratch training')
     return args
 
 
@@ -1435,6 +1452,7 @@ def main() -> None:
         scenario_names=args.training_scenario_names,
     )
     check_env(check_candidate, warn=True)
+    expected_execution = check_candidate.unwrapped.execution_configuration()
     check_candidate.close()
 
     factories = [make_worker(rank, args) for rank in range(args.workers)]
@@ -1450,6 +1468,28 @@ def main() -> None:
             "loaded_lift", "ever_grasped", "lifted_fraction",
         ),
     )
+
+    vector_env.reset()
+    worker_audit = vector_env.env_method('execution_configuration')
+    expected_rl = asdict(rl_config_from_args(args))
+    for rank, actual in enumerate(worker_audit):
+        if actual['rl_config'] != expected_rl:
+            raise RuntimeError(f'Worker {rank} RLConfig disagrees with resolved configuration')
+        if actual['compiled_hashes'] != expected_execution['compiled_hashes']:
+            raise RuntimeError(f'Worker {rank} compiled physics disagrees with checked environment')
+        for key in ('robot', 'frame_skip', 'gripper_finger_velocity_limit',
+                    'table_execution_guard_enabled', 'geometric_safety_enabled'):
+            if actual['env_config'][key] != expected_execution['env_config'][key]:
+                raise RuntimeError(f'Worker {rank} execution configuration disagrees: {key}')
+        enabled = expected_rl['arm_velocity_limits_enabled']
+        if actual['env_config']['arm_velocity_limits_enabled'] != enabled:
+            raise RuntimeError(f'Worker {rank} arm limit switch was not propagated')
+        if not enabled and (actual['env_config']['hand_cartesian_velocity_limit_enabled']
+                            or actual['env_config']['arm_acceleration_limit_enabled']):
+            raise RuntimeError(f'Worker {rank} re-enabled an arm motion limit')
+    audit_path = args.output / 'worker_configuration_audit.json'
+    audit_path.with_suffix('.tmp').write_text(json.dumps(worker_audit, indent=2, default=str), encoding='utf-8')
+    audit_path.with_suffix('.tmp').replace(audit_path)
 
     warm_start_record = None
     if args.resume is None:
@@ -1554,8 +1594,13 @@ def main() -> None:
         warm_start_record = warm_start_policy(model, args.warm_start)
     from .penalty_ramp import resolve_schedule, apply_progress
     from .target_defaults import checkpoint_configuration
-    model.penalty_ramp_schedule = resolve_schedule(model, rl_config_from_args(args), args.workers,
-        checkpoint_configuration(args.resume) if args.resume is not None else {})
+    if args.penalty_ramp_reference_workers is not None and args.penalty_ramp_reference_workers < 1:
+        raise ValueError('penalty-ramp-reference-workers must be positive')
+    ramp_reference = checkpoint_configuration(args.resume) if args.resume is not None else (
+        {'workers': args.penalty_ramp_reference_workers} if args.penalty_ramp_reference_workers else {})
+    if args.resume is not None and args.penalty_ramp_reference_workers is not None:
+        raise ValueError('Resume preserves the checkpoint penalty ramp reference')
+    model.penalty_ramp_schedule = resolve_schedule(model, rl_config_from_args(args), args.workers, ramp_reference)
     apply_progress(vector_env, model, model.penalty_ramp_schedule, training_workers=args.workers)
     from .health import TrainingHealthCallback
     checkpoint_callback = CheckpointCallback(
@@ -1577,6 +1622,9 @@ def main() -> None:
             cumulative=bool(global_schedule),
         ),
     ]
+    if not rl_config_from_args(args).arm_velocity_limits_enabled:
+        from .arm_diagnostics import ArmSpeedDiagnostics
+        callback_items.append(ArmSpeedDiagnostics(args.output))
     curriculum_callback: MotionCurriculumCallback | None = None
     if getattr(args, "workspace_curriculum", False):
         from .workspace import WorkspaceCurriculumCallback
@@ -1682,7 +1730,9 @@ def main() -> None:
         "hold_reward_timer_version": (
             "public_success_hold_v1" if (args.target_reward_profile == "tolerance_progress_v6" or args.ordinary_reward_profile in {"physical_progress_v1", "physical_progress_v2"})
             else "strict_height_band_hold_v1"),
-        "arm_acceleration_limit_enabled": args.controller_profile == "legacy",
+        "arm_acceleration_limit_enabled": (rl_config_from_args(args).arm_velocity_limits_enabled and args.controller_profile == "legacy"),
+        "arm_velocity_limits_enabled": rl_config_from_args(args).arm_velocity_limits_enabled,
+        "penalty_ramp_reference_workers_requested": args.penalty_ramp_reference_workers,
         "target_workspace": (None if args.target_workspace is None else WorkspaceMask(args.target_workspace, args.workspace_mask_key).manifest()),
         "workspace_start_protocol": args.workspace_start_protocol,
         "arm_motion_start_immediate": bool(args.target_workspace is not None
@@ -1843,9 +1893,8 @@ def main() -> None:
             "; optional bounded table-filter/contact and singularity shaping"
         ),
         "action": (
-            "base-frame delta xyz (0.010 m vector-norm cap), world-z yaw "
-            "(0.020 rad), and one hysteretic open/close gripper command; damped resolved-rate "
-            "IK with uniform joint-velocity scaling"
+            f"world-frame delta xyz ({rl_config_from_args(args).translation_delta_scale:g} m vector-norm cap), world-z yaw "
+            f"({rl_config_from_args(args).yaw_delta_scale:g} rad), and one hysteretic open/close gripper command; damped resolved-rate IK"
         ),
     }
     if args.workspace_curriculum:
@@ -1859,6 +1908,8 @@ def main() -> None:
         configuration["curriculum_motion_difficulty"] = "explicit seven-stage workspace curriculum"
     if args.controller_profile == "enhanced6_bounded_dls_v1":
         configuration["action"] = configuration["action"].split(";", 1)[0] + "; enhanced full6 bounded DLS, gravity feedforward and enhanced servo"
+    configuration['action'] += ('; arm velocity guards enabled' if configuration['arm_velocity_limits_enabled']
+                                else '; arm velocity guards disabled, joint position bounds and gripper speed retained')
     if args.target_node_task:
         configuration["rl_success_definition"] = (
             "shared physical lift/retention qualification AND material node error "
