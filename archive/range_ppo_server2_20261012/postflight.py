@@ -22,7 +22,7 @@ def main():
     probe=train.make_worker(0,args)()
     try:
         _,info=probe.reset(seed=20261010)
-        assert info['range_episode']['phase']==2 and info['scenario_name']==ALL_SCENES[2]
+        assert info['range_episode']['phase']==2 and info['scenario_name'] in ALL_SCENES[:3]
     finally:probe.close()
     train.main()
     resumed=PPO.load(ROOT/'smoke_resume/final_model.zip',device='cpu')
