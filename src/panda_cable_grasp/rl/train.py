@@ -315,8 +315,12 @@ def make_worker(rank: int, args: argparse.Namespace):
             and args.curriculum_stage_steps > 0
         ):
             if getattr(args, 'rollout_ability_curriculum', False):
-                from .rollout_curriculum import configure_env
-                configure_env(env, args.rollout_initial_phase)
+                if getattr(args, 'range_motion_curriculum', False):
+                    from .range_curriculum import configure_env
+                    configure_env(env,args.rollout_initial_phase,args.range_initial_state.get('evidence'))
+                else:
+                    from .rollout_curriculum import configure_env
+                    configure_env(env, args.rollout_initial_phase)
                 return env
             initial_mix = args.curriculum_training_mixes[0]
             env.set_training_scenario_distribution(
@@ -1142,6 +1146,8 @@ def parse_args() -> argparse.Namespace:
                         table_execution_guard=None)
     parser.add_argument('--ordinary-reward-profile', choices=('legacy', 'physical_progress_v1', 'physical_progress_v2', 'session_height_v1'), default='legacy')
     parser.add_argument('--ordered-ability-curriculum', action='store_true')
+    parser.add_argument('--range-motion-curriculum', action='store_true',
+        help='Continuous independent motion parameters with per-cell training episode gates')
     parser.add_argument('--rollout-ability-curriculum', action='store_true',
                         help='Use independent training-episode windows for ordered scene promotion; no eval environments')
     parser.add_argument('--rollout-gate-profile', choices=('strict', 'fast'), default='strict',
@@ -1390,6 +1396,10 @@ def parse_args() -> argparse.Namespace:
             tuple((n, a / len(static)) for n in static) + tuple((n, (1-a) / len(component)) for n in component),
             tuple((n, b / len(static)) for n in static) + tuple((n, c / len(component)) for n in component) + ((combined[0], 1-b-c),),
         )
+    if args.range_motion_curriculum:
+        args.rollout_ability_curriculum = True
+        if args.eval_workers != 0 or args.target_node_task:
+            parser.error('Range curriculum requires 0 eval workers and ordinary non-target-node PPO')
     if args.rollout_ability_curriculum:
         args.ordered_ability_curriculum = True
         if args.eval_freq != 0:
@@ -1445,8 +1455,13 @@ def parse_args() -> argparse.Namespace:
                 "cannot be continued safely"
             )
     if args.rollout_ability_curriculum:
-        from .rollout_curriculum import checkpoint_phase
-        args.rollout_initial_phase = checkpoint_phase(args.resume)
+        if args.range_motion_curriculum:
+            from .range_curriculum import checkpoint_state
+            args.range_initial_state=checkpoint_state(args.resume)
+            args.rollout_initial_phase=args.range_initial_state.get('phase',0)
+        else:
+            from .rollout_curriculum import checkpoint_phase
+            args.rollout_initial_phase = checkpoint_phase(args.resume)
     if not rl_config_from_args(args).arm_velocity_limits_enabled:
         if (args.robot, args.controller_profile, args.action_mode) != (
                 'nero', 'enhanced6_bounded_dls_v1', 'task_space_vertical_down'):
@@ -1674,8 +1689,12 @@ def main() -> None:
     ):
         curriculum_class = MotionCurriculumCallback
         if args.rollout_ability_curriculum:
-            from .rollout_curriculum import RolloutMotionCurriculum
-            curriculum_class = RolloutMotionCurriculum
+            if args.range_motion_curriculum:
+                from .range_curriculum import RangeMotionCurriculum
+                curriculum_class = RangeMotionCurriculum
+            else:
+                from .rollout_curriculum import RolloutMotionCurriculum
+                curriculum_class = RolloutMotionCurriculum
         elif args.ordered_ability_curriculum:
             from .ordered_curriculum import OrderedMotionCurriculum
             curriculum_class = OrderedMotionCurriculum
@@ -1973,6 +1992,12 @@ def main() -> None:
         configuration['rollout_gate_profile'] = args.rollout_gate_profile
         configuration['statistics_source'] = 'stochastic training episodes'
         configuration['rollout_initial_phase'] = args.rollout_initial_phase
+    if args.range_motion_curriculum:
+        from .range_curriculum import PROTOCOL as RANGE_PROTOCOL
+        configuration['ordered_curriculum']=RANGE_PROTOCOL
+        configuration['range_motion_curriculum']=True
+        configuration['curriculum_schedule']='six ability groups, continuous per-episode motion sampling, then joint consolidation'
+        configuration['rollout_gate_profile']='range_ability_rollout_v1'
     if args.ordinary_reward_profile == 'session_height_v1':
         configuration.update(lift_progress_accounting_version='session_reversible_bounded_balance_v1',
             lift_height_baseline_version='previous_control_step_per_session_v1',
