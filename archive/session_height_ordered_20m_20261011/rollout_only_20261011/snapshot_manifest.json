@@ -1,0 +1,27 @@
+{
+  "base_commit": "87b59957db9be2f3d6daf287d4af1b4d49a284b3",
+  "dev_comparison_commit": "a04a510b5e694f754fd77c21a46cf9a151a3bf07",
+  "runtime_snapshot": true,
+  "weights_in_git": false,
+  "files": {
+    "run_rollout.py": "2913232b571ca35d38f9842ab1e84bf7dd8b1ff4ad6a4663dc09c41bc6bcd4da",
+    "rollout_gate.py": "c51b765e841f3aa32ff517dd3aa682fe8c7e3c186fa823bf55bb51adfc2cde7e",
+    "test_gate.py": "270aaae9c15f43b210181b4ab3fe509bf5f5545d4e6f10b4e6af24beba396698",
+    "prepare.py": "c2813c6fd85913b03853a265193c436e1ec28dad81c76b690567bb7dcd2fd948",
+    "stop_old.py": "8c03574d1eac2d97627888b0d9f3636781d29bc8ad1fdea514bd03bbeb1c3b8a",
+    "confirm_startup.py": "4a3fb35851dd1b1c839fe8c95a06c51944c0cad5d2864ebebd7a8516ad9f2ae7",
+    "resume_plan.json": "e48a682476f796620f8049fb7b22010665bc4beb75aa1a989cdb1b41d015420b",
+    "resume_preflight.json": "7ca8dcf85b11b548bd162aebeb5733c9ade7fba69b1bf69cb1ab62f17dc30cd9",
+    "resume_load_receipt.json": "13da86fdccb3bca7adcbf64b090a88102fb96291965bcd19268e8c74e4b7eb9c",
+    "startup_receipt.json": "5ea16270b060e5a64303f86cafa6c0e5c7c39d92b0e590caaf1c0f92a80c6462",
+    "stop_previous_receipt.json": "6a389645cc794e02bb8abf2dc69b405facca0370112a50e03fa49be8501bcc71",
+    "training_config.json": "35650164090691b41a510cbe32d4c5ecf33290a71c65680ad3159daaad84e5f6",
+    "reference_config.json": "ffc7c4f8bbe47a1ba8210bbebf8b2d08fa319c1e2384b6afec60b0b791bc3059",
+    "plan.json": "b02dbf38ef02b13f7c81308d4718976eacfe06fd90795b41a697d9a155dd0f03",
+    "preflight.json": "a2be9f0cc854df419a616a76311766376891aa28bfdd0193376bcf139295b23f",
+    "eval_bank_receipt.json": "72ee1e35adf8c5cc4e72c1a253474923e1cd6e96f030af27b1d64df50716f110",
+    "check_once.py": "fa92c2b54d054e59088e88a1c29d0ed1ff0092ce19d5b0fde9d4f299789df9a5"
+  },
+  "verification": "Existing 2-worker real-step preflight, callback lifecycle, exit7 supervisor and 48-worker startup receipts; no rerun of training",
+  "current_training_unchanged": true
+}

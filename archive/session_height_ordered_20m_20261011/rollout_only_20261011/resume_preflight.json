@@ -1,0 +1,226 @@
+{
+  "status": "passed",
+  "workers": 2,
+  "real_steps": 3,
+  "callback_smoke_samples": 6,
+  "mixed_phase_and_mastered_replay_verified": true,
+  "model": {
+    "policy_optimizer_exact": true,
+    "timesteps": 1199808,
+    "optimizer_epochs": 120,
+    "checkpoint_sha256": "ac8a257e084161da84b232ed6f1549e21f0e1df5c71d8003453a213694ba3891",
+    "verified_at": 1791710465.6829474,
+    "optimizer_learning_rate": 0.00028384795200000004,
+    "penalty_ramp_schedule": {
+      "version": "cumulative_samples_v1",
+      "reference_workers": 48,
+      "height_full_samples": 480000,
+      "safety_full_samples": 240000
+    }
+  },
+  "protocol": {
+    "version": "ordered_rollout_gate_v1",
+    "target_episodes": 100,
+    "replay_episodes": 50,
+    "consecutive_windows": 2,
+    "success": 0.6,
+    "loaded": 0.8,
+    "secured": 0.6,
+    "replay_success": 0.4,
+    "nonoverlapping": true,
+    "replay_difficulty": "mastered: static 0, motion 1",
+    "all_replay_scenes_gated": true,
+    "independent_evaluation": false,
+    "statistics": "stochastic training episodes; not held-out deterministic evaluation",
+    "phases": [
+      [
+        0,
+        0.0
+      ],
+      [
+        1,
+        0.0
+      ],
+      [
+        2,
+        0.3333333333333333
+      ],
+      [
+        2,
+        0.6666666666666666
+      ],
+      [
+        2,
+        1.0
+      ],
+      [
+        3,
+        0.3333333333333333
+      ],
+      [
+        3,
+        0.6666666666666666
+      ],
+      [
+        3,
+        1.0
+      ],
+      [
+        4,
+        0.3333333333333333
+      ],
+      [
+        4,
+        0.6666666666666666
+      ],
+      [
+        4,
+        1.0
+      ],
+      [
+        5,
+        0.3333333333333333
+      ],
+      [
+        5,
+        0.6666666666666666
+      ],
+      [
+        5,
+        1.0
+      ]
+    ],
+    "groups": [
+      [
+        "dev_static_x075_v1"
+      ],
+      [
+        "dev_static_midshape_v1_x075_v1"
+      ],
+      [
+        "dev_rigid_l1_nominal_x075_v1"
+      ],
+      [
+        "dev_rigid_l1_midshape_v1_x075_v1",
+        "dev_rigid_replay_shape_nominal_x075_v1"
+      ],
+      [
+        "dev_shape_nominal_current_x075_v1"
+      ],
+      [
+        "dev_combined_l1_nominal_x075_v1"
+      ]
+    ],
+    "training_mixes": [
+      [
+        [
+          "dev_static_x075_v1",
+          1.0
+        ]
+      ],
+      [
+        [
+          "dev_static_midshape_v1_x075_v1",
+          0.8
+        ],
+        [
+          "dev_static_x075_v1",
+          0.2
+        ]
+      ],
+      [
+        [
+          "dev_rigid_l1_nominal_x075_v1",
+          0.8
+        ],
+        [
+          "dev_static_x075_v1",
+          0.1
+        ],
+        [
+          "dev_static_midshape_v1_x075_v1",
+          0.1
+        ]
+      ],
+      [
+        [
+          "dev_rigid_l1_midshape_v1_x075_v1",
+          0.4
+        ],
+        [
+          "dev_rigid_replay_shape_nominal_x075_v1",
+          0.4
+        ],
+        [
+          "dev_static_x075_v1",
+          0.06666666666666667
+        ],
+        [
+          "dev_static_midshape_v1_x075_v1",
+          0.06666666666666667
+        ],
+        [
+          "dev_rigid_l1_nominal_x075_v1",
+          0.06666666666666667
+        ]
+      ],
+      [
+        [
+          "dev_shape_nominal_current_x075_v1",
+          0.8
+        ],
+        [
+          "dev_static_x075_v1",
+          0.04
+        ],
+        [
+          "dev_static_midshape_v1_x075_v1",
+          0.04
+        ],
+        [
+          "dev_rigid_l1_nominal_x075_v1",
+          0.04
+        ],
+        [
+          "dev_rigid_l1_midshape_v1_x075_v1",
+          0.04
+        ],
+        [
+          "dev_rigid_replay_shape_nominal_x075_v1",
+          0.04
+        ]
+      ],
+      [
+        [
+          "dev_combined_l1_nominal_x075_v1",
+          0.8
+        ],
+        [
+          "dev_static_x075_v1",
+          0.03333333333333333
+        ],
+        [
+          "dev_static_midshape_v1_x075_v1",
+          0.03333333333333333
+        ],
+        [
+          "dev_rigid_l1_nominal_x075_v1",
+          0.03333333333333333
+        ],
+        [
+          "dev_rigid_l1_midshape_v1_x075_v1",
+          0.03333333333333333
+        ],
+        [
+          "dev_rigid_replay_shape_nominal_x075_v1",
+          0.03333333333333333
+        ],
+        [
+          "dev_shape_nominal_current_x075_v1",
+          0.03333333333333333
+        ]
+      ]
+    ]
+  },
+  "created_at": 1791710707.4954479
+}

@@ -1,0 +1,8 @@
+{
+  "path": "/data1/hxai/mujoco/mujoco_dynamic_DLO/outputs/rl/train/ppo_nero_targetnode_state6_warmstart3m_20260928/eval_banks",
+  "files": {
+    "replay_src_shape_nominal_v1.manifest.json": "e8c413026a0a246fa1a619a50b0746fbdf1d43a010b1b08179264c60aea01af6",
+    "replay_src_shape_nominal_v1.npz": "e42b22a1ab3d2b5a9674fd772a2954794dcc87c3d858bf8c9faff91df1b85e73",
+    "verification.json": "84d33cf3c3fa5353250c70eb7f8e5db15f5aba67868d7b1d2c347b13593f6418"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "policy_optimizer_exact": true,
+  "timesteps": 1399776,
+  "optimizer_epochs": 140,
+  "checkpoint_sha256": "8b7ee55b97bf53589a8e27fccef42ae328505336f828d535802854cc4e61a749",
+  "verified_at": 1791710865.36536,
+  "optimizer_learning_rate": 0.00028119374400000007,
+  "penalty_ramp_schedule": {
+    "version": "cumulative_samples_v1",
+    "reference_workers": 48,
+    "height_full_samples": 480000,
+    "safety_full_samples": 240000
+  }
+}
