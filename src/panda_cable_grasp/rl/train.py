@@ -1088,7 +1088,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(robot=None, action_mode=None, controller_profile=None,
                         table_execution_guard=None)
-    parser.add_argument('--ordinary-reward-profile', choices=('legacy', 'physical_progress_v1', 'physical_progress_v2'), default='legacy')
+    parser.add_argument('--ordinary-reward-profile', choices=('legacy', 'physical_progress_v1', 'physical_progress_v2', 'session_height_v1'), default='legacy')
+    parser.add_argument('--ordered-ability-curriculum', action='store_true')
     parser.add_argument('--action-workspace', type=Path, help='Measured TCP execution map; does not enable target-node task')
     parser.add_argument('--ordinary-family-curriculum', action='store_true', help='Map ordinary L1 curriculum to the selected placement family')
     args = parser.parse_args()
@@ -1320,6 +1321,11 @@ def parse_args() -> argparse.Namespace:
             tuple((n, a / len(static)) for n in static) + tuple((n, (1-a) / len(component)) for n in component),
             tuple((n, b / len(static)) for n in static) + tuple((n, c / len(component)) for n in component) + ((combined[0], 1-b-c),),
         )
+    if args.ordered_ability_curriculum:
+        if not args.ordinary_family_curriculum or args.curriculum_stage_steps <= 0 or args.eval_episodes != 20 or args.eval_seed_pool_size != 50:
+            parser.error('Ordered curriculum requires ordinary family curriculum, enabled stages, 20 episodes per target and 50 seed pool')
+        from .ordered_curriculum import GROUPS, MIXES
+        args.curriculum_stages, args.curriculum_training_mixes = GROUPS, MIXES
     if (
         args.training_distribution != "l1"
         and args.curriculum_stage_steps > 0
@@ -1523,7 +1529,11 @@ def main() -> None:
         args.training_distribution == "l1"
         and args.curriculum_stage_steps > 0
     ):
-        curriculum_callback = MotionCurriculumCallback(
+        curriculum_class = MotionCurriculumCallback
+        if args.ordered_ability_curriculum:
+            from .ordered_curriculum import OrderedMotionCurriculum
+            curriculum_class = OrderedMotionCurriculum
+        curriculum_callback = curriculum_class(
             stages=args.curriculum_stages,
             update_every=args.curriculum_update_steps,
             required_evaluations=args.curriculum_required_evals,
@@ -1542,7 +1552,11 @@ def main() -> None:
             eval_env = DummyVecEnv(eval_factories)
         else:
             eval_env = SubprocVecEnv(eval_factories, start_method="spawn")
-        callback_items.append(StrictSuccessEvalCallback(
+        evaluation_class = StrictSuccessEvalCallback
+        if args.ordered_ability_curriculum:
+            from .ordered_curriculum import OrderedSuccessEval
+            evaluation_class = OrderedSuccessEval
+        callback_items.append(evaluation_class(
             eval_env,
             args.output / "evaluation",
             eval_freq=args.eval_freq,
@@ -1786,11 +1800,27 @@ def main() -> None:
             "confirmed physical geometry with existing contact-loss grace, not uninterrupted raw contacts"
         )
         configuration["observation"] = "state99 plus target material u, TCP-relative position/velocity and tangent: 109-D"
+    if args.ordered_ability_curriculum:
+        from .ordered_curriculum import PROTOCOL
+        configuration['ordered_curriculum'] = PROTOCOL
+    if args.ordinary_reward_profile == 'session_height_v1':
+        configuration.update(lift_progress_accounting_version='session_reversible_bounded_balance_v1',
+            lift_height_baseline_version='previous_control_step_per_session_v1',
+            lift_reward_holding_version='confirmed_distance_contact_grace_v3_no_aperture',
+            lift_reward_contact_grace_seconds=vector_env.env_method('_lift_reward_contact_grace_seconds')[0],
+            secured_grasp_accounting_version='confirmed_distance_contact_grace_v3_no_aperture',
+            secured_contact_grace_seconds=vector_env.env_method('_lift_reward_contact_grace_seconds')[0],
+            hold_reward_timer_version='strict_height_band_hold_v1',
+            strict_hold_reward_version='strict_in_height_band_high_water_v1',
+            session_lift_node_switch='refund old balance; new node uses its own previous-step height')
     (args.output / "training_config.json").write_text(
         json.dumps(configuration, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     try:
+        if args.ordinary_reward_profile == 'session_height_v1':
+            from .exact_budget import install_exact_budget
+            install_exact_budget()
         model.learn(
             total_timesteps=args.timesteps,
             callback=callbacks,

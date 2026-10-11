@@ -74,6 +74,7 @@ class TrainingMetricsCallback(BaseCallback):
             "episode", "timesteps", "success", "strict_success", "ever_pinched",
             "ever_aligned_pinch", "lift_attempt", "loaded_lift", "ever_grasped",
             "episode_return", "episode_length", "lifted_fraction",
+            "scenario_name", "phase_at_completion", "difficulty_at_completion",
         ]
         required_v3_fields = {
             "strict_success", "ever_pinched", "ever_aligned_pinch", "lift_attempt",
@@ -184,6 +185,9 @@ class TrainingMetricsCallback(BaseCallback):
                 "episode_return": episode_return,
                 "episode_length": episode_length,
                 "lifted_fraction": lifted_fraction,
+                "scenario_name": info.get("scenario_name"),
+                "phase_at_completion": getattr(self.model, "ordinary_evaluation_phase", 0),
+                "difficulty_at_completion": getattr(self.model, "ordinary_evaluation_difficulty", 0.0),
                 **({key: info.get(key) for key in (
                     "goal_node_index", "goal_node_error", "goal_success",
                     "any_node_success", "wrong_target_grasp_count",

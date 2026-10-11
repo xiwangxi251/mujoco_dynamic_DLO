@@ -139,8 +139,10 @@ class RLConfig:
     safety_penalty_ramp_env_steps: int = 5_000
 
     def __post_init__(self) -> None:
-        if self.ordinary_reward_profile not in {"legacy", "physical_progress_v1", "physical_progress_v2"}:
+        if self.ordinary_reward_profile not in {"legacy", "physical_progress_v1", "physical_progress_v2", "session_height_v1"}:
             raise ValueError("Unknown ordinary reward profile")
+        if self.ordinary_reward_profile == "session_height_v1" and not self.height_band_reward_enabled:
+            raise ValueError("session_height_v1 requires height-band rewards")
         if self.ordinary_reward_profile != "legacy" and self.target_node_task:
             raise ValueError("Ordinary reward profile cannot enable target-node task")
         if not isinstance(self.target_node_task, bool):
@@ -502,6 +504,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self._last_grasp_body_height_above_table = 0.0
         self._episode_initial_cable_z = np.zeros(len(self.base_env.cable_ids))
         self._lift_progress_credit = None
+        self._session_lift_credit = None
         self._approach_progress_credit = None
         self._secured_candidate_hold = 0.0
         self._secured_contact_loss_hold = 0.0
@@ -1488,6 +1491,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         revised_progress = self._ordinary_progress or self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"}
         lift_scale = self.goal.lift_reward_scale() if revised_progress and self.goal is not None else float(goal_match)
         height_pinched = physical_pinch and lift_scale > 0. if revised_progress else pinch_confirmed
+        if self.rl_config.ordinary_reward_profile == "session_height_v1":
+            height_pinched = self._current_lift_reward_holding(grasp_status)
         pregrasp = not physical_pinch
         progress = self._previous_distance - distance if pregrasp else 0.0
         previous_distance = self._previous_distance
@@ -1722,6 +1727,13 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._lift_credit_high_water = self._lift_progress_credit.height_high_water
             self._cable_lift_credit_high_water = self._lift_progress_credit.fraction_high_water
 
+        if self._session_lift_credit is not None:
+            holding = self._current_lift_reward_holding(grasp_status)
+            held_index = self.base_env.cable_index[self.base_env.grasp_state.body_id] if holding else None
+            delta = self._session_lift_credit.update(self._lift_credit_heights(), held_index)
+            lift_progress_reward = self.rl_config.reward_lift_progress * delta
+            self._lift_credit_high_water = max(self._lift_credit_high_water, self._session_lift_credit.balance)
+
         # Preserve qualification across the contact-loss steps preceding the
         # physical break event. The immediately previous step may be unheld.
         if secured_grasp and goal_match:
@@ -1752,7 +1764,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             self._contact_loss_penalty_applied = True
         penalize_physical_slip = bool(penalize_contact_loss)
 
-        if self._contact_grace_rewards:
+        if self._contact_grace_rewards and self.rl_config.ordinary_reward_profile != "session_height_v1":
             # The task's 500 Hz timer already includes goal matching, lift
             # geometry and confirmed physical retention with contact grace.
             # Raw bilateral/height-band timers remain diagnostics only.
@@ -1852,7 +1864,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
 
     @property
     def _contact_grace_rewards(self):
-        return self._ordinary_progress or self.rl_config.target_reward_profile == "tolerance_progress_v6"
+        return (self._ordinary_progress or self.rl_config.ordinary_reward_profile == "session_height_v1"
+                or self.rl_config.target_reward_profile == "tolerance_progress_v6")
 
     def _lift_reward_contact_grace_seconds(self):
         return float(self.base_env.config.grasp_loss_seconds)
@@ -2096,6 +2109,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             release_debits=self._contact_grace_rewards,
             first_holding_baseline=self.rl_config.ordinary_reward_profile == "physical_progress_v2",
         ) if self._ordinary_progress or self.rl_config.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} else None)
+        from .session_lift import SessionLiftCredit
+        self._session_lift_credit = (SessionLiftCredit(self._lift_credit_heights(), self.rl_config.height_band_low_m)
+            if self.rl_config.ordinary_reward_profile == "session_height_v1" else None)
         self._secured_session_active = False
         self._secured_session_target_match = False
         self._last_grasp_break_key = None
@@ -2329,8 +2345,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         result["height_band_hold"] = self._height_band_hold
         result["lift_reward_holding_qualified"] = (
             self._current_lift_reward_holding(self._last_grasp_status)
-            if self._ordinary_progress or self.rl_config.target_reward_profile in {"tolerance_progress_v5", "tolerance_progress_v6"}
+            if self._ordinary_progress or self.rl_config.ordinary_reward_profile == "session_height_v1" or self.rl_config.target_reward_profile in {"tolerance_progress_v5", "tolerance_progress_v6"}
             else bool(self._last_grasp_status["pinch_confirmed"]))
+        result["session_lift_balance_m"] = self._session_lift_credit.balance if self._session_lift_credit else 0.0
+        result["session_lift_sessions"] = self._session_lift_credit.sessions if self._session_lift_credit else 0
         result["height_penalty_scale"] = self._last_height_penalty_scale
         result["overheight_severity"] = self._last_overheight_severity
         result["overheight_step_penalty_total"] = (
