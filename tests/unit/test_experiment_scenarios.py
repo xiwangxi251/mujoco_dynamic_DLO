@@ -619,7 +619,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
                                    False, float(env.data.time), 0.0)
                         if candidate else None
                     )
-                    policy = DynamicCableGraspPolicy(env)
+                    policy = DynamicCableGraspPolicy(env, PolicyConfig(use_contact_feedback=True))
                     policy.phase = Phase.CLOSE
                     policy.phase_start = (
                         float(env.data.time) - policy.config.close_hard_timeout - 0.1
@@ -639,7 +639,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1014)
-            policy = DynamicCableGraspPolicy(env)
+            policy = DynamicCableGraspPolicy(env, PolicyConfig(use_contact_feedback=True))
             policy.phase = Phase.CLOSE
             policy.phase_start = float(env.data.time) - 1.0
             env.finger_contacts = lambda cable_body=None: [env.target_body_id]
@@ -655,7 +655,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1014)
-            policy = DynamicCableGraspPolicy(env)
+            policy = DynamicCableGraspPolicy(env, PolicyConfig(use_contact_feedback=True))
             policy.phase = Phase.CLOSE
             policy.phase_start = (
                 float(env.data.time) - policy.config.close_hard_timeout - 0.1
@@ -712,7 +712,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         try:
             env.reset(randomize=False, seed=1016)
             env.config.episode_seconds = 15.0
-            policy = DynamicCableGraspPolicy(env)
+            policy = DynamicCableGraspPolicy(env, PolicyConfig(use_contact_feedback=True))
             policy.phase = Phase.LIFT
             policy.phase_start = float(env.data.time)
 
@@ -740,7 +740,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         env = self.make("id_static")
         try:
             env.reset(randomize=False, seed=1017)
-            policy = DynamicCableGraspPolicy(env, PolicyConfig(max_retries=0))
+            policy = DynamicCableGraspPolicy(env, PolicyConfig(max_retries=0, use_contact_feedback=True))
             policy.phase = Phase.LIFT
             policy.phase_start = float(env.data.time)
 
@@ -763,7 +763,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
         try:
             env.reset(randomize=False, seed=1018)
             env.config.episode_seconds = 15.0
-            policy = DynamicCableGraspPolicy(env)
+            policy = DynamicCableGraspPolicy(env, PolicyConfig(use_contact_feedback=True))
             env.data.time = (
                 env.config.episode_seconds
                 - policy.config.retry_min_remaining_seconds
@@ -806,7 +806,7 @@ class EnvironmentScenarioTests(unittest.TestCase):
             del env
 
     def test_prediction_uses_selected_node_position_and_velocity(self) -> None:
-        for mode in ("middle_angle", "middle_geometry"):
+        for mode in ("middle_angle", "middle_geometry", "whole_geometry"):
             with self.subTest(target_selection_mode=mode):
                 env = self.make("id_static")
                 try:
@@ -1369,8 +1369,13 @@ class EnvironmentScenarioTests(unittest.TestCase):
             env._update_rigid_motion_suspension_state()
             self.assertTrue(env.rigid_motion_suspended)
             self.assertIsNone(env.last_grasp_break)
-            # An OPEN request keeps holding until the jaws actually separate.
+            # Aperture alone is not a qualification threshold: physical loss
+            # must be observed before the drive resumes.
             env.data.qpos[env.finger_qpos_adr] = 0.025
+            env._update_physical_grasp_state(gripper_closed=False)
+            env._update_rigid_motion_suspension_state()
+            self.assertTrue(env.rigid_motion_suspended)
+            env._current_grasp_error = lambda: 2.0 * env.config.max_pad_distance
             env._update_physical_grasp_state(gripper_closed=False)
             env._update_rigid_motion_suspension_state()
             self.assertFalse(env.rigid_motion_suspended)

@@ -33,7 +33,8 @@ def test_profile_selects_lift_contact_grace(profile, paid):
             _,parts=env._reward(np.zeros(5),False,{'lifted_fraction':.2},status)
             assert parts['reward_lift_progress']>0 and parts['reward_cable_lift_progress']>0
             env.data.qpos[env.base_env.finger_qpos_adr]=[.05,-.05]
-            assert not env._current_lift_reward_holding(status)
+            # Aperture alone does not invalidate the existing physical hold.
+            assert env._current_lift_reward_holding(status)
             env.data.qpos[env.base_env.finger_qpos_adr]=[.012,-.012]
             env._grasp_center_position=lambda: np.array([1.,0.,top+.10])
             assert not env._current_lift_reward_holding(status)

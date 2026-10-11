@@ -26,6 +26,9 @@ from .shadow_rollout import ShadowCableRollout, ShadowTrajectory
 class FormulaInterceptConfig(PolicyConfig):
     """Parameters for future-trajectory candidate search."""
 
+    # Preserve the expert's separate orientation configuration.
+    follow_target_tangent: bool = False
+    use_contact_feedback: bool = True
     candidate_horizons: tuple[float, ...] = (0.35, 0.55, 0.75, 0.95)
     replan_interval: float = 0.20
     endpoint_margin_nodes: int = 4

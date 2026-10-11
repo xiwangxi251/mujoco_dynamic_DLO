@@ -84,7 +84,7 @@ def saved_args(tmp_path, monkeypatch, extra=()):
 def test_saved_stage_defaults_use_checkpoint_stage_not_later_run_stage(tmp_path, monkeypatch):
     args, config = saved_args(tmp_path, monkeypatch)
     assert args.scenario_names == config['training_scenario_names']
-    assert WorkspaceMask(args.target_workspace).manifest()['xy_bounds_m'] == [.60,.84,-.22,.30]
+    assert WorkspaceMask(args.target_workspace).manifest() == config['target_workspace']
     calls = {}
     env = SimpleNamespace(goal=SimpleNamespace(), rl_config=RLConfig(),
         set_penalty_ramp_progress=lambda *values: calls.update(ramp=values),

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 import math
 
+import mujoco
 import numpy as np
 
 from ..env.environment import CableGraspEnv
@@ -44,6 +45,9 @@ class PolicyConfig:
     # tangent crosses the planned jaw-closing axis at a favorable angle.
     # middle_geometry also favors a long straight, isolated, reachable section.
     target_selection_mode: str = "middle"
+    # Geometry selectors retain their chosen material point throughout an
+    # attempt; proximity to another fold must not silently change the target.
+    preserve_selected_material_target: bool = False
     target_middle_fraction: float = 0.20
     target_min_crossing_angle_deg: float = 60.0
     intercept_x_limits: tuple[float, float] = (0.30, 0.82)
@@ -110,6 +114,14 @@ class PolicyConfig:
     # downward approach axis.  This is a task-space pose ablation; zero keeps
     # the calibrated baseline unchanged.
     nero_grasp_yaw_offset_deg: float = 0.0
+    # Align the closing axis perpendicular to the current target tangent in XY.
+    # Keep the grasp orientation once physical grasp confirmation is established.
+    follow_target_tangent: bool = True
+    # Default baseline observes cable nodes and robot state only. Contact truth
+    # remains an explicit compatibility option for the separate expert.
+    use_contact_feedback: bool = False
+    lift_check_seconds: float = 1.0
+    lift_check_minimum_rise: float = 0.03
     policy_joint_velocity_fraction: float = 1.0
     ik_target_horizon: float = 0.11
     intercept_timeout: float = 9.0
@@ -192,6 +204,7 @@ class PolicyConfig:
             "approach_orientation_gain", "precision_orientation_gain",
             "ik_target_horizon", "strict_vertical_tolerance",
             "retry_min_remaining_seconds", "nero_pose_orientation_weight",
+            "lift_check_seconds", "lift_check_minimum_rise",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
@@ -201,8 +214,8 @@ class PolicyConfig:
             or not 0.0 < self.target_filter_alpha <= 1.0
         ):
             raise ValueError("target_filter_alpha must be in (0, 1]")
-        if self.target_selection_mode not in {"middle", "middle_angle", "middle_geometry"}:
-            raise ValueError("target_selection_mode must be middle, middle_angle, or middle_geometry")
+        if self.target_selection_mode not in {"middle", "middle_angle", "middle_geometry", "whole_geometry"}:
+            raise ValueError("target_selection_mode must be middle, middle_angle, middle_geometry, or whole_geometry")
         if not 0.0 < self.target_middle_fraction < 0.5:
             raise ValueError("target_middle_fraction must be in (0, 0.5)")
         if not 0.0 <= self.target_min_crossing_angle_deg <= 90.0:
@@ -211,6 +224,10 @@ class PolicyConfig:
             raise ValueError("policy_joint_velocity_fraction must be in (0, 1]")
         if not isinstance(self.strict_vertical_gripper, bool):
             raise ValueError("strict_vertical_gripper must be boolean")
+        if not isinstance(self.follow_target_tangent, bool):
+            raise ValueError("follow_target_tangent must be boolean")
+        if not isinstance(self.use_contact_feedback, bool):
+            raise ValueError("use_contact_feedback must be boolean")
         if not isinstance(self.nero_post_grasp_orientation_priority, bool):
             raise ValueError("nero_post_grasp_orientation_priority must be boolean")
         if not isinstance(self.nero_intercept_orientation_priority, bool):
@@ -325,6 +342,7 @@ class DynamicCableGraspPolicy:
         self.locked_segment_alpha = 0.0
         self.locked_node_ids: list[int] | None = None
         self.last_close_contact_time = -math.inf
+        self._lift_reference_height: float | None = None
         self.lift_start = np.zeros(3)
         self.lift_goal = np.zeros(3)
         self.carry_start = np.zeros(3)
@@ -454,7 +472,8 @@ class DynamicCableGraspPolicy:
         )[:2]
         closing /= max(float(np.linalg.norm(closing)), 1e-12)
         middle = len(node_ids) // 2
-        geometry_mode = self.config.target_selection_mode == "middle_geometry"
+        geometry_mode = self.config.target_selection_mode in {"middle_geometry", "whole_geometry"}
+        whole_geometry_mode = self.config.target_selection_mode == "whole_geometry"
         # The corridor test needs the full 3D jaw frame; middle and
         # middle_angle never score geometry so they keep the planar path.
         corridor = bool(self.config.corridor_clearance and geometry_mode)
@@ -477,7 +496,9 @@ class DynamicCableGraspPolicy:
                     else self.config.target_middle_fraction)
         radius = max(1, int(round(fraction * len(node_ids))))
         candidates: list[tuple[int, float, float, float]] = []
-        for index in range(max(1, middle - radius), min(len(node_ids) - 1, middle + radius + 1)):
+        lo = 2 if whole_geometry_mode else max(1, middle - radius)
+        hi = len(node_ids) - 2 if whole_geometry_mode else min(len(node_ids) - 1, middle + radius + 1)
+        for index in range(lo, hi):
             tangent = positions[index + 1] - positions[index - 1]
             length = float(np.linalg.norm(tangent))
             if length < 1e-8:
@@ -503,12 +524,32 @@ class DynamicCableGraspPolicy:
                 reach = float(np.linalg.norm(positions[index] - self.env.hand_position[:2]))
                 # A clear, locally straight section is more useful than one
                 # whose node happens to lie one step closer to the midpoint.
-                quality = (
-                    -2.0 * min(bend / 45.0, 2.0)
-                    + 1.0 * min(clearance / 0.10, 1.0)
-                    - 0.10 * abs(index - middle)
-                    - 1.5 * max(reach - 0.25, 0.0) / 0.10
-                )
+                if whole_geometry_mode:
+                    point3 = self.env.data.xpos[node_ids[index]]
+                    in_workspace = (
+                        self.config.intercept_x_limits[0] <= point3[0] <= self.config.intercept_x_limits[1]
+                        and self.config.intercept_y_limits[0] <= point3[1] <= self.config.intercept_y_limits[1]
+                        and self.config.intercept_z_limits[0] <= point3[2] <= self.config.intercept_z_limits[1]
+                    )
+                    support = float(np.linalg.norm(
+                        self.env.data.xpos[node_ids[min(index + 3, len(node_ids)-1)]]
+                        - self.env.data.xpos[node_ids[max(index - 3, 0)]]
+                    ))
+                    quality = (
+                        2.0 * min(max((angle - 45.0) / 45.0, 0.0), 1.0)
+                        - 1.8 * min(bend / 90.0, 1.5)
+                        + 1.4 * min(clearance / 0.10, 1.0)
+                        + 1.0 * min(support / 0.10, 1.0)
+                        - 1.3 * max(reach - 0.25, 0.0) / 0.10
+                        - 3.0 * float(not in_workspace)
+                    )
+                else:
+                    quality = (
+                        -2.0 * min(bend / 45.0, 2.0)
+                        + 1.0 * min(clearance / 0.10, 1.0)
+                        - 0.10 * abs(index - middle)
+                        - 1.5 * max(reach - 0.25, 0.0) / 0.10
+                    )
                 if hasattr(self, "attempted_target_indices") and index in self.attempted_target_indices:
                     quality -= 3.0
                 if corridor:
@@ -589,6 +630,7 @@ class DynamicCableGraspPolicy:
         self.locked_node_ids = None
         self.last_close_contact_time = -math.inf
         self.last_desired = self.env.hand_position.copy()
+        self._lift_reference_height = None
         self.recover_start = self.last_desired.copy()
         self.recover_goal = self.last_desired.copy()
         self.failure_hold_position = self.last_desired.copy()
@@ -620,11 +662,47 @@ class DynamicCableGraspPolicy:
                 else z_rotation @ rotation
             )
         self.desired_quat = rotation_to_quat(desired_rotation)
+        self._tangent_reference_rotation = desired_rotation.copy()
         self.desired_approach_axis = (
             desired_rotation @ self.env.gripper_approach_axis_local
         )
         self._choose_initial_target(desired_rotation)
         self.filtered_target = self._initial_target()
+        if self.config.follow_target_tangent:
+            self._update_target_tangent_orientation()
+
+    def _update_target_tangent_orientation(self) -> None:
+        """Follow the tracked material tangent, choosing the nearest symmetric yaw."""
+        if not self.config.follow_target_tangent:
+            return
+        if self.phase not in {Phase.SETTLE, Phase.APPROACH, Phase.INTERCEPT, Phase.CLOSE}:
+            return
+        if self.config.use_contact_feedback and self.phase is Phase.CLOSE and self.env.grasp_confirmed:
+            return
+        node_ids = self.locked_node_ids or self._policy_node_ids()
+        positions = self.env.data.xpos[node_ids]
+        if self.locked_segment_index is not None:
+            index = self.locked_segment_index
+            tangent = positions[index + 1, :2] - positions[index, :2]
+        else:
+            index = node_ids.index(self.selected_target_body_id)
+            tangent = positions[min(index + 1, len(node_ids) - 1), :2] - positions[max(index - 1, 0), :2]
+        if np.linalg.norm(tangent) < 1e-8:
+            return
+        base = self._tangent_reference_rotation
+        base_closing = base @ self.env.gripper_closing_axis_local
+        current = np.empty(9)
+        mujoco.mju_quat2Mat(current, self.desired_quat)
+        current_closing = current.reshape(3, 3) @ self.env.gripper_closing_axis_local
+        base_angle = math.atan2(base_closing[1], base_closing[0])
+        previous_yaw = math.atan2(current_closing[1], current_closing[0]) - base_angle
+        target_yaw = math.atan2(tangent[1], tangent[0]) + math.pi / 2 - base_angle
+        # A parallel gripper has the same grasp geometry after a 180-degree yaw.
+        delta = (target_yaw - previous_yaw + math.pi / 2) % math.pi - math.pi / 2
+        yaw = previous_yaw + delta
+        c, s = math.cos(yaw), math.sin(yaw)
+        desired_rotation = np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]]) @ base
+        self.desired_quat = rotation_to_quat(desired_rotation)
 
     @property
     def phase_time(self) -> float:
@@ -697,7 +775,14 @@ class DynamicCableGraspPolicy:
         to implement predictive segment selection.
         """
 
-        if self.config.target_selection_mode != "middle_geometry":
+        if self.config.preserve_selected_material_target:
+            node_ids = self._policy_node_ids()
+            self.locked_segment_index = min(self.selected_target_index, len(node_ids) - 2)
+            self.locked_segment_alpha = float(self.selected_target_index == len(node_ids) - 1)
+            self.locked_node_ids = node_ids
+            self.filtered_target = self.env.data.xpos[node_ids[self.selected_target_index]].copy()
+            return self.filtered_target.copy()
+        if self.config.target_selection_mode not in {"middle_geometry", "whole_geometry"}:
             return self._lock_segment_near(point)
         node_ids = self._policy_node_ids()
         positions = self.env.data.xpos[node_ids]
@@ -748,6 +833,13 @@ class DynamicCableGraspPolicy:
 
     def _lock_segment_near(self, point: np.ndarray) -> np.ndarray:
         """锁定当前进入夹持中心的线段，闭爪后不再追逐原随机目标节点。"""
+        if self.config.preserve_selected_material_target:
+            if self.locked_segment_index is None:
+                return self._select_intercept_segment(point)
+            ids = self.locked_node_ids
+            j, alpha = self.locked_segment_index, self.locked_segment_alpha
+            return ((1.0 - alpha) * self.env.data.xpos[ids[j]]
+                    + alpha * self.env.data.xpos[ids[j + 1]]).copy()
         node_ids = self._policy_node_ids()
         nearest, _, index, alpha = self._nearest_cable_point(point)
         self.locked_segment_index = index
@@ -811,19 +903,19 @@ class DynamicCableGraspPolicy:
             and remaining >= self.config.retry_min_remaining_seconds
         )
 
-    def _retry_from_unsafe_pose(self, hand: np.ndarray) -> np.ndarray:
+    def _retry_from_unsafe_pose(self, hand: np.ndarray, reason: str = "failed_no_contact") -> np.ndarray:
         """Record a failed attempt, then recover whenever budget remains."""
 
         self.attempt_failure_count += 1
-        self.last_attempt_failure = "failed_no_contact"
-        if self.config.target_selection_mode == "middle_geometry":
+        self.last_attempt_failure = reason
+        if self.config.target_selection_mode in {"middle_geometry", "whole_geometry"}:
             self.attempted_target_indices.add(self.selected_target_index)
         if self._retry_available():
             self.retry_count += 1
             self.result = "running"
             self._begin_vertical_recovery(hand)
             return self._ik_action(self.recover_start, self.env.gripper_open_ctrl)
-        self.result = "failed_no_contact"
+        self.result = reason
         self._transition(Phase.RELEASE)
         return self._ik_action(hand, self.env.gripper_open_ctrl)
 
@@ -847,7 +939,7 @@ class DynamicCableGraspPolicy:
         """Freeze one confirmed break, then retry if the episode permits it."""
 
         self.failure_diagnostics = (
-            None if self.env.last_grasp_break is None
+            None if not self.config.use_contact_feedback or self.env.last_grasp_break is None
             else self.env.last_grasp_break.copy()
         )
         self.attempt_failure_count += 1
@@ -961,10 +1053,10 @@ class DynamicCableGraspPolicy:
         # only slow the tilt recovery this branch exists to perform.
         if self.env.robot == "nero" and not self._tilt_realign_active and (
             self.config.nero_weighted_pose_ik
-            or self.config.target_selection_mode == "middle_geometry"
+            or self.config.target_selection_mode in {"middle_geometry", "whole_geometry"}
         ):
             pose_weight = (
-                0.35 if self.config.target_selection_mode == "middle_geometry"
+                0.35 if self.config.target_selection_mode in {"middle_geometry", "whole_geometry"}
                 and not self.config.nero_weighted_pose_ik
                 else self.config.nero_pose_orientation_weight
             )
@@ -1150,9 +1242,23 @@ class DynamicCableGraspPolicy:
         self.locked_segment_index = None
         self.locked_segment_alpha = 0.0
         self.locked_node_ids = None
+        self._lift_reference_height = None
         self.recover_start = hand.copy()
         self.recover_goal = hand + np.array([0.0, 0.0, 0.18])
         self._transition(Phase.RECOVER)
+
+    def _tracked_segment_height(self) -> float:
+        """Current height of the same material point; no contact or prediction."""
+        if self.locked_segment_index is None:
+            return float(self.env.data.xpos[self.selected_target_body_id, 2])
+        ids = self.locked_node_ids or self._policy_node_ids()
+        i, a = self.locked_segment_index, self.locked_segment_alpha
+        return float((1-a)*self.env.data.xpos[ids[i], 2] + a*self.env.data.xpos[ids[i+1], 2])
+
+    def _node_lift_failed(self) -> bool:
+        return bool(self._lift_reference_height is not None
+                    and self._tracked_segment_height() - self._lift_reference_height
+                    < self.config.lift_check_minimum_rise)
 
     def _close_capture_distance(self) -> float:
         """Distance at which descent transitions to gripper closure.
@@ -1185,10 +1291,10 @@ class DynamicCableGraspPolicy:
         hand = self.env.hand_position
         # 一旦真实指垫接触产生候选，就锁定实际进入夹爪的局部线段；否则继续追踪
         # 回合开始时选择的参考目标。这样不会夹到线后仍被远处目标节点拉走。
-        if self.phase is Phase.CLOSE and self.env.grasp_state is not None:
+        if self.config.use_contact_feedback and self.phase is Phase.CLOSE and self.env.grasp_state is not None:
             self._lock_segment_near(self.env.data.xpos[self.env.grasp_state.body_id])
         close_contacts = (
-            self.env.finger_contacts() if self.phase is Phase.CLOSE else []
+            self.env.finger_contacts() if self.config.use_contact_feedback and self.phase is Phase.CLOSE else []
         )
         if close_contacts:
             # 单侧指垫先接触时也应保持当前线段位于指间；这里仅改变机器人目标，
@@ -1197,6 +1303,7 @@ class DynamicCableGraspPolicy:
         target = self._predicted_segment(
             prediction_horizon=0.0 if close_contacts else None
         )
+        self._update_target_tangent_orientation()
 
         if self.phase is Phase.SETTLE:
             # 线缆自然运动期间保持夹持中心位置，同时先完成夹爪朝向对齐。
@@ -1265,6 +1372,10 @@ class DynamicCableGraspPolicy:
             nearest, nearest_distance, nearest_index, _ = (
                 self._nearest_cable_point(hand)
             )
+            if self.config.preserve_selected_material_target:
+                nearest = self._lock_segment_near(hand)
+                nearest_distance = float(np.linalg.norm(nearest - hand))
+                nearest_index = self.locked_segment_index
             # 截获期间持续追踪进入该阶段时锁定的材料线段，避免在相邻弯折间
             # 跳变；但闭爪触发仍以任意真实线缆中心线进入夹持区域为准。
             vertical_ready = (
@@ -1273,7 +1384,7 @@ class DynamicCableGraspPolicy:
             )
             intended_segment_ready = True
             if (
-                self.config.target_selection_mode == "middle_geometry"
+                self.config.target_selection_mode in {"middle_geometry", "whole_geometry"}
                 and self.locked_segment_index is not None
             ):
                 intended_segment_ready = (
@@ -1321,6 +1432,13 @@ class DynamicCableGraspPolicy:
             return self._ik_action(desired, self.env.gripper_open_ctrl)
 
         if self.phase is Phase.CLOSE:
+            if not self.config.use_contact_feedback:
+                if self.phase_time >= self.config.close_timeout:
+                    self._lift_reference_height = self._tracked_segment_height()
+                    self.lift_start = hand.copy()
+                    self.lift_goal = hand + np.array([0.0, 0.0, self.config.lift_distance])
+                    self._transition(Phase.LIFT)
+                return self._ik_action(target.copy(), self.HOLD_GRIPPER_CTRL)
             # 闭爪时继续追踪已经进入夹持中心的局部线段；真实接触存在时延长确认窗口，
             # 避免固定0.8秒超时在夹爪仍夹着线缆时主动张开。
             desired = target.copy()
@@ -1341,7 +1459,7 @@ class DynamicCableGraspPolicy:
                     close_contacts or self.env.grasp_state is not None
                 )
                 close_timed_out = (
-                    (self.config.target_selection_mode == "middle_geometry"
+                    (self.config.target_selection_mode in {"middle_geometry", "whole_geometry"}
                      and self.phase_time > self.config.close_invalid_contact_timeout)
                     or
                     self.phase_time > self.config.close_hard_timeout
@@ -1365,7 +1483,8 @@ class DynamicCableGraspPolicy:
             blend = self._smoothstep(self.phase_time / 1.0)
             desired = (1.0 - blend) * self.recover_start + blend * self.recover_goal
             if self.phase_time > 1.0:
-                if self.config.target_selection_mode == "middle_geometry":
+                if (self.config.preserve_selected_material_target
+                        or self.config.target_selection_mode in {"middle_geometry", "whole_geometry"}):
                     self._choose_initial_target(self._nero_grasp_rotation(
                         self.config.nero_grasp_yaw_offset_deg
                     ) if self.env.robot == "nero" else self.VERTICAL_GRASP_ROTATION)
@@ -1374,8 +1493,10 @@ class DynamicCableGraspPolicy:
             return self._ik_action(desired, self.env.gripper_open_ctrl)
 
         if self.phase is Phase.LIFT:
+            if not self.config.use_contact_feedback and self.phase_time >= self.config.lift_check_seconds and self._node_lift_failed():
+                return self._retry_from_unsafe_pose(hand, "failed_no_lift")
             # 把夹持点抬高22 cm；若环境报告抓取断开则保持闭爪记录失败现场。
-            if self.env.grasp_state is None:
+            if self.config.use_contact_feedback and self.env.grasp_state is None:
                 return self._observe_grasp_break(
                     hand, "failed_grasp_broke_on_lift"
                 )
@@ -1397,8 +1518,10 @@ class DynamicCableGraspPolicy:
             return self._ik_action(desired, self.HOLD_GRIPPER_CTRL)
 
         if self.phase is Phase.CARRY:
+            if not self.config.use_contact_feedback and self._node_lift_failed():
+                return self._retry_from_unsafe_pose(hand, "failed_lost_lift")
             # 抬升后朝桌面中心侧移并小幅上抬，用来验证抓取不是瞬时接触。
-            if self.env.grasp_state is None:
+            if self.config.use_contact_feedback and self.env.grasp_state is None:
                 return self._observe_grasp_break(
                     hand, "failed_grasp_broke_on_carry"
                 )
@@ -1415,6 +1538,11 @@ class DynamicCableGraspPolicy:
             return self._ik_action(desired, self.HOLD_GRIPPER_CTRL)
 
         if self.phase is Phase.HOLD:
+            if not self.config.use_contact_feedback:
+                if self._node_lift_failed():
+                    return self._retry_from_unsafe_pose(hand, "failed_lost_lift")
+                # External evaluation owns success/termination; the policy holds.
+                return self._ik_action(self.hold_position.copy(), self.HOLD_GRIPPER_CTRL)
             # 在目标位置保持，环境成功条件需要连续满足规定时长。
             if self.env.grasp_state is None:
                 return self._observe_grasp_break(

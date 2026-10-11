@@ -17,8 +17,11 @@ def test_target_training_enables_validated_stack_and_new_seven_scenes_by_default
     assert args.target_reward_profile == 'tolerance_progress_v6'
     from panda_cable_grasp.rl.workspace import WorkspaceMask
     mask=WorkspaceMask(args.target_workspace)
-    assert mask.manifest()['xy_bounds_m']==[.60,.84,-.22,.30]
-    assert mask.manifest()['accepted_cells']==78
+    assert mask.manifest()['kind']=='annular_sector'
+    assert mask.manifest()['center_xy_m']==[.35,0.]
+    assert mask.manifest()['radius_range_m']==[.28,.56]
+    assert mask.manifest()['angle_range_deg']==[-30.,70.]
+    assert mask.manifest()['provenance']['selected_passing_samples']==88
     assert args.workspace_scene_family == 'cable_x075_v1'
     assert tuple(args.training_scenario_names) == tuple(args.eval_scenario_names) == WORKSPACE_SCENE_FAMILIES['cable_x075_v1']
     assert len(args.training_scenario_names) == 7
@@ -98,3 +101,18 @@ def test_evaluation_inherits_saved_new_defaults_and_preserves_historical_setting
     assert not args.table_execution_guard and args.workspace_scene_family == 'cable_x075_v1'
     with patch('sys.argv', ['eval','--model',str(model),'--disable-table-finger-collision-filter']):
         assert evaluation_args().disable_table_finger_collision_filter
+
+
+def test_saved_workspace_relocation_preserves_both_sector_and_legacy_rectangle(tmp_path):
+    from panda_cable_grasp.env.workspace_geometry import DEFAULT_TARGET_WORKSPACE, LEGACY_RECTANGLE_WORKSPACE
+    from panda_cable_grasp.rl.workspace import WorkspaceMask
+    for original in (DEFAULT_TARGET_WORKSPACE, LEGACY_RECTANGLE_WORKSPACE):
+        workspace=WorkspaceMask(original).manifest()
+        workspace['path']='/unavailable_server/original_workspace.npz'
+        (tmp_path/'training_config.json').write_text(json.dumps(dict(target_node_task=True,
+            robot='nero',target_workspace=workspace,workspace_curriculum=False,
+            controller_profile='enhanced6_bounded_dls_v1',table_execution_guard_enabled=True)))
+        with patch('sys.argv',['eval','--model',str(tmp_path/'checkpoint.zip')]):
+            args=evaluation_args()
+        assert args.target_workspace==original
+        assert WorkspaceMask(args.target_workspace).sha256==workspace['sha256']

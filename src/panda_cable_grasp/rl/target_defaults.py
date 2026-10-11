@@ -76,12 +76,14 @@ def configure_saved_evaluation_defaults(args, argv):
     if '--target-workspace' not in supplied and workspace:
         path = Path(workspace['path'])
         if not path.is_file():
-            # The built-in rectangle can be relocated between Linux/Windows
-            # only when its content hash matches the saved experiment.
-            from .workspace import DEFAULT_TARGET_WORKSPACE
-            if hashlib.sha256(DEFAULT_TARGET_WORKSPACE.read_bytes()).hexdigest() != workspace.get('sha256'):
+            # Relocate either built-in workspace by its saved identity; never
+            # replace a historical rectangle with the newer default sector.
+            from ..env.workspace_geometry import BUILTIN_WORKSPACE_DIR
+            matches=[candidate for candidate in BUILTIN_WORKSPACE_DIR.glob('*.npz')
+                     if hashlib.sha256(candidate.read_bytes()).hexdigest()==workspace.get('sha256')]
+            if not matches:
                 raise ValueError('Saved workspace unavailable; pass --target-workspace with the original NPZ')
-            path = DEFAULT_TARGET_WORKSPACE
+            path = matches[0]
         args.target_workspace = path
     for key in ('workspace_entry_seconds', 'workspace_reset_attempts', 'episode_seconds', 'disturbance'):
         if '--'+key.replace('_', '-') not in supplied and key in saved:

@@ -44,7 +44,7 @@ __TABLE__
 <label>速度 <select id="rate"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label>
 <button class="primary" id="play">同步播放</button><button id="pause">暂停</button><button id="restart">从头播放</button><button id="expand">放大对比</button>
 </div><div class="reference"><label for="episode-reference">回合标识</label><input id="episode-reference" readonly aria-label="可复制回合标识"><button id="copy-reference">复制标识＋时间</button><span id="copy-status" role="status"></span></div><div class="players">__PLAYERS__</div><div class="timeline"><span id="clock">0.00 s</span><input id="seek" type="range" min="0" max="15.02" step="0.02" value="0"></div></div>
-<p id="note" class="note">蓝框：工作区 X=0.60～0.84 m、Y=−0.22～0.30 m，仅显示，不限制选点。黄圈：规则策略当前跟踪的材料点；初始从中点开始，保留默认最近点锁定，因此跟踪点可改变。完整回合按公共物理成功条件计数，所有成功和失败均保留。两路使用同一仿真状态和时间；短片结束后停在末帧。</p>
+<p id="note" class="note">蓝线：环形扇区工作区，圆心(0.35,0)m，半径0.28～0.56m，角度−30°～70°（世界+X为0°、向+Y为正）；仅显示，不限制选点。黄圈：规则策略当前跟踪的材料点；初始从中点开始，保留默认最近点锁定，因此跟踪点可改变。完整回合按公共物理成功条件计数，所有成功和失败均保留。两路使用同一仿真状态和时间；短片结束后停在末帧。</p>
 <footer><a href="report.md" target="_blank">结果记录</a><a href="summary.json" target="_blank">逐回合结果</a><a href="manifest.json" target="_blank">配置与来源</a><a href="episodes.csv">下载 CSV</a></footer>
 <script id="data" type="application/json">__DATA__</script><script>
 const D=JSON.parse(document.getElementById('data').textContent),ids=['global','wrist'],$=id=>document.getElementById(id),vs=()=>ids.map(id=>$('video-'+id));
@@ -98,6 +98,10 @@ def main():
     visibility = next(script for script in re.findall(r'<script>.*?</script>', template, re.S)
                       if 'function showControls(video,show)' in script)
     page = PAGE.replace('__TABLE__', table).replace('__VISIBILITY__', visibility)
+    if manifest.get('workspace',{}).get('kind')!='annular_sector':
+        workspace_note = ('本组录像不绘制工作区边界。' if manifest.get('run_type') == 'scripted_ppo_motion_difficulty_video_grid'
+                          else '蓝框：本次录像沿用历史矩形工作区 X=0.60～0.84m、Y=−0.22～0.30m')
+        page=page.replace('蓝线：环形扇区工作区，圆心(0.35,0)m，半径0.28～0.56m，角度−30°～70°（世界+X为0°、向+Y为正）', workspace_note)
     if historical:
         page = page.replace('<div id="viewing">', f'<p class="note">{HISTORICAL_NOTE}</p><div id="viewing">')
     page = page.replace('<title>规则方法 · 七场景</title>', f'<title>规则方法 · {len(scenes)} 个场景</title>')
@@ -112,21 +116,22 @@ def main():
         fields = ['scene','seed','task_success','task_failure_type','policy_result','duration_s','steps','goal_node','directory']
         writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
         writer.writeheader();writer.writerows(rows)
-    report = [f'# 默认规则方法 {len(scenes)} 场景评测（2026-10-09）', '',
-        f"NERO；{manifest['controller_profile']}；TableExecutionGuard={manifest['table_execution_guard_enabled']}。",
+    robot = str(manifest.get('robot', 'NERO')).upper()
+    report = [f"# 默认规则方法 {len(scenes)} 个条件评测（{manifest.get('run_name', args.output.name)}）", '',
+        f"{robot}；{manifest['controller_profile']}；TableExecutionGuard={manifest['table_execution_guard_enabled']}。",
         'PolicyConfig 默认值；初始中点＋最近点锁定；15 秒上限；工作区仅用于显示；公共物理成功判定。',
-        f"配对种子：{seeds[0]}～{seeds[-1]}；源轨迹库：`{manifest['bank']}`。", '',
+        f"配对种子：{seeds[0]}～{seeds[-1]}；源轨迹库：`{manifest.get('bank', 'not recorded')}`。", '',
         '| 场景 | 成功数 | 成功率 |', '| --- | --- | --- |']
     if historical:
         report[2:2] = [HISTORICAL_NOTE, '']
     report.extend(f'| {label[name]} | {n}/{len(seeds)} | {n/len(seeds):.0%} |' for name,n in results)
     total = sum(n for _,n in results)
-    report += ['', f'总计：{total}/{len(rows)}（{total/len(rows):.1%}）。每场景十次，作为初步检查。', '',
+    report += ['', f'总计：{total}/{len(rows)}（{total/len(rows):.1%}）。每个条件 {len(seeds)} 次。', '',
         f'{len(rows)*2} 路录像按实际控制步状态原生渲染，1280×960、50 fps；H.264 CRF16、GOP≤12、无B帧。',
         '常规控制步为 20 ms；边界终止可能发生在最后一个控制步内，末帧保留真实终止状态。视频为恒定 50 fps，真实仿真时间保存在 trajectory.npz 的 frame_times，例外见 verification.json。',
         '逐视频帧数、时间戳、关键帧间隔及校验和保存在 metadata.json；渲染前后完整物理状态一致。',
-        '黄圈标记策略选取/锁定的当前材料点；蓝框标记 XY 工作区。',
-        '冻结源码及全部文件哈希见 source/source_provenance.json；配置和库哈希见 manifest.json。']
+        '黄圈标记策略选取/锁定的当前材料点；工作区边界是否绘制以录像配置为准。',
+        f"运行配置和来源提交见 manifest.json；源提交：`{manifest.get('source_git_head', 'not recorded')}`。"]
     (args.output/'report.md').write_text('\n'.join(report)+'\n', encoding='utf-8')
     print(json.dumps(dict(episodes=len(rows), successes=total, by_scene=summary['by_scene']), ensure_ascii=False))
 

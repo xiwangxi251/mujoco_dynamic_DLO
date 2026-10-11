@@ -11,7 +11,7 @@ from ..env.control import add_controller_arguments
 from ..evaluation.benchmark import run_benchmark
 from ..evaluation.defaults import DEFAULT_EVALUATION_SEED, DEFAULT_VIDEO_FPS
 from ..paths import output_path
-from ..policies.scripted import DynamicCableGraspPolicy
+from ..policies.scripted import DynamicCableGraspPolicy, PolicyConfig
 from ..scenarios.registry import (
     SCENARIO_SUITE_NAMES,
     get_scenario,
@@ -82,6 +82,7 @@ def run_headless(args: argparse.Namespace) -> None:
         robot=getattr(args, "robot", "panda"),
         controller_profile=getattr(args, "controller_profile", "legacy"),
         table_execution_guard=getattr(args, "table_execution_guard", False),
+        scripted_options={"follow_target_tangent": getattr(args, "follow_target_tangent", PolicyConfig().follow_target_tangent)},
     ))
 
 
@@ -92,7 +93,8 @@ def run_viewer(args: argparse.Namespace) -> None:
 
     env = CableGraspEnv(env_config_from_args(args))
     env.reset(seed=args.seed)
-    policy = DynamicCableGraspPolicy(env)
+    policy = DynamicCableGraspPolicy(env, PolicyConfig(
+        follow_target_tangent=getattr(args, "follow_target_tangent", PolicyConfig().follow_target_tangent)))
     controls = {"reset": False, "paused": False, "speed": float(args.speed)}
 
     def key_callback(keycode: int) -> None:
@@ -186,6 +188,9 @@ def parse_args() -> argparse.Namespace:
         description="Reactive robot grasping of a continuously deforming cable"
     )
     add_controller_arguments(parser)
+    parser.add_argument('--follow-target-tangent', action=argparse.BooleanOptionalAction,
+                        default=PolicyConfig().follow_target_tangent,
+                        help='rotate the gripper closing axis perpendicular to the target tangent (default: enabled)')
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--duration", type=float, default=0.0)

@@ -41,15 +41,30 @@ def test_mask_uses_xy_grid_and_height_band(mask_path):
     assert len(mask.manifest()['sha256']) == 64
 
 
-def test_default_rectangle_includes_exact_corners_and_rejects_outside():
-    from panda_cable_grasp.rl.workspace import DEFAULT_TARGET_WORKSPACE
-    mask=WorkspaceMask(DEFAULT_TARGET_WORKSPACE)
+def test_legacy_rectangle_includes_exact_corners_and_rejects_outside():
+    from panda_cable_grasp.env.workspace_geometry import LEGACY_RECTANGLE_WORKSPACE
+    mask=WorkspaceMask(LEGACY_RECTANGLE_WORKSPACE)
     corners=[[x,y,z] for x in (.60,.84) for y in (-.22,.30) for z in (-.005,.10)]
     assert np.all(mask.contains(corners))
     assert not np.any(mask.contains([[.60-1e-6,0,.01],[.84+1e-6,0,.01],
                                      [.70,-.22-1e-6,.01],[.70,.30+1e-6,.01],
                                      [.70,0,-.005-1e-6],[.70,0,.10+1e-6]]))
     assert np.all(mask.mask) and mask.mask.shape==(13,6)
+
+
+def test_default_sector_includes_curved_boundaries_and_excludes_hole_and_bbox_corners():
+    from panda_cable_grasp.rl.workspace import DEFAULT_TARGET_WORKSPACE
+    mask=WorkspaceMask(DEFAULT_TARGET_WORKSPACE)
+    def point(radius,angle,z=.014):
+        a=np.radians(angle)
+        return [.35+radius*np.cos(a),radius*np.sin(a),z]
+    assert np.all(mask.contains([point(r,a,z) for r in (.28,.56) for a in (-30.,0.,70.) for z in (-.005,.10)]))
+    outside=[point(.28-1e-6,0),point(.56+1e-6,0),point(.4,-30.-1e-6),
+             point(.4,70.+1e-6),point(.4,0,-.005-1e-6),point(.4,0,.10+1e-6),
+             [.35,0,.014],[.9,.5,.014],[.5,-.25,.014]]
+    assert not np.any(mask.contains(outside))
+    assert np.all(mask.contains([point(.4,35),point(.56,0)]))
+    assert mask.manifest()['membership']=='analytic'
 
 
 @pytest.mark.parametrize('axes,shape', [([0, .1, .3], (2, 3)), ([0, 0], (2, 2)),

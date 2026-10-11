@@ -38,6 +38,8 @@ class _FakeEvalVecEnv:
         dones = self._steps >= episode_lengths
         infos = []
         for seed in seeds:
+            # Real environment info uses Python scalars, including JSON booleans.
+            seed = int(seed)
             infos.append({
                 "success": seed % 2 == 0,
                 "strict_success": seed % 4 == 0,

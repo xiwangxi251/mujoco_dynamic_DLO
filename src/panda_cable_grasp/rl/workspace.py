@@ -7,6 +7,7 @@ import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 from .target_node import TargetNodeTask
+from ..env.workspace_geometry import AnnularSector, DEFAULT_TARGET_WORKSPACE
 from ..scenarios.registry import (
     CABLE_X075_REPLAY_SCENARIO_NAMES, LEGACY_PPO_SIX_SOURCE_NAMES, SCENARIO_FAMILIES,
 )
@@ -15,8 +16,6 @@ WORKSPACE_SCENE_FAMILIES = {
     "legacy_ppo_six": LEGACY_PPO_SIX_SOURCE_NAMES,
     "cable_x075_v1": SCENARIO_FAMILIES["cable_x075_v1"],
 }
-DEFAULT_TARGET_WORKSPACE = Path(__file__).with_name("workspaces") / "rectangle_060_084_m022_030.npz"
-TARGET_WORKSPACE_XY_BOUNDS = (.60, .84, -.22, .30)
 WORKSPACE_STAGES = (
     ("static_workspace_all_nodes", (1,0,0,0,0,0), 0.),
     ("complex_static_workspace", (.3,0,0,0,.7,0), 0.),
@@ -57,6 +56,12 @@ class WorkspaceMask:
             self.mask = data[key].astype(bool)
             self.xy_bounds = (data["rectangle_xy_bounds"].copy()
                               if "rectangle_xy_bounds" in data else None)
+            self.sector = (AnnularSector.from_array(data['annular_sector_xy'])
+                           if 'annular_sector_xy' in data else None)
+            self.provenance = (json.loads(str(data['provenance_json']))
+                               if 'provenance_json' in data else None)
+        if self.sector is not None and self.xy_bounds is not None:
+            raise ValueError('Workspace cannot be both a rectangle and a sector')
         if (self.xs.ndim != 1 or self.ys.ndim != 1 or
                 len(self.xs) < 2 or len(self.ys) < 2 or
                 self.mask.shape != (len(self.ys), len(self.xs))):
@@ -84,6 +89,9 @@ class WorkspaceMask:
         positions = np.atleast_2d(np.asarray(positions, dtype=float))
         if positions.shape[1] != 3 or not np.all(np.isfinite(positions)):
             raise ValueError("Expected finite XYZ positions")
+        if self.sector is not None:
+            return (self.sector.contains_xy(positions[:,:2])
+                    & (positions[:,2]>=-.005) & (positions[:,2]<=.10))
         ix = np.rint((positions[:,0]-self.xs[0])/(self.xs[1]-self.xs[0])).astype(int)
         iy = np.rint((positions[:,1]-self.ys[0])/(self.ys[1]-self.ys[0])).astype(int)
         valid = ((ix >= 0) & (ix < len(self.xs)) & (iy >= 0) & (iy < len(self.ys))
@@ -106,6 +114,10 @@ class WorkspaceMask:
                       accepted_cells=int(self.mask.sum()), z_range_m=[-.005, .10])
         if self.xy_bounds is not None:
             result.update(kind="rectangle", xy_bounds_m=self.xy_bounds.tolist())
+        if self.sector is not None:
+            result.update(self.sector.manifest(), membership='analytic')
+        if self.provenance is not None:
+            result['provenance']=self.provenance
         return result
 
 
