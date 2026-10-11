@@ -104,15 +104,19 @@ def calibration_one(job):
         if 'rigid_speed' in params:cfg.rigid_motion_nominal_speed=params['rigid_speed'];cfg.rigid_frequency_scale=1.
         if 'shape_strength' in params:cfg.disturbance_strength=params['shape_strength'];cfg.motion_frequency_scale=params['shape_frequency']
         if 'replay_time_scale' in params:cfg.replay_time_scale=params['replay_time_scale']
-        values=[]
+        values=[];weights=[];terminal={}
         while env.data.time<7.4:
-            env.base_env.step(env.base_env.ready_ctrl.copy())
+            before=float(env.data.time)
+            _,_,success,truncated,terminal=env.base_env.step(env.base_env.ready_ctrl.copy())
             if env.data.time>=.82:
                 velocity=np.array([env.base_env.body_linear_velocity(i) for i in env.base_env.cable_ids])
                 values.append(float(np.average(np.linalg.norm(velocity,axis=1),weights=env.base_env.cable_mass)))
-        return dict(scene=name,cell=cell,seed=seed,parameters=params,mean_speed=float(np.mean(values)),
+                weights.append(float(env.data.time)-max(before,.82))
+            if success or truncated:break
+        return dict(scene=name,cell=cell,seed=seed,parameters=params,mean_speed=float(np.average(values,weights=weights)),
             peak_speed=max(values),samples=len(values),finite=bool(np.isfinite(values).all()),
-            measurement='no-policy mass-weighted mean node speed .82..7.4 seconds')
+            stopped_at=float(env.data.time),termination_reason=terminal.get('termination_reason'),
+            measurement='no-policy time-weighted mass-weighted node speed .82..min(7.4,episode end) seconds')
     finally:env.close()
 
 def preflight():
@@ -252,7 +256,19 @@ def supervise(failure=False):
         write(output/'status.json',status);raise
 
 if __name__=='__main__':
-    if '--preflight' in sys.argv:preflight()
+    if '--calibrate-correction' in sys.argv:
+        setup()
+        from panda_cable_grasp.rl.range_curriculum import ALL_SCENES,cells
+        jobs=[(n,c,20260804) for n in ALL_SCENES[2:] for c in cells(n)]
+        with concurrent.futures.ProcessPoolExecutor(max_workers=12) as pool:
+            calibration=list(pool.map(calibration_one,jobs))
+        assert all(x['finite'] for x in calibration)
+        original=read(ROOT/'preflight.json')
+        write(ROOT/'calibration_superseded.json',dict(reason='Old diagnostics continued stepping after episode termination, overweighting short terminal steps',calibration=original['calibration']))
+        original.update(calibration=calibration,calibration_corrected_at=utc())
+        write(ROOT/'preflight.json',original)
+        print('calibration_corrected',flush=True)
+    elif '--preflight' in sys.argv:preflight()
     elif '--supervise-failure' in sys.argv:supervise(True)
     elif '--supervise' in sys.argv:supervise()
     elif '--train' in sys.argv:
