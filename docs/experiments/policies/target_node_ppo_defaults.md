@@ -14,8 +14,8 @@
 | 工作区诊断范围 | 圆心(0.35,0)m，半径0.28～0.56m，角度−30°～70°的环形扇区；Z诊断窗口仍为−0.005～0.10m。见[当前范围](workspace_near_table_sector_20261010.md) |
 | 成功 / 位置正奖励容差 | ±2 / ±4 节点 |
 
-唯一默认定义位于 `src/panda_cable_grasp/rl/target_defaults.py` 的
-`TARGET_PPO_DEFAULTS`，由正式训练参数解析调用，避免不同启动脚本分别维护开关。
+执行默认定义位于 `src/panda_cable_grasp/rl/target_defaults.py` 的
+`PPO_EXECUTION_PROFILES`，指定点任务默认由 `TARGET_PPO_DEFAULTS` 补充，均由正式训练参数解析调用。
 启动配置保存最终解析值及机器人类型。2026-10-10起，默认新场景族使用包内环形扇区工作区；显式工作区文件优先。原矩形及旧权重配置保留。
 训练库、评估库路径仍须按本机数据位置指定；七阶段课程仍用 `--workspace-curriculum` 显式开启。
 成功与保持奖励修正见 [指定点奖励v6](target_node_reward_v6.md)，当前抬升和稳定承载接触资格见 [接触宽限修正](target_node_lift_contact_grace.md)，松爪后的收益记账见 [下降扣回修正](target_node_lift_release_fix.md)，接近/对齐记账见 [v4](target_node_reward_v4.md)，矩形规则见 [指定点奖励v3](target_node_reward_v3.md)。
@@ -23,7 +23,16 @@
 命令行显式配置优先。复现旧实验须显式选择旧场景族、控制器和奖励；
 需要关闭碰桌保护时使用 `--no-table-execution-guard`。
 复现启用旧预测过滤器的实验时使用 `--enable-table-finger-collision-filter`。
-普通任意点 PPO 的默认配置保持原样。已有权重、冻结源码及历史统计不改写。
+2026-10-11起，普通任意点 PPO 新训练也默认使用同一套 NERO、垂直向下动作、增强控制器及碰桌保护，
+关闭旧预测过滤器。普通 PPO 的任务类型、奖励、场景、课程及工作区默认不变。
+历史 Panda/task_space/legacy 执行配置用 `--execution-profile legacy` 整体选择，单项显式参数仍优先。
+已有权重、冻结源码及历史统计不改写。
+
+续训未显式选择执行 profile 时，从 checkpoint 旁的 `training_config.json` 恢复机器人、动作模式、
+控制器、碰桌保护和旧预测过滤器开关；显式单项参数覆盖保存值。
+旧档案缺少这些字段时停止并列出需要补齐的参数，也可显式选择 `--execution-profile legacy` 或 `nero`；
+动作接口兼容性检查仍然生效，不能据此直接将 Panda 权重用于 NERO。
+启动日志显示最终执行配置，训练配置保存 `execution_profile_requested` 和 `execution_defaults_source`。
 
 评估入口从权重旁的 `training_config.json` 继承机器人、控制器、碰桌保护
 开关及指定点场景族。显式参数可以覆盖；旧配置中关闭的保护不会被新默认开启，

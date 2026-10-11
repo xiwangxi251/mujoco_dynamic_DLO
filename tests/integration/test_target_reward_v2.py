@@ -159,11 +159,10 @@ def test_reference_config_preserves_other_rewards_and_legacy_resume_is_explicit(
     from panda_cable_grasp.rl.train import parse_args, rl_config_from_args
     cfg = asdict(RLConfig(target_node_task=True, target_node_tolerance=4,
                          graspable_end_fraction=0., safety_reward_enabled=True))
-    cfg.update(target_proximity_radius=8, target_first_grasp_only=True)
     reference = tmp_path/'training_config.json'
     reference.write_text(json.dumps(dict(rl_config=cfg, rl_interface_version='full6_workspace_target_node_v1')))
     checkpoint = tmp_path/'checkpoint.zip'; checkpoint.touch()
-    argv = ['train', '--resume', str(checkpoint), '--resume-legacy-full6',
+    argv = ['train', '--resume', str(checkpoint), '--resume-legacy-full6', '--execution-profile', 'nero',
             '--target-node-task', '--target-reward-profile', 'tolerance_progress_v2',
             '--rl-config-file', str(reference), '--robot', 'nero',
             '--action-mode', 'task_space_vertical_down',

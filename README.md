@@ -2,7 +2,8 @@
 
 这是一个基于 MuJoCo 的 Franka Panda / 松灵 NERO 动态柔性线缆抓取项目，包含规则策略、
 PPO 强化学习、特权专家数据采集、DynamicVLA 和视觉 Diffusion Policy。产品代码统一位于
-`src/panda_cable_grasp/`，所有实验产物统一写入 `outputs/`。默认机器人仍为 Panda；NERO
+`src/panda_cable_grasp/`，所有实验产物统一写入 `outputs/`。规则策略等通用入口默认机器人仍为 Panda；
+PPO 新训练默认 NERO、垂直向下动作、增强控制器及碰桌执行保护。NERO
 使用仓库内 `assets/mujoco/nero/` 的 AgileX 官方模型和网格资源。
 
 ## 快速开始
@@ -81,6 +82,11 @@ panda-cable-motion-diagnostics --help
 ```
 
 PPO 训练与评估：
+
+普通 PPO 和指定点 PPO 的新训练共用 NERO 执行默认值；奖励、任务类型和场景分别配置。
+复现 Panda 历史执行配置请加 `--execution-profile legacy`。续训默认从 checkpoint 旁的
+`training_config.json` 恢复执行配置，缺失信息时要求显式补齐；单项命令行参数优先。
+启动日志和配置文件记录最终执行配置及其来源，详见[默认配置规则](docs/experiments/policies/target_node_ppo_defaults.md)。
 
 ```bash
 panda-cable-rl-train --workers 12 --eval-workers 4 --timesteps 2000000 --device cpu

@@ -1,5 +1,6 @@
 import json
 import numpy as np
+import pytest
 from unittest.mock import patch
 from panda_cable_grasp.rl.train import parse_args, make_configured_env
 from panda_cable_grasp.rl.evaluate import parse_args as evaluation_args
@@ -27,14 +28,101 @@ def test_target_training_enables_validated_stack_and_new_seven_scenes_by_default
     assert len(args.training_scenario_names) == 7
 
 
-def test_non_target_training_retains_existing_defaults():
+def test_non_target_training_shares_execution_defaults_without_changing_task():
     with patch('sys.argv', ['train']):
         args = parse_args()
-    assert (args.robot, args.action_mode, args.controller_profile) == ('panda', 'task_space', 'legacy')
-    assert not args.table_execution_guard
-    assert not args.disable_table_finger_collision_filter
+    assert (args.robot, args.action_mode, args.controller_profile) == (
+        'nero', 'task_space_vertical_down', 'enhanced6_bounded_dls_v1')
+    assert args.table_execution_guard
+    assert args.disable_table_finger_collision_filter
+    assert args.execution_defaults_source == 'fresh_default:nero'
+    assert not args.target_node_task
+    assert args.target_workspace is None
     assert args.workspace_scene_family is None
     assert args.target_reward_profile == 'legacy'
+    assert args.ordinary_reward_profile == 'legacy'
+
+
+@pytest.mark.parametrize('target', [False, True])
+def test_explicit_legacy_execution_and_individual_overrides(target):
+    argv = ['train', '--execution-profile', 'legacy'] + (['--target-node-task'] if target else [])
+    with patch('sys.argv', argv):
+        args = parse_args()
+    assert (args.robot, args.action_mode, args.controller_profile) == ('panda', 'task_space', 'legacy')
+    assert not args.table_execution_guard and not args.disable_table_finger_collision_filter
+    assert args.execution_defaults_source == 'explicit_profile:legacy'
+    with patch('sys.argv', argv + ['--robot', 'nero', '--action-mode', 'task_space_vertical_down',
+            '--controller-profile', 'enhanced6_bounded_dls_v1', '--table-execution-guard',
+            '--disable-table-finger-collision-filter']):
+        args = parse_args()
+    assert args.robot == 'nero' and args.action_mode == 'task_space_vertical_down'
+    assert args.controller_profile == 'enhanced6_bounded_dls_v1'
+    assert args.table_execution_guard and args.disable_table_finger_collision_filter
+
+
+def test_incompatible_partial_override_fails_before_environment_creation(capsys):
+    with patch('sys.argv', ['train', '--robot', 'panda']), pytest.raises(SystemExit):
+        parse_args()
+    assert '--execution-profile legacy' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('profile,version', [
+    ('legacy', 'baseline_v4'), ('nero', 'baseline_v6_task_space_vertical_down')])
+def test_resume_restores_saved_execution_with_individual_overrides(tmp_path, profile, version):
+    from panda_cable_grasp.rl.target_defaults import PPO_EXECUTION_PROFILES
+    execution = PPO_EXECUTION_PROFILES[profile]
+    checkpoint = tmp_path/'checkpoints/checkpoint.zip'
+    checkpoint.parent.mkdir()
+    checkpoint.touch()
+    (tmp_path/'training_config.json').write_text(json.dumps(dict(
+        robot=execution['robot'], action_mode=execution['action_mode'],
+        controller_profile=execution['controller_profile'],
+        table_execution_guard_enabled=execution['table_execution_guard'],
+        table_finger_collision_filter_enabled=not execution['disable_table_finger_collision_filter'],
+        rl_interface_version=version)))
+    argv = ['train', '--resume', str(checkpoint)]
+    with patch('sys.argv', argv):
+        args = parse_args()
+    for key, value in execution.items():
+        assert getattr(args, key) == value
+    assert args.execution_defaults_source == 'checkpoint'
+    with patch('sys.argv', argv + ['--no-table-execution-guard', '--enable-table-finger-collision-filter']):
+        args = parse_args()
+    assert not args.table_execution_guard and not args.disable_table_finger_collision_filter
+    assert args.robot == execution['robot'] and args.action_mode == execution['action_mode']
+
+
+def test_resume_with_missing_settings_requires_explicit_choice(tmp_path, capsys):
+    checkpoint = tmp_path/'checkpoint.zip'
+    checkpoint.touch()
+    (tmp_path/'training_config.json').write_text(json.dumps(dict(rl_interface_version='baseline_v4')))
+    argv = ['train', '--resume', str(checkpoint)]
+    with patch('sys.argv', argv), pytest.raises(SystemExit):
+        parse_args()
+    assert 'Resume checkpoint lacks execution settings' in capsys.readouterr().err
+    with patch('sys.argv', argv + ['--execution-profile', 'legacy']):
+        assert parse_args().robot == 'panda'
+    with patch('sys.argv', argv + ['--execution-profile', 'nero']), pytest.raises(SystemExit):
+        parse_args()
+    assert 'different RL action interface' in capsys.readouterr().err
+
+
+def test_non_target_defaults_reach_physical_execution(tmp_path):
+    with patch('sys.argv', ['train', '--training-scenarios', 'id_static',
+                           '--curriculum-stage-steps', '0', '--output', str(tmp_path/'run')]):
+        args = parse_args()
+    env = make_configured_env(args, seed=81, scenario_names=args.training_scenario_names)
+    try:
+        observation, _ = env.reset(seed=81)
+        assert observation.shape == (99,) and env.action_space.shape == (5,)
+        with patch.object(env, '_probe_table_finger_distance', side_effect=AssertionError('old filter called')):
+            observation, reward, _, _, info = env.step(np.zeros(5))
+        assert np.isfinite(observation).all() and np.isfinite(reward)
+        assert info['table_execution_guard_enabled']
+        assert info['table_execution_guard']['guard_steps'] == 10
+        assert not info['table_finger_collision_avoidance_enabled']
+    finally:
+        env.close()
 
 
 def test_defaults_reach_physical_execution_without_guard_or_family_flags(tmp_path):

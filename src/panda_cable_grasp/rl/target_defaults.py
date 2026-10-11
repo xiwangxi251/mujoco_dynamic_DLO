@@ -1,14 +1,24 @@
-"""Resolved defaults for new target-node PPO runs and saved evaluations."""
+"""Shared PPO execution defaults, task defaults and saved evaluations."""
 import json
 import hashlib
 from pathlib import Path
 
-TARGET_PPO_DEFAULTS = {
+PPO_EXECUTION_PROFILES = {'nero': {
     'robot': 'nero',
     'action_mode': 'task_space_vertical_down',
     'controller_profile': 'enhanced6_bounded_dls_v1',
     'table_execution_guard': True,
     'disable_table_finger_collision_filter': True,
+}, 'legacy': {
+    'robot': 'panda',
+    'action_mode': 'task_space',
+    'controller_profile': 'legacy',
+    'table_execution_guard': False,
+    'disable_table_finger_collision_filter': False,
+}}
+
+TARGET_PPO_DEFAULTS = {
+    **PPO_EXECUTION_PROFILES['nero'],
     'workspace_scene_family': 'cable_x075_v1',
     'target_reward_profile': 'tolerance_progress_v6',
 }
@@ -24,16 +34,45 @@ def checkpoint_configuration(checkpoint):
 
 
 def configure_target_training_defaults(args, argv):
-    """Explicit options remain authoritative; defaults are task scoped."""
+    """Resolve execution independently of task type; never guess on resume."""
     supplied = {item.split('=', 1)[0] for item in argv if item.startswith('--')}
     target = args.target_node_task
-    generic = dict(robot='panda', action_mode='task_space',
-                   controller_profile='legacy', table_execution_guard=False,
-                   disable_table_finger_collision_filter=False,
-                   target_reward_profile='legacy')
-    for key in generic:
+    profile = getattr(args, 'execution_profile', None)
+    resume = getattr(args, 'resume', None)
+    if resume is not None and profile is None:
+        saved = checkpoint_configuration(resume)
+        saved_keys = dict(robot='robot', action_mode='action_mode',
+                          controller_profile='controller_profile',
+                          table_execution_guard='table_execution_guard_enabled',
+                          disable_table_finger_collision_filter='table_finger_collision_filter_enabled')
+        defaults = {}
+        missing = []
+        for key, saved_key in saved_keys.items():
+            if getattr(args, key) is not None:
+                continue
+            if saved_key not in saved:
+                missing.append('--'+key.replace('_', '-'))
+                continue
+            value = saved[saved_key]
+            if key in ('table_execution_guard', 'disable_table_finger_collision_filter'):
+                if not isinstance(value, bool):
+                    raise ValueError(f'Saved {saved_key} must be a boolean')
+                if key == 'disable_table_finger_collision_filter':
+                    value = not value
+            defaults[key] = value
+        if missing:
+            raise ValueError('Resume checkpoint lacks execution settings: '+', '.join(missing)
+                             +'. Supply the missing options or explicitly choose '
+                             '--execution-profile nero or --execution-profile legacy.')
+        args.execution_defaults_source = 'checkpoint'
+    else:
+        defaults = PPO_EXECUTION_PROFILES[profile or 'nero']
+        args.execution_defaults_source = ('explicit_profile:' if profile else 'fresh_default:')+(profile or 'nero')
+    for key in PPO_EXECUTION_PROFILES['nero']:
         if getattr(args, key) is None:
-            setattr(args, key, TARGET_PPO_DEFAULTS[key] if target else generic[key])
+            setattr(args, key, defaults[key])
+    if args.target_reward_profile is None:
+        args.target_reward_profile = TARGET_PPO_DEFAULTS['target_reward_profile'] if target else 'legacy'
     if (target and args.workspace_scene_family is None
             and not supplied.intersection({'--training-scenarios', '--eval-scenarios',
                                             '--training-distribution', '--eval-distribution'})):

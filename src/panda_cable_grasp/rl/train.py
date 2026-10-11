@@ -1121,6 +1121,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-seed", type=int, default=20270804)
     parser.add_argument("--device", default="cpu", help="cpu, cuda or auto")
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument('--execution-profile', choices=('nero', 'legacy'), default=None,
+                        help='fresh default: NERO vertical-down enhanced6 with table guard; '
+                             'legacy selects Panda/task_space/legacy; resume inherits saved execution '
+                             'unless a profile is explicitly requested; individual flags take priority')
     parser.add_argument(
         "--restart-schedules-on-resume", action="store_true",
         help=(
@@ -1142,7 +1146,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ordinary-family-curriculum', action='store_true', help='Map ordinary L1 curriculum to the selected placement family')
     args = parser.parse_args()
     from .target_defaults import configure_target_training_defaults
-    configure_target_training_defaults(args, sys.argv[1:])
+    try:
+        configure_target_training_defaults(args, sys.argv[1:])
+    except (ValueError, OSError, TypeError) as error:
+        parser.error(str(error))
+    if args.robot not in ROBOT_SPECS or args.action_mode not in ('task_space', 'task_space_vertical_down', 'joint_target'):
+        parser.error('Saved robot/action mode is unsupported; specify the intended execution settings')
+    if args.controller_profile not in ('legacy', 'enhanced6_bounded_dls_v1'):
+        parser.error('Unsupported saved controller profile')
+    if args.robot != 'nero' and args.controller_profile != 'legacy':
+        parser.error('Enhanced6 requires NERO; for historical Panda use --execution-profile legacy')
+    if args.table_execution_guard and args.controller_profile != 'enhanced6_bounded_dls_v1':
+        parser.error('Table execution guard requires enhanced6; explicitly disable it for a legacy controller')
     if args.target_reward_profile in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"} and not args.target_node_task:
         parser.error("tolerance_progress_v2/v3/v4/v5 requires --target-node-task")
     if args.eval_seed_pool_size < 0:
@@ -1438,6 +1453,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    print(f"execution_source={args.execution_defaults_source} robot={args.robot} "
+          f"action_mode={args.action_mode} controller={args.controller_profile} "
+          f"table_guard={args.table_execution_guard} "
+          f"legacy_table_filter={not args.disable_table_finger_collision_filter}", flush=True)
     args.output.mkdir(parents=True, exist_ok=True)
     from .affinity import prepare_worker_affinity
     args.worker_affinity_plan = prepare_worker_affinity(args)
@@ -1687,6 +1706,8 @@ def main() -> None:
     bind_learner(args)
     configuration = {
         "algorithm": "PPO",
+        "execution_profile_requested": args.execution_profile,
+        "execution_defaults_source": args.execution_defaults_source,
         "robot": args.robot,
         "rl_interface_version": action_interface_version(args.action_mode),
         "action_mode": args.action_mode,
