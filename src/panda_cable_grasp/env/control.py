@@ -1,5 +1,5 @@
 """Opt-in enhanced full-six-dimensional DLS; legacy decoders stay independent."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import numpy as np
 from scipy.optimize import lsq_linear
 
@@ -20,6 +20,15 @@ ENHANCED6_BOUNDED_DLS_V1 = Full6ControlProfile()
 CONTROLLER_PROFILES = ("legacy", ENHANCED6_BOUNDED_DLS_V1.name)
 
 
+def scaled_full6_profile(scale=1.0):
+    """Scale speed bounds while preserving gains, damping and target horizon."""
+    if isinstance(scale, bool) or not np.isfinite(scale) or scale <= 0:
+        raise ValueError('arm_velocity_limit_scale must be finite and positive')
+    return replace(ENHANCED6_BOUNDED_DLS_V1,
+                   linear_velocity_limit=.90*scale,
+                   angular_velocity_limit=1.40*scale)
+
+
 def configure_profile(config, profile):
     if profile not in CONTROLLER_PROFILES:
         raise ValueError(f"unknown controller profile: {profile}")
@@ -30,8 +39,8 @@ def configure_profile(config, profile):
         # The serialized arm switch also governs profile reconfiguration.
         config.arm_acceleration_limit_enabled = False
         config.hand_cartesian_velocity_limit_enabled = config.arm_velocity_limits_enabled
-        config.hand_linear_velocity_limit = 0.90
-        config.hand_angular_velocity_limit = 2.0
+        config.hand_linear_velocity_limit = 0.90*config.arm_velocity_limit_scale
+        config.hand_angular_velocity_limit = 2.0*config.arm_velocity_limit_scale
     config.controller_profile = profile
     return config
 

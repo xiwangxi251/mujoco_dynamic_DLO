@@ -21,7 +21,7 @@ import numpy as np
 from ..env.environment import CableGraspEnv, EnvConfig
 from ..env.contact_cache import cached_contact_reads
 from ..env.control import (
-    ENHANCED6_BOUNDED_DLS_V1, configure_profile, delta_pose_twist,
+    ENHANCED6_BOUNDED_DLS_V1, configure_profile, delta_pose_twist, scaled_full6_profile,
     solve_bounded_full6,
 )
 from ..env.kinematics import quat_error, rotation_to_quat
@@ -49,6 +49,7 @@ class RLConfig:
     translation_delta_scale: float = 0.010
     yaw_delta_scale: float = 0.020
     arm_velocity_limits_enabled: bool = True
+    arm_velocity_limit_scale: float = 1.0
     ik_damping: float = 0.05
     # Task-space IK singularity avoidance is soft: it only becomes active near
     # a rank-deficient Jacobian or a joint limit, and never terminates an episode.
@@ -439,7 +440,11 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             env_config.replay_seed_fallback = replay_seed_fallback
         if not isinstance(self.rl_config.arm_velocity_limits_enabled, bool):
             raise ValueError("arm_velocity_limits_enabled must be boolean")
+        self._full6_control_profile = scaled_full6_profile(self.rl_config.arm_velocity_limit_scale)
+        if not self.rl_config.arm_velocity_limits_enabled and self.rl_config.arm_velocity_limit_scale != 1:
+            raise ValueError('A speed limit scale requires enabled arm velocity guards')
         env_config.arm_velocity_limits_enabled = self.rl_config.arm_velocity_limits_enabled
+        env_config.arm_velocity_limit_scale = self.rl_config.arm_velocity_limit_scale
         self.base_env = CableGraspEnv(env_config)
         self.base_env.config.arm_motion_start_immediate = bool(
             target_workspace is not None and workspace_start_protocol == "policy_from_initial_v3")
@@ -1025,9 +1030,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         if not self.rl_config.arm_velocity_limits_enabled:
             self._last_ik_velocity_scale = 1.0
             return q_velocity
-        velocity_limits = np.asarray(
-            self.base_env.config.arm_joint_velocity_limits, dtype=float
-        )
+        velocity_limits = self.base_env._arm_velocity_limits
         velocity_scale = min(
             1.0,
             float(np.min(
@@ -1047,6 +1050,8 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                       'actuator_ctrlrange', 'jnt_range', 'body_mass', 'body_inertia',
                       'geom_friction', 'geom_solref', 'geom_solimp')
         return dict(rl_config=asdict(self.rl_config), env_config=asdict(base.config),
+                    effective_arm_joint_velocity_limits=base._arm_velocity_limits.tolist(),
+                    effective_full6_profile=asdict(self._full6_control_profile),
                     observation_shape=list(self.observation_space.shape),
                     action_shape=list(self.action_space.shape),
                     physics_timestep=float(self.model.opt.timestep),
@@ -1104,7 +1109,7 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 world_translation,
                 control_dt,
                 orientation_error,
-                ENHANCED6_BOUNDED_DLS_V1,
+                self._full6_control_profile,
                 velocity_limits_enabled=self.rl_config.arm_velocity_limits_enabled,
             )
             q_current = self.data.qpos[self.base_env.arm_qpos_adr]
@@ -1114,10 +1119,10 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
                 angular_velocity,
                 q_current,
                 self.base_env.ready_qpos[:7],
-                np.asarray(self.base_env.config.arm_joint_velocity_limits, dtype=float),
+                self.base_env._arm_velocity_limits,
                 self.model.jnt_range[self.base_env.arm_joint_ids, 0],
                 self.model.jnt_range[self.base_env.arm_joint_ids, 1],
-                ENHANCED6_BOUNDED_DLS_V1,
+                self._full6_control_profile,
                 velocity_limits_enabled=self.rl_config.arm_velocity_limits_enabled,
             )
             self._singularity_metrics(jacobian)
@@ -2765,9 +2770,7 @@ class JointTargetRLCableGraspEnv(RLCableGraspEnv):
             self.model.opt.timestep * max(1, self.base_env.config.frame_skip)
         )
         previous_target = self.base_env._last_applied_action[:7]
-        velocity_limits = np.asarray(
-            self.base_env.config.arm_joint_velocity_limits, dtype=float
-        )
+        velocity_limits = self.base_env._arm_velocity_limits
         target_delta = normalized[:7] * velocity_limits * control_dt
         joint_range = self.model.jnt_range[self.base_env.arm_joint_ids]
         target_qpos = np.clip(

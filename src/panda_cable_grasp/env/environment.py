@@ -443,6 +443,7 @@ class EnvConfig:
     robot_motion_limit_profile: str = "dynamicvla_panda_v4"
     arm_joint_velocity_limits: tuple[float, ...] = DEFAULT_ARM_JOINT_VELOCITY_LIMITS
     arm_velocity_limits_enabled: bool = True
+    arm_velocity_limit_scale: float = 1.0
     arm_acceleration_limit_enabled: bool = False
     arm_joint_acceleration_limits: tuple[float, ...] = (
         15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0,
@@ -685,6 +686,10 @@ class EnvConfig:
             raise ValueError("arm_acceleration_limit_enabled must be boolean")
         if not isinstance(self.arm_velocity_limits_enabled, bool):
             raise ValueError("arm_velocity_limits_enabled must be boolean")
+        if (isinstance(self.arm_velocity_limit_scale, bool)
+                or not math.isfinite(self.arm_velocity_limit_scale)
+                or self.arm_velocity_limit_scale <= 0):
+            raise ValueError('arm_velocity_limit_scale must be finite and positive')
         if not isinstance(self.hand_cartesian_velocity_limit_enabled, bool):
             raise ValueError(
                 "hand_cartesian_velocity_limit_enabled must be boolean"
@@ -1520,7 +1525,7 @@ class CableGraspEnv:
 
         self._arm_velocity_limits = np.asarray(
             self.config.arm_joint_velocity_limits, dtype=float
-        )
+        ) * self.config.arm_velocity_limit_scale
         self._arm_acceleration_limits = np.asarray(
             self.config.arm_joint_acceleration_limits, dtype=float
         )
@@ -2914,6 +2919,7 @@ class CableGraspEnv:
             "robot_motion_limit_profile": self.config.robot_motion_limit_profile,
             "arm_joint_velocity_limits": self._arm_velocity_limits.copy(),
             "arm_velocity_limits_enabled": self.config.arm_velocity_limits_enabled,
+            "arm_velocity_limit_scale": self.config.arm_velocity_limit_scale,
             "arm_acceleration_limit_enabled": (
                 self.config.arm_acceleration_limit_enabled
             ),

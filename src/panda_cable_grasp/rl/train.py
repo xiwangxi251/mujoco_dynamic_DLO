@@ -188,6 +188,8 @@ def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
         values = {key: value for key, value in saved.items() if key in accepted}
         if getattr(args, 'arm_velocity_limits', None) is not None:
             values['arm_velocity_limits_enabled'] = args.arm_velocity_limits
+        if getattr(args, 'arm_velocity_limit_scale', None) is not None:
+            values['arm_velocity_limit_scale'] = args.arm_velocity_limit_scale
         values["target_reward_profile"] = getattr(args, "target_reward_profile", "legacy")
         if values["target_reward_profile"] in {"tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"}:
             values.update(target_node_task=True, target_node_tolerance=2,
@@ -201,6 +203,8 @@ def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
         return RLConfig(**values)
     return RLConfig(
         arm_velocity_limits_enabled=(getattr(args, 'arm_velocity_limits', None) is not False),
+        arm_velocity_limit_scale=(1.0 if getattr(args, 'arm_velocity_limit_scale', None) is None
+                                  else args.arm_velocity_limit_scale),
         ordinary_reward_profile=getattr(args, "ordinary_reward_profile", "legacy"),
         action_workspace_path=str(args.action_workspace.resolve()) if getattr(args, 'action_workspace', None) else None,
         action_workspace_sha256=(__import__('hashlib').sha256(args.action_workspace.read_bytes()).hexdigest() if getattr(args, 'action_workspace', None) else None),
@@ -886,6 +890,8 @@ def parse_args() -> argparse.Namespace:
                         help="explicit reference RLConfig JSON; preserves its non-target reward/action values")
     parser.add_argument('--arm-velocity-limits', action=argparse.BooleanOptionalAction, default=None,
                         help='override saved arm speed guards; gripper speed and position bounds remain')
+    parser.add_argument('--arm-velocity-limit-scale', type=float, default=None,
+                        help='scale all enhanced6 arm speed guards; actuator dynamics and gripper unchanged')
     parser.add_argument('--penalty-ramp-reference-workers', type=int, default=None,
                         help='scratch ramp duration reference, independent of actual worker count')
     parser.add_argument("--resume-legacy-full6", action="store_true",
@@ -1448,6 +1454,18 @@ def parse_args() -> argparse.Namespace:
     if args.penalty_ramp_reference_workers is not None:
         if args.penalty_ramp_reference_workers < 1 or args.resume is not None:
             parser.error('penalty-ramp-reference-workers requires a positive value and scratch training')
+    speed_config = rl_config_from_args(args)
+    from ..env.control import scaled_full6_profile
+    try:
+        scaled_full6_profile(speed_config.arm_velocity_limit_scale)
+    except ValueError as error:
+        parser.error(str(error))
+    if speed_config.arm_velocity_limit_scale != 1:
+        if not speed_config.arm_velocity_limits_enabled:
+            parser.error('A speed limit scale requires enabled arm velocity guards')
+        if (args.robot, args.controller_profile, args.action_mode) != (
+                'nero', 'enhanced6_bounded_dls_v1', 'task_space_vertical_down'):
+            parser.error('Scaled arm guards are validated only for NERO enhanced6 vertical-down task space')
     return args
 
 
@@ -1753,6 +1771,7 @@ def main() -> None:
             else "strict_height_band_hold_v1"),
         "arm_acceleration_limit_enabled": (rl_config_from_args(args).arm_velocity_limits_enabled and args.controller_profile == "legacy"),
         "arm_velocity_limits_enabled": rl_config_from_args(args).arm_velocity_limits_enabled,
+        "arm_velocity_limit_scale": rl_config_from_args(args).arm_velocity_limit_scale,
         "penalty_ramp_reference_workers_requested": args.penalty_ramp_reference_workers,
         "target_workspace": (None if args.target_workspace is None else WorkspaceMask(args.target_workspace, args.workspace_mask_key).manifest()),
         "workspace_start_protocol": args.workspace_start_protocol,
