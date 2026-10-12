@@ -44,7 +44,8 @@ def completed(out):
 def render(out, index, smoke=False):
     row = rows(out)[index]
     dest = dest_for(out,row)
-    if not smoke and (dest/'video_metadata.json').exists():
+    video_dest = out/row['video_directory'] if row.get('video_directory') else dest
+    if not smoke and (video_dest/'video_metadata.json').exists():
         return
     meta = load(dest/'state_metadata.json')
     cfg = EnvConfig(**meta['env_config'])
@@ -56,7 +57,7 @@ def render(out, index, smoke=False):
     renderer = None
     writers = {}
     started = time.monotonic()
-    video_dest = out/'render_smoke' if smoke else dest
+    video_dest = out/'render_smoke' if smoke else video_dest
     video_dest.mkdir(parents=True,exist_ok=True)
     try:
         env.reset(seed=cfg.seed)
@@ -88,11 +89,19 @@ def render(out, index, smoke=False):
                 '-g','12','-keyint_min','12','-sc_threshold','0','-bf','0','-pix_fmt','yuv420p',
                 '-movflags','+faststart',str(video_dest/f'{view}.mp4')],stdin=subprocess.PIPE)
         save(video_dest/'render_ready.json',dict(pid=os.getpid(),ready_at=now().isoformat(),scene=row['scene'],seed=row['seed'],frames=frames))
-        error = state_error = 0.
+        error = state_error = auxiliary_error = 0.
+        reference_kinematics=mujoco.MjData(env.model)
         for frame in range(frames):
             mujoco.mj_setState(env.model,env.data,data['states'][frame],state_kind)
+            # The evaluated recorder saved xpos before the final integration's
+            # derived poses were refreshed. Its full integration state is the
+            # authoritative timestamped physical state. Compute an independent
+            # pose reference from that saved qpos, and report auxiliary lag.
+            reference_kinematics.qpos[:]=env.data.qpos
+            mujoco.mj_kinematics(env.model,reference_kinematics)
             mujoco.mj_forward(env.model,env.data)
-            error = max(error,float(np.max(np.abs(env.data.xpos[env.cable_ids]-data['cable_xyz'][frame]))))
+            error = max(error,float(np.max(np.abs(env.data.xpos[env.cable_ids]-reference_kinematics.xpos[env.cable_ids]))))
+            auxiliary_error=max(auxiliary_error,float(np.max(np.abs(env.data.xpos[env.cable_ids]-data['cable_xyz'][frame]))))
             before=np.empty(mujoco.mj_stateSize(env.model,state_kind))
             mujoco.mj_getState(env.model,env.data,before,state_kind)
             point=data['tracked_target_xyz'][frame]
@@ -104,10 +113,10 @@ def render(out, index, smoke=False):
                 image=Image.fromarray(renderer.render())
                 draw=ImageDraw.Draw(image)
                 draw.rectangle((12,12,1268,144),fill='#eef3fa')
-                lines=[f"RULE NODE FEEDBACK | {row['scene']} | {view}",
+                lines=[f"{row.get('arm_label', 'RULE NODE FEEDBACK')} | {row['scene']} | {view}",
                     f"seed {row['seed']} | t={data['frame_times'][frame]:.2f}s | {data['phases'][frame]} | success {row['task_success']}",
                     'YELLOW: recorded tracked target | BLUE: measured workspace | tangent rotation ON',
-                    'Saved simulation states | no policy execution or physics stepping during rendering']
+                    row.get('source_run', 'Saved simulation states')]
                 for j,line in enumerate(lines):
                     draw.text((24,16+31*j),line,font=font,fill='#17314b')
                 x,y,z=project(renderer.scene,point,1280,960)
@@ -130,7 +139,11 @@ def render(out, index, smoke=False):
             recording_camera_enabled_for_replay=recording_camera_enabled,
             reference_model_sha256=meta.get('reference_model_sha256'),
             source_trajectory_sha256=meta['trajectory_sha256'],render_script_sha256=sha(__file__),
+            source_directory=str(dest),source_run=row.get('source_run'),
+            frame_times=data['frame_times'][:frames].tolist(),
             reproduction_max_position_error_m=error,render_state_difference=state_error,
+            position_reference='Independent kinematics from the authoritative saved qpos',
+            stored_auxiliary_xyz_max_discrepancy_m=auxiliary_error,
             encoding_verification=encoding,wall_seconds=time.monotonic()-started,
             capture='Saved actual rollout states; no policy rerun or physics stepping'))
     finally:
