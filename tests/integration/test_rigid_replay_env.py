@@ -555,6 +555,139 @@ class ContinuousReplayPairingTests(ReplayPairingTests):
             env.close()
 
 
+class ContactAwareReplayPairingTests(ContinuousReplayPairingTests):
+    """v3 retains tracking and grasp contracts, adding pre-grasp contact gating."""
+
+    @classmethod
+    def setUpClass(cls):
+        from dataclasses import replace
+        super().setUpClass()
+        cls.replay_config = replace(cls.replay_config, replay_controller_version="continuous_ff_v3")
+
+    def test_actual_unilateral_contact_freezes_and_release_reanchors(self):
+        from dataclasses import replace
+        for robot in ("panda", "nero"):
+            with self.subTest(robot=robot):
+                config = replace(self.replay_config, robot=robot)
+                if robot == "nero":
+                    # Banks record model body order; build the NERO fixture from
+                    # its own model, without relabelling the Panda bank IDs.
+                    probe = CableGraspEnv(replace(self.shape_config, robot=robot))
+                    try:
+                        probe.reset(seed=SEED)
+                        xy = probe.data.xpos[probe.cable_ids, :2].copy()
+                        _write_synthetic_bank(
+                            self.bank_dir, cable_ids=probe.cable_ids, node_xy0=xy,
+                            placed_com=np.average(xy, axis=0, weights=probe.cable_mass),
+                            target_index=int(probe.cable_index[probe.target_body_id]),
+                            control_dt=self.control_dt, horizon=201, seed=SEED,
+                            bank_name="nero_contact_bank",
+                        )
+                    finally:
+                        probe.close()
+                    config.replay_bank = "nero_contact_bank"
+                env = CableGraspEnv(config)
+                try:
+                    env.reset(seed=SEED)
+                    for _ in range(50):
+                        env.step(env.ready_ctrl)
+                    self.assertGreater(env._replay_elapsed, .5)
+                    # Place a cable end at a real left finger collision surface.
+                    # Only the initial fixture is positioned; all held/clear
+                    # steps below use the ordinary env.step physics path.
+                    initial = env.data.qpos.copy()
+                    found = False
+                    for geom in sorted(env.pad_geom_ids):
+                        if env.model.geom_bodyid[geom] != env.left_finger_id:
+                            continue
+                        for offset in (np.zeros(3), np.array([0., .005, 0.]), np.array([0., -.005, 0.])):
+                            env.data.qpos[:] = initial
+                            mujoco.mj_forward(env.model, env.data)
+                            shift = env.data.geom_xpos[geom] + offset - env.data.xpos[env.cable_ids[0]]
+                            env.data.qpos[env.cable_free_qadr:env.cable_free_qadr+3] += shift
+                            mujoco.mj_forward(env.model, env.data)
+                            if {f for _, f in env._finger_body_contact_pairs()} == {env.left_finger_id}:
+                                found = True
+                                break
+                        if found:
+                            break
+                    self.assertTrue(found, "fixture must produce real unilateral finger contact")
+                    env._update_rigid_motion_suspension_state()
+                    frozen = env._replay_elapsed
+                    # The Panda surface supports this pose longer. NERO's
+                    # mesh sheds the cable quickly; a brief touch must still
+                    # gate drive without pretending it is a sustained hold.
+                    for _ in range(8 if robot == "panda" else 1):
+                        _, _, _, _, info = env.step(env.ready_ctrl)
+                        self.assertFalse(env.grasp_confirmed)
+                        self.assertTrue(info["replay_contact_blocked"])
+                        self.assertEqual(info["replay_suspension_reason"], "gripper_contact")
+                        self.assertEqual(env._replay_elapsed, frozen)
+                        np.testing.assert_array_equal(env._last_rigid_translation_acceleration, 0.)
+                        np.testing.assert_array_equal(env._last_rigid_rotation_acceleration, 0.)
+                    # Remove contact with a displaced cable pose and check the
+                    # new reference follows that pose instead of the old path.
+                    env.data.qpos[env.cable_free_qadr:env.cable_free_qadr+3] -= shift
+                    env.data.qvel[:] = 0.
+                    mujoco.mj_forward(env.model, env.data)
+                    self.assertEqual(env._replay_gripper_contact_count_now(), 0)
+                    env._update_rigid_motion_suspension_state()
+                    self.assertTrue(env.rigid_motion_suspended)
+                    anchored = []
+                    reanchor = env._replay_reanchor
+                    def record_reanchor():
+                        reanchor()
+                        position, _, _, yaw, _, _ = env._continuous_replay_targets()
+                        offset = env._rigid_reference_xy[env._replay_tracked_index] - env._rigid_reference_com_xy
+                        anchored.append((
+                            position + offset @ env._planar_rotation(yaw),
+                            env.data.xpos[env.cable_ids[env._replay_tracked_index], :2].copy(),
+                        ))
+                    env._replay_reanchor = record_reanchor
+                    for _ in range(3):
+                        env.step(env.ready_ctrl)
+                        if not env.rigid_motion_suspended:
+                            break
+                    self.assertFalse(env.rigid_motion_suspended)
+                    self.assertEqual(env._replay_anchor_elapsed, frozen)
+                    self.assertLess(env._replay_elapsed - frozen, self.control_dt + 1e-12)
+                    self.assertEqual(len(anchored), 1)
+                    np.testing.assert_allclose(*anchored[0], atol=1e-12)
+                    progressed = env._replay_elapsed
+                    env.step(env.ready_ctrl)
+                    self.assertAlmostEqual(env._replay_elapsed - progressed, self.control_dt)
+                    # Reset during a new obstruction must clear hysteresis and
+                    # previous suspension; no release/reanchor leaks episodes.
+                    env._replay_last_gripper_contact_time = float(env.data.time)
+                    env._replay_was_suspended = True
+                    env._replay_contact_blocked = True
+                    env.reset(seed=SEED)
+                    self.assertFalse(env._replay_was_suspended)
+                    self.assertFalse(env._replay_contact_blocked)
+                    self.assertEqual(env._replay_last_gripper_contact_time, -math.inf)
+                    self.assertEqual(env._replay_anchor_elapsed, 0.)
+                finally:
+                    env.close()
+
+    def test_no_contact_has_identical_physics_to_v2(self):
+        from dataclasses import replace
+        current = self.make_replay_env()
+        previous = CableGraspEnv(replace(self.replay_config, replay_controller_version="continuous_ff_v2"))
+        try:
+            current.reset(seed=SEED)
+            previous.reset(seed=SEED)
+            for _ in range(60):
+                current.step(current.ready_ctrl)
+                previous.step(previous.ready_ctrl)
+                self.assertEqual(current._replay_gripper_contact_count, 0)
+                np.testing.assert_array_equal(current.data.qpos, previous.data.qpos)
+                np.testing.assert_array_equal(current.data.qvel, previous.data.qvel)
+                self.assertEqual(current._replay_elapsed, previous._replay_elapsed)
+        finally:
+            current.close()
+            previous.close()
+
+
 class RenderModeInvarianceTests(unittest.TestCase):
     """The gripper geom-group toggle must be an observation-only change."""
 

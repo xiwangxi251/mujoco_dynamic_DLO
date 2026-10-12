@@ -94,6 +94,11 @@
 历史配置缺省保持`legacy_pd_v1`，历史录像/结果保留原身份。
 实现、有限配对验证与限制见[Shape replay速度跟踪修正](shape_replay_tracking_fix_20261012.md)。
 
+2026-10-13进一步处理 **Shape replay** 未抓牢的夹爪阻挡，当前采用
+`continuous_ff_v3`：单侧手指/夹爪基座接触也暂停回放，连续无接触40ms后
+重锚并续走。v2历史配置保留原语义；仅当前Shape replay场景ID再次更新。
+规则、回归与范围见[未抓牢阻挡处理](shape_replay_obstruction_fix_20261013.md)。
+
 第七项调整时的验证：原有 60 个场景 ID 全部保留；实际评测库的 20260804～20260813
 十个种子均通过初始化、快照构型及运动规则配对检查，中心化构型最大差异
 小于 6e-16 m。记录：`outputs/tmp/complex_simple_motion_20261009/verification.json`。
