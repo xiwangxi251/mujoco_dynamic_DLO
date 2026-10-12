@@ -6,7 +6,7 @@ Output includes source/bank identities and every measured/reference sample.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
@@ -148,6 +148,22 @@ def measure(job):
             state_kind=int(state_kind),
             columns=np.array(['time_s','x','y','vx','vy','reference_x','reference_y','reference_vx','reference_vy']))
         result['trajectory_sha256'] = sha(dest/'tracking.npz')
+        if env._replay_force_tape is not None:
+            from panda_cable_grasp.env.force_replay import FORCE_COMPILER_PARAMETERS
+            tape = env._replay_force_tape
+            np.savez_compressed(dest/'forces.npz', forces=tape.forces,
+                                timestep=tape.timestep, start_time=tape.start_time)
+            result['force_tape_sha256'] = tape.sha256
+            result['force_file_sha256'] = sha(dest/'forces.npz')
+            result['force_steps'] = len(tape.forces)
+            result['force_compiler_parameters'] = FORCE_COMPILER_PARAMETERS
+            result['max_node_force_n'] = tape.max_node_force_n
+            result['compiler_playback_max_cable_qpos_difference'] = float(np.max(np.abs(
+                env.data.qpos[env.cable_free_qadr:] - tape.final_qpos[env.cable_free_qadr:],
+            )))
+            result['compiler_playback_max_cable_qvel_difference'] = float(np.max(np.abs(
+                env.data.qvel[env.cable_free_dadr:] - tape.final_qvel[env.cable_free_dadr:],
+            )))
         save(dest/'result.json', result)
         return result
     finally:
@@ -161,6 +177,8 @@ def main():
     p.add_argument('--seeds', nargs='+', type=int)
     p.add_argument('--seconds', type=float, default=3.)
     p.add_argument('--workers', type=int, default=4)
+    p.add_argument('--versions', nargs='+', default=['legacy_pd_v1', 'continuous_ff_v2'],
+                   choices=['legacy_pd_v1', 'continuous_ff_v2', 'force_tape_v5'])
     p.add_argument('--physics-only', action='store_true', help='Use after a saved-state equivalence check to the full environment path')
     args = p.parse_args()
     if not np.isfinite(args.seconds) or args.seconds <= .82:
@@ -177,26 +195,36 @@ def main():
         seeds = bank_seeds if args.seeds is None else args.seeds
     if not seeds or len(set(seeds)) != len(seeds) or not set(seeds) <= set(bank_seeds):
         p.error('Seeds must be distinct members of the selected bank')
-    versions = ['legacy_pd_v1', 'continuous_ff_v2']
+    versions = args.versions
+    if len(set(versions)) != len(versions):
+        p.error('Versions must be distinct')
     manifest = dict(created_at=datetime.now(timezone.utc).isoformat(),
         source_directory=str(ROOT), branch=subprocess.check_output(['git','branch','--show-current'],cwd=ROOT,text=True).strip(),
         commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
         git_status=subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True),
         source_sha256={str(f.relative_to(ROOT)):sha(f) for f in [Path(__file__),
             ROOT/'src/panda_cable_grasp/env/environment.py', ROOT/'src/panda_cable_grasp/env/replay_bank.py',
-            ROOT/'src/panda_cable_grasp/scenarios/registry.py']},
+            ROOT/'src/panda_cable_grasp/scenarios/registry.py', ROOT/'src/panda_cable_grasp/env/force_replay.py']},
         bank_file=str(bank_file), bank_sha256=sha(bank_file), seeds=seeds,
-        versions=versions, seconds=args.seconds, planned=2*len(seeds),
+        versions=versions, seconds=args.seconds, planned=len(versions)*len(seeds),
         physics_only=args.physics_only,
         protocol='Arm ready, no grasp policy; paired seed/node; common C2 reference; 0.82s onward; physical state refreshed on an independent probe')
     save(args.output/'manifest.json', manifest)
     jobs = [(seed, version, str(args.bank.resolve()), args.seconds, str(args.output), args.physics_only) for seed in seeds for version in versions]
     begun = time.monotonic()
+    results = []
+    def record_progress(result):
+        results.append(result)
+        save(args.output/'progress.json', dict(completed=len(results), planned=len(jobs),
+            last_progress_at=datetime.now(timezone.utc).isoformat(),
+            elapsed_wall_s=time.monotonic()-begun))
     if args.workers == 1:
-        results = [measure(job) for job in jobs]
+        for job in jobs:
+            record_progress(measure(job))
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
-            results = list(pool.map(measure, jobs))
+            for future in as_completed([pool.submit(measure, job) for job in jobs]):
+                record_progress(future.result())
     summaries = {}
     for version in versions:
         group = [r for r in results if r['version'] == version]

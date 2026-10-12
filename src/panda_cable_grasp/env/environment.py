@@ -53,6 +53,7 @@ REPLAY_OBSTRUCTION_MAX_PROGRESS = 0.25
 REPLAY_OBSTRUCTION_MIN_LAG = 0.005
 REPLAY_OBSTRUCTION_CLEARANCE = 0.002
 CONTINUOUS_REPLAY_CONTROLLERS = {"continuous_ff_v2", "continuous_ff_v3", "continuous_ff_v4"}
+FORCE_REPLAY_CONTROLLER = "force_tape_v5"
 
 DEFAULT_DYNAMICVLA_WRIST_CAMERA_POS = (0.065, 0.0, 0.0)
 DEFAULT_DYNAMICVLA_WRIST_CAMERA_QUAT = (
@@ -550,7 +551,7 @@ class EnvConfig:
                 "Level-1/Level-2/replay profiles require rigid or combined motion"
             )
         uses_replay = self.motion_profile_version == REPLAY_MOTION_PROFILE
-        if self.replay_controller_version not in {"legacy_pd_v1", *CONTINUOUS_REPLAY_CONTROLLERS}:
+        if self.replay_controller_version not in {"legacy_pd_v1", FORCE_REPLAY_CONTROLLER, *CONTINUOUS_REPLAY_CONTROLLERS}:
             raise ValueError("unsupported replay_controller_version")
         if self.replay_controller_version != "legacy_pd_v1" and not uses_replay:
             raise ValueError("replay_controller_version requires the replay profile")
@@ -1632,6 +1633,10 @@ class CableGraspEnv:
         self._replay_anchor_index = 0
         self._replay_anchor_elapsed = 0.0
         self._replay_reference = None
+        self._replay_force_tape = None
+        self._replay_force_compiler = None
+        self._last_ungated_scene_force = np.zeros((node_count, 3))
+        self._last_replay_force_grounded = np.zeros(node_count, dtype=bool)
         self._replay_was_suspended = False
         self._replay_contact_blocked = False
         self._replay_gripper_contact_count = 0
@@ -1787,7 +1792,7 @@ class CableGraspEnv:
         self._replay_yaw = trajectory.delta_yaw
         self._replay_yaw_rate = trajectory.yaw_rate
         self._replay_valid_steps = int(bank.valid_steps[entry])
-        if self.config.replay_controller_version in CONTINUOUS_REPLAY_CONTROLLERS:
+        if self.config.replay_controller_version in CONTINUOUS_REPLAY_CONTROLLERS | {FORCE_REPLAY_CONTROLLER}:
             from .replay_bank import ContinuousReplayReference
             self._replay_reference = ContinuousReplayReference(
                 trajectory, self._replay_dt, self._replay_valid_steps,
@@ -2221,6 +2226,13 @@ class CableGraspEnv:
         self._dynamicvla_camera_frame_time = None
         self._dynamicvla_camera_frames.clear()
         self.trial_index += 1
+        self._replay_force_tape = None
+        self._replay_force_compiler = None
+        self._last_ungated_scene_force[:] = 0.
+        self._last_replay_force_grounded[:] = False
+        if self._uses_force_replay:
+            from .force_replay import prepare_force_replay
+            self._replay_force_compiler = prepare_force_replay(self)
         return self.observation(), self.info()
 
     @cached_contact_reads
@@ -2838,6 +2850,10 @@ class CableGraspEnv:
             pass
 
     def info(self) -> dict:
+        force_compiler_parameters = None
+        if self._uses_force_replay:
+            from .force_replay import FORCE_COMPILER_PARAMETERS
+            force_compiler_parameters = dict(FORCE_COMPILER_PARAMETERS)
         cable_positions = self.data.xpos[self.cable_ids]
         grasp_error = math.inf
         grasped_body = self.last_grasped_body_id
@@ -2914,7 +2930,8 @@ class CableGraspEnv:
                 self.config.rigid_motion_exit_y if uses_rigid_motion else None
             ),
             "rigid_motion_control": (
-                "actual_progress_velocity_v1" if uses_rigid_motion else None
+                "material_force_tape_v5" if self._uses_force_replay
+                else "actual_progress_velocity_v1" if uses_rigid_motion else None
             ),
             "arm_motion_start_time": arm_motion_start_time,
             "arm_motion_delayed": bool(
@@ -2924,6 +2941,7 @@ class CableGraspEnv:
             "rigid_velocity_gain": self.config.rigid_velocity_gain,
             "rigid_translation_max_acceleration": (
                 self.config.rigid_translation_max_acceleration
+                if not self._uses_force_replay else None
             ),
             "rigid_motion_com_y": (
                 self.rigid_motion_com_y if uses_rigid_motion else None
@@ -2977,6 +2995,20 @@ class CableGraspEnv:
             ),
             "replay_controller_version": (
                 self.config.replay_controller_version if self._uses_replay_motion else None
+            ),
+            "replay_force_tape_sha256": (
+                self._replay_force_tape.sha256 if self._replay_force_tape is not None else None
+            ),
+            "replay_force_max_node_force_n": (
+                self._replay_force_tape.max_node_force_n
+                if self._replay_force_tape is not None else None
+            ),
+            "replay_force_compiler_parameters": force_compiler_parameters,
+            "replay_force_tape_step": (
+                self._replay_force_tape.index(self.data.time) if self._replay_force_tape is not None else None
+            ),
+            "replay_force_grounded_nodes": (
+                int(self._last_replay_force_grounded.sum()) if self._uses_force_replay else None
             ),
             "replay_source_motion_mode": (
                 self._replay_source_motion_mode
@@ -3226,6 +3258,14 @@ class CableGraspEnv:
         覆盖 L1/L2 扫描和 ``rigid_replay_v1`` 回放：确认抓取期间整体驱动
         与回放时钟一起暂停，松开后从暂停处续走而不是追赶进度。
         """
+        if self._uses_force_replay:
+            # Grasp/contact still participate in task judgement, never in tape
+            # scheduling. Do not reanchor, pause or accumulate missed forces.
+            self.rigid_motion_suspended = False
+            self._replay_contact_blocked = False
+            self._replay_was_suspended = False
+            self._replay_gripper_contact_count = self._replay_gripper_contact_count_now()
+            return
         was_contact_blocked = self._replay_contact_blocked
         self._replay_gripper_contact_count = 0
         self._replay_contact_blocked = False
@@ -3811,6 +3851,10 @@ class CableGraspEnv:
     def _apply_cable_disturbance(self) -> None:
         """按场景组合静止、整体运动和局部形变三个可审计分量。"""
 
+        if self._uses_force_replay:
+            self._apply_replay_force_tape()
+            return
+
         if self.config._uses_object_scene:
             self._apply_objects_drive()
             return
@@ -3855,6 +3899,9 @@ class CableGraspEnv:
                     # L1/L2 的进度式路径一致（抓取松开后续走而非补时）。
                     self._replay_elapsed += float(self.model.opt.timestep) * self.config.replay_time_scale
 
+        self._last_ungated_scene_force[:] = self.cable_mass[:, None] * (
+            shape + translation + rotation + shape_hold
+        )
         if (
             self.config.rigid_motion_contact_only
             and self.config.motion_mode in {"rigid", "combined"}
@@ -3875,6 +3922,36 @@ class CableGraspEnv:
         self.data.xfrc_applied[self.cable_ids, :3] += (
             self.cable_mass[:, None] * intended
         )
+
+    @property
+    def _uses_force_replay(self) -> bool:
+        return self._uses_replay_motion and self.config.replay_controller_version == FORCE_REPLAY_CONTROLLER
+
+    def _apply_replay_force_tape(self) -> None:
+        if self._replay_force_tape is None:
+            from .force_replay import compile_force_replay
+            assert self._replay_force_compiler is not None
+            self._replay_force_tape = compile_force_replay(self._replay_force_compiler)
+            self._replay_force_compiler = None
+            self.motion_profile_hash = hashlib.sha256(
+                (self.motion_profile_hash + "|" + self._replay_force_tape.sha256).encode("ascii")
+            ).hexdigest()
+        assert self._replay_force_tape is not None
+        forces = self._replay_force_tape.sample(float(self.data.time))
+        self._last_ungated_scene_force[:] = forces
+        grounded = self._cable_table_contact_mask()
+        self._last_replay_force_grounded[:] = grounded
+        forces[~grounded] = 0.
+        self.data.xfrc_applied[self.cable_ids, :3] += forces
+        self._last_shape_acceleration[:] = 0.
+        self._last_rigid_translation_acceleration[:] = forces / self.cable_mass[:, None]
+        self._last_rigid_rotation_acceleration[:] = 0.
+        self._last_rigid_shape_hold_acceleration[:] = 0.
+        # Clock describes the next integration tick; it advances even when
+        # every node is airborne, or when a confirmed grasp is active.
+        self._replay_elapsed = (
+            float(self.data.time) + float(self.model.opt.timestep)
+        ) * self.config.replay_time_scale
 
     # ---------------------------------------------------------------------
     # 多对象 / 对象族驱动

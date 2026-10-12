@@ -100,6 +100,11 @@
 仅当前Shape replay场景ID再次更新，历史完整配置保留原语义。
 当前规则、回归与范围见[接触不等于阻挡](shape_replay_obstruction_refinement_20261013.md)。
 
+2026-10-13用户进一步确定 **Shape replay** 完全不暂停，当前采用
+`force_tape_v5`：独立无干预仿真提前生成逐节点外力序列，真实回合按时间播放，
+仅关闭离桌节点的场景力，不暂停、不重锚、不追赶。v3/v4暂停规则仅为历史行为。
+实现、生成成本及无干预验收见[逐节点外力播放](shape_replay_force_playback_20261013.md)。
+
 第七项调整时的验证：原有 60 个场景 ID 全部保留；实际评测库的 20260804～20260813
 十个种子均通过初始化、快照构型及运动规则配对检查，中心化构型最大差异
 小于 6e-16 m。记录：`outputs/tmp/complex_simple_motion_20261009/verification.json`。
