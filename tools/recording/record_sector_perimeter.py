@@ -217,6 +217,7 @@ def record(args):
 def build_gallery(args, result):
     page=args.template.read_text(encoding='utf-8')
     page=page.replace('near_table_inner_arc028_20261009',args.output.name)
+    page=page.replace("negative_y_polar_reach_r'+e.radius_m+'_arc-30to70", "near_table_sector_boundary_lap")
     page=re.sub(r'<title>.*?</title>','<title>新工作区完整边界绕行 · −30°～70°</title>',page)
     page=re.sub(r'<h1>.*?</h1>','<h1>新工作区完整边界绕行 · −30°～70°</h1>',page)
     page=re.sub(r'<select id="goal">.*?</select>',f'<select id="goal"><option value="{result["seed"]}">完整边界一周</option></select>',page)
