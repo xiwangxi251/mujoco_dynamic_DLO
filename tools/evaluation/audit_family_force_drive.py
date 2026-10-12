@@ -1,4 +1,4 @@
-"""Small paired no-contact check of current-family L1 force playback."""
+"""Small paired no-contact check of the separate force family's L1 playback."""
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
@@ -19,7 +19,7 @@ from panda_cable_grasp.env.control import configure_profile
 from panda_cable_grasp.scenarios import get_scenario
 from audit_replay_tracking import save,sha
 
-SCENES=('dev_rigid_l1_nominal_x075_v1','dev_rigid_l1_midshape_v1_x075_v1','dev_combined_l1_nominal_x075_v1')
+SCENES=('dev_rigid_l1_nominal_x075_force_v1','dev_rigid_l1_midshape_v1_x075_force_v1','dev_combined_l1_nominal_x075_force_v1')
 
 
 def measure(job):

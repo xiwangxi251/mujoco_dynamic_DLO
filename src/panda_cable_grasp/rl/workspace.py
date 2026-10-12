@@ -14,7 +14,7 @@ from ..scenarios.registry import (
 
 WORKSPACE_SCENE_FAMILIES = {
     "legacy_ppo_six": LEGACY_PPO_SIX_SOURCE_NAMES,
-    "cable_x075_v1": SCENARIO_FAMILIES["cable_x075_v1"],
+    **SCENARIO_FAMILIES,
 }
 WORKSPACE_STAGES = (
     ("static_workspace_all_nodes", (1,0,0,0,0,0), 0.),
@@ -31,10 +31,8 @@ def workspace_stages(scene_names):
     """Keep archived mixes; share the final comparison mass across seven scenes."""
     if len(scene_names) == 6:
         return WORKSPACE_STAGES
-    if tuple(scene_names) not in (
-        WORKSPACE_SCENE_FAMILIES["cable_x075_v1"], CABLE_X075_REPLAY_SCENARIO_NAMES,
-    ):
-        raise ValueError("Workspace curriculum requires six ordered scenes or cable_x075_v1")
+    if tuple(scene_names) not in (*SCENARIO_FAMILIES.values(), CABLE_X075_REPLAY_SCENARIO_NAMES):
+        raise ValueError("Workspace curriculum requires six ordered scenes or a registered seven-scene family")
     return tuple(
         (name.replace("six_scenes", "seven_scenes"),
          weights[:5] + (weights[5] / 2, weights[5] / 2), difficulty)

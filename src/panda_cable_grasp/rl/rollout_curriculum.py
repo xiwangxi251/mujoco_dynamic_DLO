@@ -6,7 +6,7 @@ from pathlib import Path
 import time
 import zipfile
 
-from .ordered_curriculum import GROUPS, PHASES, MIXES, OrderedMotionCurriculum
+from .ordered_curriculum import GROUPS, PHASES, MIXES, OrderedMotionCurriculum, structure_for_family
 
 VERSION='ordered_rollout_gate_v1'
 PROTOCOL=dict(version=VERSION,target_episodes=100,replay_episodes=50,consecutive_windows=2,
@@ -25,14 +25,20 @@ CONSOLIDATION_PROTOCOL = dict(FAST_PROTOCOL, version='ordered_rollout_consolidat
 PROFILES['consolidate'] = CONSOLIDATION_PROTOCOL
 
 
-def protocol_for(profile):
-    return dict(PROFILES[profile])
+def protocol_for(profile, scene_family='cable_x075_v1'):
+    result = dict(PROFILES[profile])
+    if profile == 'consolidate' and scene_family != 'cable_x075_v1':
+        result['terminal_training_mix'] = structure_for(profile, scene_family)[2][-1]
+    return result
 
 
-def structure_for(profile):
+def structure_for(profile, scene_family='cable_x075_v1'):
+    groups, mixes = structure_for_family(scene_family)
     if profile == 'consolidate':
-        return GROUPS + (ALL_SCENES,), PHASES + ((6, 1.),), MIXES + (CONSOLIDATION_MIX,)
-    return GROUPS, PHASES, MIXES
+        scenes = tuple(n for group in groups for n in group)
+        final_mix = tuple((n, .3 if n in (groups[1][0], groups[3][0]) else .08) for n in scenes)
+        return groups + (scenes,), PHASES + ((6, 1.),), mixes + (final_mix,)
+    return groups, PHASES, mixes
 
 
 def restored_phase(state, default, profile):
@@ -78,24 +84,29 @@ class Windows:
         return dict(scenes=scenes,passed=passed,consecutive=self.consecutive,
                     promote=self.consecutive>=self.protocol['consecutive_windows'])
 
-def difficulties(phase):
+def difficulties(phase, groups=GROUPS):
     if phase == 14:
-        return {n:float(0. if g < 2 else 1.) for g,names in enumerate(GROUPS) for n in names}
+        return {n:float(0. if g < 2 else 1.) for g,names in enumerate(groups) for n in names}
     group,difficulty=PHASES[phase]
     return {n:float(difficulty if g==group else 0. if g<2 else 1.)
-            for g,names in enumerate(GROUPS[:group+1]) for n in names}
+            for g,names in enumerate(groups[:group+1]) for n in names}
 
-def configure_env(env,phase):
-    mix=CONSOLIDATION_MIX if phase == 14 else MIXES[PHASES[phase][0]]
-    env.set_rollout_curriculum(phase,tuple(n for n,p in mix),tuple(p for n,p in mix),difficulties(phase))
+def configure_env(env,phase,scene_family='cable_x075_v1'):
+    groups, mixes = structure_for_family(scene_family)
+    mix=structure_for('consolidate',scene_family)[2][-1] if phase == 14 else mixes[PHASES[phase][0]]
+    env.set_rollout_curriculum(phase,tuple(n for n,p in mix),tuple(p for n,p in mix),difficulties(phase,groups))
 
-def checkpoint_phase(path, gate_profile='strict'):
+def checkpoint_phase(path, gate_profile='strict', scene_family='cable_x075_v1'):
     """Read JSON curriculum identity before spawned workers perform their first reset."""
     if path is None:return 0
     path=Path(path)
     if not path.is_file():path=Path(str(path)+'.zip')
     with zipfile.ZipFile(path) as z:data=json.loads(z.read('data'))
     state=data.get('rollout_gate_state',{})
+    from .target_defaults import checkpoint_configuration
+    saved_family = state.get('scene_family', checkpoint_configuration(path).get('workspace_scene_family', 'cable_x075_v1'))
+    if saved_family != scene_family:
+        raise ValueError('Rollout curriculum checkpoint uses a different scene family')
     if state and state.get('version') not in {p['version'] for p in PROFILES.values()}:
         raise ValueError('Incompatible rollout curriculum checkpoint version')
     if state.get('version') == CONSOLIDATION_PROTOCOL['version'] and gate_profile != 'consolidate':
@@ -105,14 +116,15 @@ def checkpoint_phase(path, gate_profile='strict'):
     return phase
 
 class RolloutMotionCurriculum(OrderedMotionCurriculum):
-    def __init__(self, output_dir, initial_phase=0, gate_profile='strict', **kwargs):
+    def __init__(self, output_dir, initial_phase=0, gate_profile='strict', scene_family='cable_x075_v1', **kwargs):
         self.gate_profile = gate_profile
-        groups, phases, mixes = structure_for(gate_profile)
+        self.scene_family = scene_family
+        groups, phases, mixes = structure_for(gate_profile, scene_family)
         if gate_profile == 'consolidate':
             kwargs.update(stages=groups, training_mixes=mixes)
         super().__init__(**kwargs)
         self.phases = phases
-        self.protocol = protocol_for(gate_profile)
+        self.protocol = protocol_for(gate_profile, scene_family)
         self.output=Path(output_dir)
         self.initial_phase=int(initial_phase)
         if not 0<=self.initial_phase<len(self.phases):raise ValueError('Invalid initial curriculum phase')
@@ -120,7 +132,7 @@ class RolloutMotionCurriculum(OrderedMotionCurriculum):
     def _apply(self):
         mix=self.current_training_mix
         self.training_env.env_method('set_rollout_curriculum',self.phase_index,
-            tuple(n for n,p in mix),tuple(p for n,p in mix),difficulties(self.phase_index))
+            tuple(n for n,p in mix),tuple(p for n,p in mix),difficulties(self.phase_index,self.stages[:6]))
         self.model.ordinary_evaluation_phase=self.phase_index
         self.model.ordinary_evaluation_difficulty=self.difficulty
         self.model.ordinary_evaluation_scenarios=self.current_scenarios
@@ -129,11 +141,13 @@ class RolloutMotionCurriculum(OrderedMotionCurriculum):
             qualifying_evaluations=self.windows.consecutive).items(): self.logger.record('curriculum/'+k,v)
 
     def _new_windows(self,state=None):
-        replay=() if self.phase_index == 14 else tuple(n for names in GROUPS[:self.stage_index] for n in names)
+        replay=() if self.phase_index == 14 else tuple(n for names in self.stages[:self.stage_index] for n in names)
         self.windows=Windows(self.current_scenarios,replay,state,self.protocol)
 
     def _on_training_start(self):
         saved=getattr(self.model,'rollout_gate_state',{})
+        if saved and saved.get('scene_family','cable_x075_v1') != self.scene_family:
+            raise ValueError('Incompatible rollout curriculum scene family')
         if saved and saved.get('version') not in {p['version'] for p in PROFILES.values()}:
             raise ValueError('Incompatible rollout curriculum state')
         self.phase_index=restored_phase(saved,self.initial_phase,self.gate_profile)
@@ -156,13 +170,14 @@ class RolloutMotionCurriculum(OrderedMotionCurriculum):
         self._save_state()
 
     def _save_state(self,persist=True):
-        state=dict(version=self.protocol['version'],phase=self.phase_index,windows=self.windows.state(),episode_counter=self.episode_counter)
+        state=dict(version=self.protocol['version'],phase=self.phase_index,windows=self.windows.state(),episode_counter=self.episode_counter,
+                   scene_family=self.scene_family)
         self.model.rollout_gate_state=state
         if not persist:return
         record=dict(version=self.protocol['version'],phase=self.phase_index,consecutive=self.windows.consecutive,
             timesteps=self.num_timesteps,updated_at=time.time(),protocol=self.protocol,
             episode_counter=self.episode_counter,target_scenes=self.current_scenarios,
-            difficulties=difficulties(self.phase_index),scenes=[dict(scenario=n,
+            difficulties=difficulties(self.phase_index,self.stages[:6]),scenes=[dict(scenario=n,
                 role='target' if n in self.windows.targets else 'replay',episodes=len(q),
                 fresh_episodes=self.windows.fresh[n],required_episodes=self.windows.required(n),
                 counts={k:sum(r[k] for r in q) for k in ('success','loaded','secured','attempt')})
@@ -177,7 +192,7 @@ class RolloutMotionCurriculum(OrderedMotionCurriculum):
             if not episode:continue
             name=info['scenario_name'];phase=int(info['rollout_episode_phase']);difficulty=float(info['rollout_episode_difficulty'])
             eligible=(phase==self.phase_index and name in self.windows.queues
-                and abs(difficulty-difficulties(self.phase_index)[name])<1e-9)
+                and abs(difficulty-difficulties(self.phase_index,self.stages[:6])[name])<1e-9)
             result=dict(success=int(bool(episode.get('success',info.get('success',False)))),
                 loaded=int(bool(episode.get('loaded_lift',info.get('loaded_lift',False)))),
                 secured=int(bool(episode.get('ever_grasped',info.get('ever_grasped',False)))),

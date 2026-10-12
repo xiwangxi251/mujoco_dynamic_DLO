@@ -1,4 +1,4 @@
-"""Current-family L1 force tapes retain shape drive and never pause."""
+"""Separate-family L1 force tapes retain shape drive and never pause."""
 from dataclasses import replace
 import unittest
 
@@ -9,7 +9,7 @@ from panda_cable_grasp.env.environment import CableGraspEnv, EnvConfig, GraspSta
 from panda_cable_grasp.scenarios import get_scenario
 from tests.integration import test_rigid_replay_env as fixtures
 
-NAMES=("dev_rigid_l1_nominal_x075_v1", "dev_rigid_l1_midshape_v1_x075_v1", "dev_combined_l1_nominal_x075_v1")
+NAMES=("dev_rigid_l1_nominal_x075_force_v1", "dev_rigid_l1_midshape_v1_x075_force_v1", "dev_combined_l1_nominal_x075_force_v1")
 
 
 class FamilyForceTests(unittest.TestCase):

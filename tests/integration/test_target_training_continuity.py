@@ -98,13 +98,14 @@ def test_saved_stage_defaults_use_checkpoint_stage_not_later_run_stage(tmp_path,
     assert calls['ramp'][1] == 0
 
 
-@pytest.mark.parametrize('historical', [False, True])
-def test_saved_seven_scene_curriculum_restores_its_original_list(tmp_path, monkeypatch, historical):
+@pytest.mark.parametrize('family', ['cable_x075_v1', 'cable_x075_force_v1', 'historical'])
+def test_saved_seven_scene_curriculum_restores_its_original_list(tmp_path, monkeypatch, family):
     from panda_cable_grasp.scenarios.registry import CABLE_X075_REPLAY_SCENARIO_NAMES
     args, config = saved_args(tmp_path, monkeypatch)
-    names = CABLE_X075_REPLAY_SCENARIO_NAMES if historical else WORKSPACE_SCENE_FAMILIES['cable_x075_v1']
+    names = CABLE_X075_REPLAY_SCENARIO_NAMES if family == 'historical' else WORKSPACE_SCENE_FAMILIES[family]
+    config['workspace_scene_family'] = 'cable_x075_v1' if family == 'historical' else family
     config['training_scenario_names'] = list(names)
-    if not historical:
+    if family != 'historical':
         config['workspace_stages'] = workspace_stages(names)
     (tmp_path/'training_config.json').write_text(json.dumps(config))
     args = parse_args()

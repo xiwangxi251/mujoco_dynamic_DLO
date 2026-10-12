@@ -26,6 +26,15 @@ PROTOCOL = dict(version="ordered_ability_v1", phases=PHASES, groups=GROUPS, trai
     confirmation_counts_for_promotion=False)
 
 
+def structure_for_family(family='cable_x075_v1'):
+    """Use the same ability groups and probabilities in either explicit family."""
+    from ..scenarios.registry import SCENARIO_FAMILIES
+    mapping = dict(zip(SCENARIO_FAMILIES['cable_x075_v1'], SCENARIO_FAMILIES[family]))
+    groups = tuple(tuple(mapping[n] for n in group) for group in GROUPS)
+    mixes = tuple(tuple((mapping[n], p) for n, p in mix) for mix in MIXES)
+    return groups, mixes
+
+
 class OrderedMotionCurriculum(MotionCurriculumCallback):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -63,7 +72,7 @@ class OrderedSuccessEval(StrictSuccessEvalCallback):
         phase, group, difficulty = c.phase_index, c.stage_index, c.difficulty
         targets = [self._scene(n, difficulty, self.episodes, 0, "target") for n in c.current_scenarios]
         retention = ([] if group == 0 else [self._scene(n, 0. if group-1 < 2 else 1., 10, 20, "retention")
-                                             for n in GROUPS[group-1]])
+                                             for n in c.stages[group-1]])
         metrics = self._aggregate(targets)
         score = (phase, metrics["success_rate"], metrics["grasp_rate"], metrics["aligned_pinch_rate"], metrics["mean_return"])
         best = (self.best_phase, self.best_success_rate, self.best_grasp_rate,

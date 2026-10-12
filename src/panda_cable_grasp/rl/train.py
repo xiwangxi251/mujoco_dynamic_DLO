@@ -320,7 +320,7 @@ def make_worker(rank: int, args: argparse.Namespace):
                     configure_env(env,args.rollout_initial_phase,args.range_initial_state.get('evidence'))
                 else:
                     from .rollout_curriculum import configure_env
-                    configure_env(env, args.rollout_initial_phase)
+                    configure_env(env, args.rollout_initial_phase, args.workspace_scene_family)
                 return env
             initial_mix = args.curriculum_training_mixes[0]
             env.set_training_scenario_distribution(
@@ -1195,8 +1195,8 @@ def parse_args() -> argparse.Namespace:
             ActionWorkspace(args.action_workspace)
         except (ValueError, KeyError, OSError) as error:
             parser.error(str(error))
-    if args.ordinary_family_curriculum and (args.target_node_task or args.workspace_scene_family != 'cable_x075_v1'):
-        parser.error('Ordinary family curriculum requires ordinary cable_x075_v1')
+    if args.ordinary_family_curriculum and (args.target_node_task or args.workspace_scene_family not in ('cable_x075_v1', 'cable_x075_force_v1')):
+        parser.error('Ordinary family curriculum requires ordinary cable_x075_v1 or cable_x075_force_v1')
     if args.target_workspace is not None:
         if not args.target_node_task or args.observation_mode != "state":
             parser.error("Target workspace requires target-node task and state observations")
@@ -1382,7 +1382,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(str(error))
     args.curriculum_stages = RL_L1_CURRICULUM_STAGES
     if args.ordinary_family_curriculum:
-        variant = lambda name: 'dev_' + name.removeprefix('id_') + '_x075_v1'
+        suffix = '_x075_force_v1' if args.workspace_scene_family == 'cable_x075_force_v1' else '_x075_v1'
+        variant = lambda name: 'dev_' + name.removeprefix('id_') + suffix
         static = (variant('id_static'), variant('id_static_midshape_v1'))
         component = (variant('id_shape_nominal_current'), variant('id_rigid_l1_nominal'),
                      variant('id_rigid_l1_midshape_v1'), variant('id_rigid_replay_shape_nominal'))
@@ -1397,6 +1398,8 @@ def parse_args() -> argparse.Namespace:
             tuple((n, b / len(static)) for n in static) + tuple((n, c / len(component)) for n in component) + ((combined[0], 1-b-c),),
         )
     if args.range_motion_curriculum:
+        if args.workspace_scene_family == 'cable_x075_force_v1':
+            parser.error('Range curriculum retains its original scene family; force family requires fixed scene motion')
         args.rollout_ability_curriculum = True
         if args.eval_workers != 0 or args.target_node_task:
             parser.error('Range curriculum requires 0 eval workers and ordinary non-target-node PPO')
@@ -1409,11 +1412,11 @@ def parse_args() -> argparse.Namespace:
     if args.ordered_ability_curriculum:
         if not args.ordinary_family_curriculum or args.curriculum_stage_steps <= 0 or (not args.rollout_ability_curriculum and (args.eval_episodes != 20 or args.eval_seed_pool_size != 50)):
             parser.error('Ordered curriculum requires ordinary family curriculum, enabled stages, 20 episodes per target and 50 seed pool')
-        from .ordered_curriculum import GROUPS, MIXES
-        args.curriculum_stages, args.curriculum_training_mixes = GROUPS, MIXES
+        from .ordered_curriculum import structure_for_family
+        args.curriculum_stages, args.curriculum_training_mixes = structure_for_family(args.workspace_scene_family)
         if args.rollout_ability_curriculum:
             from .rollout_curriculum import structure_for
-            args.curriculum_stages, _, args.curriculum_training_mixes = structure_for(args.rollout_gate_profile)
+            args.curriculum_stages, _, args.curriculum_training_mixes = structure_for(args.rollout_gate_profile, args.workspace_scene_family)
     if (
         args.training_distribution != "l1"
         and args.curriculum_stage_steps > 0
@@ -1464,7 +1467,7 @@ def parse_args() -> argparse.Namespace:
             args.rollout_initial_phase=args.range_initial_state.get('phase',0)
         else:
             from .rollout_curriculum import checkpoint_phase
-            args.rollout_initial_phase = checkpoint_phase(args.resume, args.rollout_gate_profile)
+            args.rollout_initial_phase = checkpoint_phase(args.resume, args.rollout_gate_profile, args.workspace_scene_family)
     if not rl_config_from_args(args).arm_velocity_limits_enabled:
         if (args.robot, args.controller_profile, args.action_mode) != (
                 'nero', 'enhanced6_bounded_dls_v1', 'task_space_vertical_down'):
@@ -1711,6 +1714,7 @@ def main() -> None:
             training_mixes=args.curriculum_training_mixes,
             **(dict(output_dir=args.output, initial_phase=args.rollout_initial_phase,
                     gate_profile=args.rollout_gate_profile) if args.rollout_ability_curriculum else {}),
+            **(dict(scene_family=args.workspace_scene_family) if args.rollout_ability_curriculum and not args.range_motion_curriculum else {}),
         )
         if args.rollout_ability_curriculum:
             callback_items.insert(0, curriculum_callback)
@@ -1981,7 +1985,8 @@ def main() -> None:
         configuration["observation"] = "state99 plus target material u, TCP-relative position/velocity and tangent: 109-D"
     if args.ordered_ability_curriculum:
         from .ordered_curriculum import PROTOCOL
-        configuration['ordered_curriculum'] = PROTOCOL
+        configuration['ordered_curriculum'] = dict(PROTOCOL, groups=args.curriculum_stages,
+                                                   training_mixes=args.curriculum_training_mixes)
     configuration.update(actual_eval_workers=args.eval_workers if args.eval_freq > 0 else 0,
         independent_evaluation_enabled=args.eval_freq > 0,
         rollout_ability_curriculum=args.rollout_ability_curriculum,
@@ -1991,8 +1996,8 @@ def main() -> None:
         configuration['entropy_coef_schedule'] = 'linear over cumulative global samples; updated per rollout'
     if args.rollout_ability_curriculum:
         from .rollout_curriculum import protocol_for, structure_for
-        groups, phases, mixes = structure_for(args.rollout_gate_profile)
-        configuration['ordered_curriculum'] = dict(protocol_for(args.rollout_gate_profile), phases=phases, groups=groups, training_mixes=mixes)
+        groups, phases, mixes = structure_for(args.rollout_gate_profile, args.workspace_scene_family)
+        configuration['ordered_curriculum'] = dict(protocol_for(args.rollout_gate_profile, args.workspace_scene_family), phases=phases, groups=groups, training_mixes=mixes)
         configuration['rollout_gate_profile'] = args.rollout_gate_profile
         configuration['statistics_source'] = 'stochastic training episodes'
         configuration['rollout_initial_phase'] = args.rollout_initial_phase

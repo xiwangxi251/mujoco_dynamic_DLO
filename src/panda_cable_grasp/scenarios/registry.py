@@ -1339,16 +1339,6 @@ def _registered_scenarios() -> list[ScenarioConfig]:
                 0.82 if variant_name in CABLE_X075_SCENARIO_NAMES else source.arm_motion_start_delay
             ),
             replay_use_snapshot_position=source_name == "id_rigid_replay_midshape_v1",
-            rigid_drive_version=(
-                "force_tape_v1" if variant_name in {
-                    "dev_rigid_l1_nominal_x075_v1", "dev_rigid_l1_midshape_v1_x075_v1",
-                    "dev_combined_l1_nominal_x075_v1",
-                } else source.rigid_drive_version
-            ),
-            replay_controller_version=(
-                "force_tape_v5" if variant_name == "dev_rigid_replay_shape_nominal_x075_v1"
-                else source.replay_controller_version
-            ),
             description=(
                 "Complex snapshot shape and placement paired with dev_static_midshape_v1_x075_v1; "
                 "rigid motion replays the same source entry from t=0, with X placement basis 0.75 m."
@@ -1356,6 +1346,25 @@ def _registered_scenarios() -> list[ScenarioConfig]:
                 else f"{source_name} with initial X placement basis 0.75 m."
             ),
             tags=source.tags + ("cable_x075_v1", "placement_variant"),
+        ))
+    # Force playback is an explicit new family. Saved names in cable_x075_v1
+    # continue to resolve to the original feedback / legacy replay definitions.
+    by_name = {scenario.name: scenario for scenario in scenarios}
+    for old_name, force_name in zip(CABLE_X075_SCENARIO_NAMES, CABLE_X075_FORCE_SCENARIO_NAMES):
+        source = by_name[old_name]
+        scenarios.append(replace(
+            source,
+            name=force_name,
+            rigid_drive_version=(
+                "force_tape_v1" if source.motion_profile_version == "rigid_level1_single_pass_v2"
+                else source.rigid_drive_version
+            ),
+            replay_controller_version=(
+                "force_tape_v5" if source.motion_profile_version == "rigid_replay_v1"
+                else source.replay_controller_version
+            ),
+            description=f"{source.description} Explicit uninterrupted whole-motion force playback family.",
+            tags=tuple(tag for tag in source.tags if tag != "cable_x075_v1") + ("cable_x075_force_v1",),
         ))
     return scenarios
 
@@ -1374,7 +1383,14 @@ CABLE_X075_SCENARIO_NAMES = tuple(
 CABLE_X075_REPLAY_SCENARIO_NAMES = CABLE_X075_SCENARIO_NAMES[:6] + (
     "dev_rigid_replay_midshape_v1_x075_v1",
 )
-SCENARIO_FAMILIES = {"cable_x075_v1": CABLE_X075_SCENARIO_NAMES}
+CABLE_X075_FORCE_SCENARIO_NAMES = tuple(
+    name.removesuffix("_x075_v1") + "_x075_force_v1"
+    for name in CABLE_X075_SCENARIO_NAMES
+)
+SCENARIO_FAMILIES = {
+    "cable_x075_v1": CABLE_X075_SCENARIO_NAMES,
+    "cable_x075_force_v1": CABLE_X075_FORCE_SCENARIO_NAMES,
+}
 SCENARIO_REGISTRY = ScenarioRegistry(_registered_scenarios())
 SCENARIOS = SCENARIO_REGISTRY
 DEFAULT_SCENARIO = SCENARIO_REGISTRY[DEFAULT_SCENARIO_NAME]
@@ -1548,6 +1564,7 @@ __all__ = [
     "CORE_SCENARIO_NAMES",
     "CABLE_X075_SOURCE_NAMES",
     "CABLE_X075_SCENARIO_NAMES",
+    "CABLE_X075_FORCE_SCENARIO_NAMES",
     "CABLE_X075_REPLAY_SCENARIO_NAMES",
     "LEGACY_PPO_SIX_SOURCE_NAMES",
     "SCENARIO_FAMILIES",
