@@ -260,7 +260,7 @@ class ScenarioConfig:
                 "rigid and combined scenarios must explicitly select "
                 "Level-1/Level-2 or the replay profile"
             )
-        if self.replay_controller_version not in {"legacy_pd_v1", "continuous_ff_v2", "continuous_ff_v3"}:
+        if self.replay_controller_version not in {"legacy_pd_v1", "continuous_ff_v2", "continuous_ff_v3", "continuous_ff_v4"}:
             raise ValueError("unsupported replay_controller_version")
         if self.replay_controller_version != "legacy_pd_v1" and self.motion_profile_version != "rigid_replay_v1":
             raise ValueError("replay_controller_version requires the replay profile")
@@ -1331,7 +1331,7 @@ def _registered_scenarios() -> list[ScenarioConfig]:
             ),
             replay_use_snapshot_position=source_name == "id_rigid_replay_midshape_v1",
             replay_controller_version=(
-                "continuous_ff_v3" if variant_name == "dev_rigid_replay_shape_nominal_x075_v1"
+                "continuous_ff_v4" if variant_name == "dev_rigid_replay_shape_nominal_x075_v1"
                 else source.replay_controller_version
             ),
             description=(

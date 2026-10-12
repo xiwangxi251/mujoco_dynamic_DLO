@@ -688,6 +688,86 @@ class ContactAwareReplayPairingTests(ContinuousReplayPairingTests):
             previous.close()
 
 
+class MeasuredObstructionReplayPairingTests(ContinuousReplayPairingTests):
+    """Current replay preserves normal contact response instead of touch gating."""
+
+    @classmethod
+    def setUpClass(cls):
+        from dataclasses import replace
+        super().setUpClass()
+        cls.replay_config = replace(cls.replay_config, replay_controller_version="continuous_ff_v4")
+
+    test_no_contact_has_identical_physics_to_v2 = ContactAwareReplayPairingTests.test_no_contact_has_identical_physics_to_v2
+
+    def test_real_short_unilateral_touch_keeps_replay_running(self):
+        from dataclasses import replace
+        for robot in ("panda", "nero"):
+            with self.subTest(robot=robot):
+                config = replace(self.replay_config, robot=robot)
+                if robot == "nero":
+                    probe = CableGraspEnv(replace(self.shape_config, robot=robot))
+                    try:
+                        probe.reset(seed=SEED)
+                        xy = probe.data.xpos[probe.cable_ids, :2].copy()
+                        _write_synthetic_bank(
+                            self.bank_dir, cable_ids=probe.cable_ids, node_xy0=xy,
+                            placed_com=np.average(xy, axis=0, weights=probe.cable_mass),
+                            target_index=int(probe.cable_index[probe.target_body_id]),
+                            control_dt=self.control_dt, horizon=201, seed=SEED,
+                            bank_name="nero_touch_bank",
+                        )
+                    finally:
+                        probe.close()
+                    config.replay_bank = "nero_touch_bank"
+                env = CableGraspEnv(config)
+                try:
+                    env.reset(seed=SEED)
+                    for _ in range(50):
+                        env.step(env.ready_ctrl)
+                    initial = env.data.qpos.copy()
+                    found = False
+                    for geom in sorted(env.pad_geom_ids):
+                        if env.model.geom_bodyid[geom] != env.left_finger_id:
+                            continue
+                        for offset in (np.zeros(3), np.array([0., .005, 0.]), np.array([0., -.005, 0.])):
+                            env.data.qpos[:] = initial
+                            mujoco.mj_forward(env.model, env.data)
+                            shift = env.data.geom_xpos[geom] + offset - env.data.xpos[env.cable_ids[0]]
+                            env.data.qpos[env.cable_free_qadr:env.cable_free_qadr+3] += shift
+                            mujoco.mj_forward(env.model, env.data)
+                            if {f for _, f in env._finger_body_contact_pairs()} == {env.left_finger_id}:
+                                found = True
+                                break
+                        if found:
+                            break
+                    self.assertTrue(found)
+                    env._update_rigid_motion_suspension_state()
+                    self.assertGreater(env._replay_gripper_contact_count, 0)
+                    self.assertFalse(env.rigid_motion_suspended)
+                    elapsed = env._replay_elapsed
+                    env.step(env.ready_ctrl)
+                    self.assertFalse(env.grasp_confirmed)
+                    self.assertFalse(env.rigid_motion_suspended)
+                    self.assertAlmostEqual(env._replay_elapsed-elapsed, self.control_dt)
+                    self.assertEqual(env._replay_anchor_elapsed, 0.)
+                    env.data.qpos[env.cable_free_qadr:env.cable_free_qadr+3] -= shift
+                    env.data.qvel[:] = 0.
+                    mujoco.mj_forward(env.model, env.data)
+                    self.assertEqual(env._replay_gripper_contact_count_now(), 0)
+                    env._update_rigid_motion_suspension_state()
+                    env.step(env.ready_ctrl)
+                    self.assertFalse(env.rigid_motion_suspended)
+                    self.assertAlmostEqual(env._replay_elapsed-elapsed, 2*self.control_dt)
+                    self.assertEqual(env._replay_anchor_elapsed, 0.)
+                    env._replay_obstruction_started_at = float(env.data.time)
+                    env._replay_obstruction_geom_pairs = {(1, 2)}
+                    env.reset(seed=SEED)
+                    self.assertIsNone(env._replay_obstruction_started_at)
+                    self.assertEqual(env._replay_obstruction_geom_pairs, set())
+                finally:
+                    env.close()
+
+
 class RenderModeInvarianceTests(unittest.TestCase):
     """The gripper geom-group toggle must be an observation-only change."""
 

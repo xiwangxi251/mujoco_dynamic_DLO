@@ -1,4 +1,4 @@
-"""Contact gating must not depend on confirmation, hold duration or jaw command."""
+"""Distinguish sustained obstruction from contact; preserve historical v3."""
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -23,6 +23,10 @@ def make_env(version="continuous_ff_v3"):
     env.grasp_state = None
     env.rigid_motion_released = False
     env._replay_was_suspended = False
+    env._replay_contact_blocked = False
+    env._replay_obstruction_started_at = None
+    env._replay_obstruction_geom_pairs = set()
+    env._replay_obstruction_still_near = Mock(return_value=False)
     env._replay_last_gripper_contact_time = -np.inf
     env._replay_reanchor = Mock()
     return env
@@ -103,3 +107,94 @@ def test_saved_controller_versions_keep_contact_semantics(version):
     env._update_rigid_motion_suspension_state()
     assert not env.rigid_motion_suspended
     assert not env._replay_contact_blocked
+
+
+def test_v4_short_touch_does_not_pause_or_reanchor():
+    env = make_env("continuous_ff_v4")
+    env._replay_obstruction_evidence = Mock(return_value=True)
+    contacts(env, (0, 2, -.001))
+    env._update_rigid_motion_suspension_state()
+    env.data.time = 1.098
+    env._update_rigid_motion_suspension_state()
+    assert not env.rigid_motion_suspended
+    contacts(env)
+    env.data.time = 1.1
+    env._update_rigid_motion_suspension_state()
+    assert not env.rigid_motion_suspended
+    assert env._replay_obstruction_started_at is None
+    env._replay_reanchor.assert_not_called()
+
+
+def test_v4_sliding_contact_does_not_pause_even_when_persistent():
+    env = make_env("continuous_ff_v4")
+    env._replay_obstruction_evidence = Mock(return_value=False)
+    contacts(env, (0, 2, -.001))
+    for time in (1., 1.1, 2., 11.):
+        env.data.time = time
+        env._update_rigid_motion_suspension_state()
+        assert not env.rigid_motion_suspended
+    env._replay_reanchor.assert_not_called()
+
+
+def test_v4_obstruction_requires_continuous_evidence_then_reanchors_on_clear():
+    env = make_env("continuous_ff_v4")
+    env._replay_obstruction_evidence = Mock(return_value=True)
+    contacts(env, (0, 2, -.001))
+    env._update_rigid_motion_suspension_state()
+    env.data.time = 1.08
+    env._replay_obstruction_evidence.return_value = False
+    env._update_rigid_motion_suspension_state()
+    env._replay_obstruction_evidence.return_value = True
+    for time in (1.10, 1.198):
+        env.data.time = time
+        env._update_rigid_motion_suspension_state()
+        assert not env.rigid_motion_suspended
+    env.data.time = 1.20
+    env._update_rigid_motion_suspension_state()
+    assert env.rigid_motion_suspended
+    env.data.time = 11.20
+    env._update_rigid_motion_suspension_state()
+    assert env.rigid_motion_suspended
+    contacts(env)
+    env.data.time = 11.238
+    env._update_rigid_motion_suspension_state()
+    assert env.rigid_motion_suspended
+    env.data.time = 11.24
+    env._update_rigid_motion_suspension_state()
+    assert not env.rigid_motion_suspended
+    env._replay_reanchor.assert_called_once()
+
+
+@pytest.mark.parametrize("speed,actual,lag,expected", [
+    (.1, .0, .02, True),     # Actually held back.
+    (.1, -.1, .02, True),    # Pushed against the direction of travel.
+    (.1, .08, .02, False),   # Sliding contact with good progress.
+    (.1, .0, .001, False),   # Little tracking lag.
+    (.01, .0, .02, False),   # Naturally slow reference.
+    (.1, .0, -.02, False),   # Cable already ahead of reference.
+])
+def test_v4_uses_material_progress_and_lag(speed, actual, lag, expected):
+    env = make_env("continuous_ff_v4")
+    contacts(env, (0, 2, -.001), (0, 2, -.001))
+    env.cable_index = {3: 0}
+    env._rigid_reference_xy = np.zeros((1, 2))
+    env._rigid_reference_com_xy = np.zeros(2)
+    env.data.xpos = np.zeros((6, 3))
+    env.body_linear_velocity = Mock(return_value=np.array([actual, 0., 0.]))
+    env._continuous_replay_targets = lambda: (np.array([lag, 0.]), np.array([speed, 0.]), None, 0., 0., 0.)
+    assert env._replay_obstruction_evidence() is expected
+
+
+def test_v4_rotation_can_be_obstructed_even_when_com_is_stationary():
+    env = make_env("continuous_ff_v4")
+    contacts(env, (0, 2, -.001))
+    env.cable_index = {3: 0}
+    env._rigid_reference_xy = np.array([[.1, 0.]])
+    env._rigid_reference_com_xy = np.zeros(2)
+    env.data.xpos = np.zeros((6, 3))
+    env.data.xpos[3, :2] = [.1, -.02]
+    env.body_linear_velocity = Mock(return_value=np.zeros(3))
+    env._continuous_replay_targets = lambda: (np.zeros(2), np.zeros(2), None, 0., 1., 0.)
+    assert env._replay_obstruction_evidence()
+    assert env._replay_motion_progress_ratio == 0.
+    assert env._replay_motion_lag_m == pytest.approx(.02)

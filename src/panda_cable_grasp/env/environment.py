@@ -47,6 +47,12 @@ NERO_ARM_JOINT_VELOCITY_LIMITS = (
 
 # v3 resumes only after 40 ms without penetrating gripper/cable contact.
 REPLAY_CONTACT_CLEAR_SECONDS = 0.04
+REPLAY_OBSTRUCTION_CONFIRM_SECONDS = 0.10
+REPLAY_OBSTRUCTION_MIN_SPEED = 0.03
+REPLAY_OBSTRUCTION_MAX_PROGRESS = 0.25
+REPLAY_OBSTRUCTION_MIN_LAG = 0.005
+REPLAY_OBSTRUCTION_CLEARANCE = 0.002
+CONTINUOUS_REPLAY_CONTROLLERS = {"continuous_ff_v2", "continuous_ff_v3", "continuous_ff_v4"}
 
 DEFAULT_DYNAMICVLA_WRIST_CAMERA_POS = (0.065, 0.0, 0.0)
 DEFAULT_DYNAMICVLA_WRIST_CAMERA_QUAT = (
@@ -544,7 +550,7 @@ class EnvConfig:
                 "Level-1/Level-2/replay profiles require rigid or combined motion"
             )
         uses_replay = self.motion_profile_version == REPLAY_MOTION_PROFILE
-        if self.replay_controller_version not in {"legacy_pd_v1", "continuous_ff_v2", "continuous_ff_v3"}:
+        if self.replay_controller_version not in {"legacy_pd_v1", *CONTINUOUS_REPLAY_CONTROLLERS}:
             raise ValueError("unsupported replay_controller_version")
         if self.replay_controller_version != "legacy_pd_v1" and not uses_replay:
             raise ValueError("replay_controller_version requires the replay profile")
@@ -1630,6 +1636,10 @@ class CableGraspEnv:
         self._replay_contact_blocked = False
         self._replay_gripper_contact_count = 0
         self._replay_last_gripper_contact_time = -math.inf
+        self._replay_obstruction_started_at = None
+        self._replay_obstruction_geom_pairs = set()
+        self._replay_motion_progress_ratio = None
+        self._replay_motion_lag_m = None
 
         # initial_shape_bank 状态：库与回放库同格式，只取一帧构型。
         self._shape_banks: dict[str, "ReplayBank"] = {}
@@ -1777,7 +1787,7 @@ class CableGraspEnv:
         self._replay_yaw = trajectory.delta_yaw
         self._replay_yaw_rate = trajectory.yaw_rate
         self._replay_valid_steps = int(bank.valid_steps[entry])
-        if self.config.replay_controller_version in {"continuous_ff_v2", "continuous_ff_v3"}:
+        if self.config.replay_controller_version in CONTINUOUS_REPLAY_CONTROLLERS:
             from .replay_bank import ContinuousReplayReference
             self._replay_reference = ContinuousReplayReference(
                 trajectory, self._replay_dt, self._replay_valid_steps,
@@ -2164,6 +2174,10 @@ class CableGraspEnv:
         self._replay_contact_blocked = False
         self._replay_gripper_contact_count = 0
         self._replay_last_gripper_contact_time = -math.inf
+        self._replay_obstruction_started_at = None
+        self._replay_obstruction_geom_pairs = set()
+        self._replay_motion_progress_ratio = None
+        self._replay_motion_lag_m = None
         self.last_termination_reason = None
         self._last_contact_count = 0
         self._last_shape_acceleration[:] = 0.0
@@ -2924,9 +2938,14 @@ class CableGraspEnv:
             "rigid_motion_released": self.rigid_motion_released,
             "replay_contact_blocked": self._replay_contact_blocked,
             "replay_gripper_contact_count": self._replay_gripper_contact_count,
+            "replay_motion_progress_ratio": self._replay_motion_progress_ratio,
+            "replay_motion_lag_m": self._replay_motion_lag_m,
             "replay_suspension_reason": (
                 "confirmed_grasp" if self.rigid_motion_suspended and self.grasp_confirmed
-                else "gripper_contact" if self._replay_contact_blocked else None
+                else (
+                    "gripper_obstruction" if self.config.replay_controller_version == "continuous_ff_v4"
+                    else "gripper_contact"
+                ) if self._replay_contact_blocked else None
             ),
             "termination_reason": self.last_termination_reason,
             "initial_shape_family": self._rigid_initial_shape_family,
@@ -3202,22 +3221,48 @@ class CableGraspEnv:
         )
 
     def _update_rigid_motion_suspension_state(self) -> None:
-        """Suspend rigid drive for grasp, and v3 replay for gripper obstruction.
+        """Suspend for grasp, or sustained measured obstruction in current replay.
 
         覆盖 L1/L2 扫描和 ``rigid_replay_v1`` 回放：确认抓取期间整体驱动
         与回放时钟一起暂停，松开后从暂停处续走而不是追赶进度。
         """
+        was_contact_blocked = self._replay_contact_blocked
         self._replay_gripper_contact_count = 0
         self._replay_contact_blocked = False
-        if self._uses_replay_motion and self.config.replay_controller_version == "continuous_ff_v3":
+        self._replay_motion_progress_ratio = None
+        self._replay_motion_lag_m = None
+        confirmed = self.grasp_confirmed
+        version = self.config.replay_controller_version
+        if self._uses_replay_motion and version in {"continuous_ff_v3", "continuous_ff_v4"}:
             self._replay_gripper_contact_count = self._replay_gripper_contact_count_now()
             if self._replay_gripper_contact_count:
                 self._replay_last_gripper_contact_time = float(self.data.time)
-            self._replay_contact_blocked = (
+            if version == "continuous_ff_v4" and was_contact_blocked and self._replay_obstruction_still_near():
+                # Unloading a real obstruction may remove solver contacts by
+                # micrometres. That is not evidence the obstacle was removed.
+                self._replay_last_gripper_contact_time = float(self.data.time)
+            contact_recent = (
                 self.data.time - self._replay_last_gripper_contact_time
                 < REPLAY_CONTACT_CLEAR_SECONDS - 1e-12
             )
-        confirmed = self.grasp_confirmed
+            if version == "continuous_ff_v3":
+                self._replay_contact_blocked = contact_recent
+            elif was_contact_blocked:
+                self._replay_contact_blocked = contact_recent
+                self._replay_obstruction_started_at = None
+            elif not confirmed and self._replay_gripper_contact_count and self._replay_obstruction_evidence():
+                if self._replay_obstruction_started_at is None:
+                    self._replay_obstruction_started_at = float(self.data.time)
+                self._replay_contact_blocked = (
+                    self.data.time - self._replay_obstruction_started_at
+                    >= REPLAY_OBSTRUCTION_CONFIRM_SECONDS - 1e-12
+                )
+                if self._replay_contact_blocked:
+                    self._replay_obstruction_geom_pairs = set(self._replay_gripper_contact_geom_pairs())
+            else:
+                self._replay_obstruction_started_at = None
+            if version == "continuous_ff_v4" and not self._replay_contact_blocked:
+                self._replay_obstruction_geom_pairs.clear()
         self.rigid_motion_suspended = bool(
             self.config.motion_profile_version in RIGID_STYLE_PROFILES
             and (confirmed or self._replay_contact_blocked)
@@ -3232,22 +3277,68 @@ class CableGraspEnv:
         self._replay_was_suspended = self.rigid_motion_suspended
 
     def _replay_gripper_contact_count_now(self) -> int:
+        return len(self._replay_gripper_contact_geom_pairs())
+
+    def _replay_gripper_contact_bodies(self) -> list[int]:
+        return [int(self.model.geom_bodyid[cable]) for _, cable in self._replay_gripper_contact_geom_pairs()]
+
+    def _replay_gripper_contact_geom_pairs(self) -> list[tuple[int, int]]:
         """Any finger/palm cable contact, including unilateral or outer surfaces.
 
-        Conservatively pause on touching/penetrating geometry; positive-distance
-        margin contacts, table contact and visual-only geoms do not count. This
-        does not change physical grasp confirmation or task success predicates.
+        Contact is evidence to inspect, not sufficient to pause the v4 drive.
+        Positive-distance margins, table and visual-only geoms do not count.
         """
-        count = 0
+        pairs = []
         for contact in self.data.contact[:self.data.ncon]:
             if contact.dist > 0.0:
                 continue
             g1, g2 = int(contact.geom1), int(contact.geom2)
-            count += int(
-                (g1 in self.replay_gripper_geom_ids and int(self.model.geom_bodyid[g2]) in self.cable_set)
-                or (g2 in self.replay_gripper_geom_ids and int(self.model.geom_bodyid[g1]) in self.cable_set)
-            )
-        return count
+            if g1 in self.replay_gripper_geom_ids and int(self.model.geom_bodyid[g2]) in self.cable_set:
+                pairs.append((g1, g2))
+            elif g2 in self.replay_gripper_geom_ids and int(self.model.geom_bodyid[g1]) in self.cable_set:
+                pairs.append((g2, g1))
+        return pairs
+
+    def _replay_obstruction_still_near(self) -> bool:
+        # Only inspect pairs from a confirmed sustained obstruction. Mere
+        # proximity or a fresh touch cannot activate this latch.
+        return any(
+            mujoco.mj_geomDistance(
+                self.model, self.data, gripper, cable,
+                2.*REPLAY_OBSTRUCTION_CLEARANCE, None,
+            ) <= REPLAY_OBSTRUCTION_CLEARANCE
+            for gripper, cable in self._replay_obstruction_geom_pairs
+        )
+
+    def _replay_obstruction_evidence(self) -> bool:
+        """Contacted material nodes must actually lag and stop progressing.
+
+        Use planar rigid material velocities, including yaw, rather than COM
+        speed alone. A glancing/sliding contact or a naturally stationary
+        reference is not obstruction. Repeated contacts on one node count once.
+        """
+        bodies = sorted(set(self._replay_gripper_contact_bodies()))
+        if not bodies:
+            return False
+        indices = np.array([self.cable_index[body] for body in bodies])
+        position, velocity, _, yaw, rate, _ = self._continuous_replay_targets()
+        relative = (
+            self._rigid_reference_xy[indices] - self._rigid_reference_com_xy
+        ) @ self._planar_rotation(yaw)
+        desired_velocity = velocity + rate * np.column_stack((-relative[:, 1], relative[:, 0]))
+        speed_squared = float(np.sum(desired_velocity**2))
+        if math.sqrt(speed_squared / len(bodies)) < REPLAY_OBSTRUCTION_MIN_SPEED:
+            return False
+        actual_velocity = np.array([self.body_linear_velocity(body)[:2] for body in bodies])
+        error = position + relative - self.data.xpos[bodies, :2]
+        self._replay_motion_progress_ratio = float(np.sum(actual_velocity * desired_velocity) / speed_squared)
+        self._replay_motion_lag_m = float(
+            np.sum(error * desired_velocity) / np.sum(np.linalg.norm(desired_velocity, axis=1))
+        )
+        return (
+            self._replay_motion_progress_ratio < REPLAY_OBSTRUCTION_MAX_PROGRESS
+            and self._replay_motion_lag_m > REPLAY_OBSTRUCTION_MIN_LAG
+        )
 
     def _replay_reanchor(self) -> None:
         """抓取松开后把回放参考重锚到线缆当前实际位姿。
@@ -4506,7 +4597,7 @@ class CableGraspEnv:
         松开后参考经 `_replay_reanchor` 重锚，无追赶段。
         """
 
-        if self.config.replay_controller_version in {"continuous_ff_v2", "continuous_ff_v3"}:
+        if self.config.replay_controller_version in CONTINUOUS_REPLAY_CONTROLLERS:
             return self._continuous_replay_motion_acceleration(velocity_xy)
 
         index = self._replay_index()
@@ -4829,7 +4920,7 @@ class CableGraspEnv:
         reference_relative = self._rigid_reference_xy - self._rigid_reference_com_xy
         com_velocity = np.average(velocity_xy, axis=0, weights=self.cable_mass)
         if self._uses_replay_motion:
-            if self.config.replay_controller_version in {"continuous_ff_v2", "continuous_ff_v3"}:
+            if self.config.replay_controller_version in CONTINUOUS_REPLAY_CONTROLLERS:
                 _, _, _, target_yaw, target_yaw_rate, _ = self._continuous_replay_targets()
             else:
                 index = self._replay_index()
