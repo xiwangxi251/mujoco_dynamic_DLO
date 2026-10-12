@@ -487,6 +487,74 @@ class ReplayPairingTests(unittest.TestCase):
             env.close()
 
 
+class ContinuousReplayPairingTests(ReplayPairingTests):
+    """Run existing freeze, suspension, release and yaw-wrap contracts on v2."""
+
+    @classmethod
+    def setUpClass(cls):
+        from dataclasses import replace
+        super().setUpClass()
+        cls.replay_config = replace(cls.replay_config,replay_controller_version='continuous_ff_v2')
+
+    def make_replay_env(self):
+        # Tests that vary time scale must not mutate the shared class config.
+        from dataclasses import replace
+        return CableGraspEnv(replace(self.replay_config))
+
+    def test_reference_derivatives_and_fractional_reanchor(self):
+        env = self.make_replay_env()
+        try:
+            env.reset(seed=SEED)
+            env._replay_anchor_elapsed=.437
+            env._replay_anchor_yaw=.8
+            env._replay_elapsed=1.137
+            for scale in (.5,1.,2.):
+                env.config.replay_time_scale=scale
+                t=env._replay_elapsed
+                h=1e-5
+                env._replay_elapsed=t-h*scale
+                left=env._continuous_replay_targets()
+                env._replay_elapsed=t
+                center=env._continuous_replay_targets()
+                env._replay_elapsed=t+h*scale
+                right=env._continuous_replay_targets()
+                np.testing.assert_allclose((right[0]-left[0])/(2*h),center[1],atol=1e-7)
+                np.testing.assert_allclose((right[1]-left[1])/(2*h),center[2],atol=1e-6)
+                self.assertAlmostEqual((right[3]-left[3])/(2*h),center[4],places=7)
+                env._replay_elapsed=t
+            env._replay_reanchor()
+            position, _, _, yaw, _, _=env._continuous_replay_targets()
+            offset=(env._rigid_reference_xy[env._replay_tracked_index]-env._rigid_reference_com_xy)
+            np.testing.assert_allclose(position+offset@env._planar_rotation(yaw),
+                env.data.xpos[env.cable_ids[env._replay_tracked_index],:2],atol=1e-12)
+        finally:
+            env.close()
+
+    def test_synthetic_velocity_and_position_tracking(self):
+        env=self.make_replay_env()
+        try:
+            env.reset(seed=SEED)
+            probe=mujoco.MjData(env.model)
+            jac=np.empty((3,env.model.nv));jr=np.empty_like(jac)
+            errors=[];velocities=[];expected=[]
+            for _ in range(int(2./self.control_dt)):
+                env.step(env.ready_ctrl)
+                if env.data.time<.82: continue
+                probe.qpos[:]=env.data.qpos;probe.qvel[:]=env.data.qvel
+                mujoco.mj_kinematics(env.model,probe);mujoco.mj_comPos(env.model,probe)
+                body=int(env.cable_ids[env._replay_tracked_index])
+                mujoco.mj_jacBody(env.model,probe,jac,jr,body)
+                sample=env._replay_reference.sample(env._replay_elapsed)
+                errors.append(probe.xpos[body,:2]-env._replay_anchor_tracked-sample.position)
+                velocities.append((jac@probe.qvel)[:2]);expected.append(sample.velocity)
+            velocities=np.array(velocities);expected=np.array(expected)
+            self.assertLess(np.sqrt(np.mean(np.sum(np.array(errors)**2,axis=1))),.005)
+            self.assertLess(np.sqrt(np.mean(np.sum((velocities-expected)**2,axis=1))),.02)
+            self.assertLess(abs(np.linalg.norm(velocities,axis=1).mean()/np.linalg.norm(expected,axis=1).mean()-1),.05)
+        finally:
+            env.close()
+
+
 class RenderModeInvarianceTests(unittest.TestCase):
     """The gripper geom-group toggle must be an observation-only change."""
 

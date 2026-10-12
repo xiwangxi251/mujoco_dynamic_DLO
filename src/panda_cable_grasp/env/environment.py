@@ -349,6 +349,12 @@ class EnvConfig:
     replay_bank: str | None = None
     replay_bank_dir: str | None = None   # None -> output_path("motion_banks")
     replay_seed_fallback: str = "resample"  # resample / error：seed 不在库中时的行为
+    # Missing in historical configs: preserve the original controller exactly.
+    replay_controller_version: str = "legacy_pd_v1"
+    replay_position_gain: float = 800.0
+    replay_velocity_gain: float = 56.0
+    replay_yaw_position_gain: float = 160.0
+    replay_yaw_velocity_gain: float = 24.0
 
     # initial_shape_bank：从同格式轨迹库取一个中间帧构型作为本回合
     # 初始线缆形状（场景内无驱动）。与 rigid_replay_v1 联用时必须等于
@@ -535,6 +541,10 @@ class EnvConfig:
                 "Level-1/Level-2/replay profiles require rigid or combined motion"
             )
         uses_replay = self.motion_profile_version == REPLAY_MOTION_PROFILE
+        if self.replay_controller_version not in {"legacy_pd_v1", "continuous_ff_v2"}:
+            raise ValueError("unsupported replay_controller_version")
+        if self.replay_controller_version != "legacy_pd_v1" and not uses_replay:
+            raise ValueError("replay_controller_version requires the replay profile")
         if uses_replay:
             if self.replay_bank is None or not str(self.replay_bank).strip():
                 raise ValueError("rigid_replay_v1 requires a replay_bank name")
@@ -590,6 +600,10 @@ class EnvConfig:
             "rigid_shape_stiffness",
             "rigid_shape_damping",
             "rigid_shape_max_acceleration",
+            "replay_position_gain",
+            "replay_velocity_gain",
+            "replay_yaw_position_gain",
+            "replay_yaw_velocity_gain",
         )
         positive = (
             "replay_time_scale",
@@ -1602,6 +1616,8 @@ class CableGraspEnv:
         self._replay_anchor_tracked = np.zeros(2)
         self._replay_anchor_yaw = 0.0
         self._replay_anchor_index = 0
+        self._replay_anchor_elapsed = 0.0
+        self._replay_reference = None
 
         # initial_shape_bank 状态：库与回放库同格式，只取一帧构型。
         self._shape_banks: dict[str, "ReplayBank"] = {}
@@ -1749,6 +1765,13 @@ class CableGraspEnv:
         self._replay_yaw = trajectory.delta_yaw
         self._replay_yaw_rate = trajectory.yaw_rate
         self._replay_valid_steps = int(bank.valid_steps[entry])
+        if self.config.replay_controller_version == "continuous_ff_v2":
+            from .replay_bank import ContinuousReplayReference
+            self._replay_reference = ContinuousReplayReference(
+                trajectory, self._replay_dt, self._replay_valid_steps,
+            )
+        else:
+            self._replay_reference = None
         self._replay_placed_com = bank.placed_com_xy[entry].astype(float)
         if self.config.initial_cable_center_x is not None:
             self._replay_placed_com[0] += (
@@ -2080,6 +2103,7 @@ class CableGraspEnv:
             ].copy()
             self._replay_anchor_yaw = 0.0
             self._replay_anchor_index = 0
+            self._replay_anchor_elapsed = 0.0
         for obj in self._objects:
             obj.reference_xy = self.data.xpos[
                 np.asarray(obj.ids), :2
@@ -2103,6 +2127,12 @@ class CableGraspEnv:
                 f"{self._replay_tracked_index}"
             ).encode("ascii") if self._uses_replay_motion else b"",
         ))
+        if self._uses_replay_motion and self.config.replay_controller_version != "legacy_pd_v1":
+            profile_bytes += (
+                f"|{self.config.replay_controller_version}|{self.config.replay_position_gain:.17g}"
+                f"|{self.config.replay_velocity_gain:.17g}|{self.config.replay_yaw_position_gain:.17g}"
+                f"|{self.config.replay_yaw_velocity_gain:.17g}"
+            ).encode("ascii")
         self.motion_profile_hash = hashlib.sha256(profile_bytes).hexdigest()
 
         self.grasp_state = None
@@ -2904,6 +2934,9 @@ class CableGraspEnv:
             "replay_elapsed": (
                 float(self._replay_elapsed) if self._uses_replay_motion else None
             ),
+            "replay_controller_version": (
+                self.config.replay_controller_version if self._uses_replay_motion else None
+            ),
             "replay_source_motion_mode": (
                 self._replay_source_motion_mode
                 if self._uses_replay_motion else None
@@ -3179,6 +3212,7 @@ class CableGraspEnv:
         ].copy()
         self._replay_anchor_yaw = float(current_yaw)
         self._replay_anchor_index = index
+        self._replay_anchor_elapsed = float(self._replay_elapsed)
 
     def _update_physical_grasp_state(self, gripper_closed: bool) -> None:
         """Physical evidence controls state; commands only annotate release intent."""
@@ -4421,6 +4455,9 @@ class CableGraspEnv:
         松开后参考经 `_replay_reanchor` 重锚，无追赶段。
         """
 
+        if self.config.replay_controller_version == "continuous_ff_v2":
+            return self._continuous_replay_motion_acceleration(velocity_xy)
+
         index = self._replay_index()
         anchor_index = self._replay_anchor_index
         anchor_yaw = self._replay_anchor_yaw
@@ -4504,6 +4541,69 @@ class CableGraspEnv:
                 np.cross(np.broadcast_to(omega, relative.shape), relative),
             )
         )
+        rotation -= np.average(rotation, axis=0, weights=self.cable_mass)
+        return translation, rotation
+
+    def _continuous_replay_targets(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+        """COM position/velocity/acceleration and yaw derivatives in world time."""
+        assert self._replay_reference is not None
+        sample = self._replay_reference.sample(self._replay_elapsed)
+        anchor = self._replay_reference.sample(self._replay_anchor_elapsed)
+        scale = self.config.replay_time_scale
+        yaw = self._replay_anchor_yaw + sample.yaw - anchor.yaw
+        rate = sample.yaw_rate * scale
+        alpha = sample.yaw_acceleration * scale**2
+        anchor_rotation = self._planar_rotation(self._replay_anchor_yaw - anchor.yaw)
+        tracked_offset = (
+            self._rigid_reference_xy[self._replay_tracked_index]
+            - self._rigid_reference_com_xy
+        ) @ self._planar_rotation(yaw)
+        tangent = np.array([-tracked_offset[1], tracked_offset[0]])
+        position = (
+            self._replay_anchor_tracked
+            + (sample.position - anchor.position) @ anchor_rotation - tracked_offset
+        )
+        velocity = scale * sample.velocity @ anchor_rotation - rate * tangent
+        acceleration = (
+            scale**2 * sample.acceleration @ anchor_rotation
+            - alpha * tangent + rate**2 * tracked_offset
+        )
+        return position, velocity, acceleration, yaw, rate, alpha
+
+    def _continuous_replay_motion_acceleration(
+        self, velocity_xy: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        position, velocity, feedforward, yaw, rate, alpha = self._continuous_replay_targets()
+        xy = self.data.xpos[self.cable_ids, :2]
+        com = np.average(xy, axis=0, weights=self.cable_mass)
+        com_velocity = np.average(velocity_xy, axis=0, weights=self.cable_mass)
+        acceleration = (
+            feedforward + self.config.replay_position_gain * (position - com)
+            + self.config.replay_velocity_gain * (velocity - com_velocity)
+        )
+        norm = float(np.linalg.norm(acceleration))
+        if norm > self.config.rigid_translation_max_acceleration:
+            acceleration *= self.config.rigid_translation_max_acceleration / norm
+        translation = np.zeros((len(self.cable_ids), 3))
+        translation[:, :2] = acceleration
+        relative = xy - com
+        relative_velocity = velocity_xy - com_velocity
+        inertia = float(np.sum(self.cable_mass * np.sum(relative**2, axis=1)))
+        actual_rate = float(np.sum(self.cable_mass * (
+            relative[:, 0] * relative_velocity[:, 1]
+            - relative[:, 1] * relative_velocity[:, 0]
+        )) / max(inertia, 1e-12))
+        _, actual_yaw = self._current_rigid_pose()
+        angular_acceleration = float(np.clip(
+            alpha + self.config.replay_yaw_position_gain * _wrap_angle(yaw - actual_yaw)
+            + self.config.replay_yaw_velocity_gain * (rate - actual_rate), -18., 18.,
+        ))
+        rotation = np.zeros_like(translation)
+        rotation[:, :2] = angular_acceleration * np.column_stack((
+            -relative[:, 1], relative[:, 0],
+        )) - actual_rate**2 * relative
         rotation -= np.average(rotation, axis=0, weights=self.cable_mass)
         return translation, rotation
 
@@ -4678,9 +4778,12 @@ class CableGraspEnv:
         reference_relative = self._rigid_reference_xy - self._rigid_reference_com_xy
         com_velocity = np.average(velocity_xy, axis=0, weights=self.cable_mass)
         if self._uses_replay_motion:
-            index = self._replay_index()
-            target_yaw = float(self._replay_yaw[index])
-            target_yaw_rate = float(self._replay_yaw_rate[index])
+            if self.config.replay_controller_version == "continuous_ff_v2":
+                _, _, _, target_yaw, target_yaw_rate, _ = self._continuous_replay_targets()
+            else:
+                index = self._replay_index()
+                target_yaw = float(self._replay_yaw[index])
+                target_yaw_rate = float(self._replay_yaw_rate[index])
         else:
             current_offset = current_com - self._rigid_reference_com_xy
             _, tangent, progress, progress_metric = (

@@ -9,6 +9,8 @@ import numpy as np
 from panda_cable_grasp.env.replay_bank import (
     BANK_FORMAT_VERSION,
     ReplayBank,
+    ReplayTrajectory,
+    ContinuousReplayReference,
 )
 
 
@@ -161,6 +163,53 @@ class ReplayBankTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             ReplayBank(path)
+
+
+class ContinuousReplayReferenceTests(unittest.TestCase):
+    def make_reference(self, valid=101):
+        t = np.arange(121)*.02
+        position = np.column_stack((.05*np.sin(2*t), .03*(1-np.cos(3*t))))
+        yaw = .4*t + .02*np.sin(t)
+        position[valid:] = position[valid-1]
+        yaw[valid:] = yaw[valid-1]
+        trajectory = ReplayTrajectory(position, np.gradient(position,.02,axis=0),
+            yaw, np.gradient(yaw,.02))
+        return ContinuousReplayReference(trajectory,.02,valid), position, yaw
+
+    def test_interpolation_preserves_recorded_knots(self):
+        reference, position, yaw = self.make_reference()
+        for i in range(101):
+            sample = reference.sample(i*.02)
+            np.testing.assert_allclose(sample.position,position[i],atol=1e-12)
+            self.assertAlmostEqual(sample.yaw,yaw[i],places=12)
+
+    def test_derivatives_match_position_and_velocity_between_and_at_knots(self):
+        reference, _, _ = self.make_reference()
+        for t in (.113, .42, 1.007, 1.54):
+            h = 1e-6
+            left, center, right = [reference.sample(x) for x in (t-h,t,t+h)]
+            np.testing.assert_allclose((right.position-left.position)/(2*h),center.velocity,atol=1e-8)
+            np.testing.assert_allclose((right.velocity-left.velocity)/(2*h),center.acceleration,atol=1e-6)
+            self.assertAlmostEqual((right.yaw-left.yaw)/(2*h),center.yaw_rate,places=8)
+            self.assertAlmostEqual((right.yaw_rate-left.yaw_rate)/(2*h),center.yaw_acceleration,places=6)
+            np.testing.assert_allclose(left.acceleration,right.acceleration,atol=1e-5)
+
+    def test_tail_is_held_with_zero_derivatives(self):
+        reference, position, yaw = self.make_reference(valid=51)
+        for t in (1., 1.001, 1.5, 100.):
+            sample=reference.sample(t)
+            np.testing.assert_array_equal(sample.position,position[50])
+            np.testing.assert_array_equal(sample.velocity,np.zeros(2))
+            np.testing.assert_array_equal(sample.acceleration,np.zeros(2))
+            self.assertEqual(sample.yaw_rate,0.)
+            self.assertEqual(sample.yaw_acceleration,0.)
+        self.assertLess(np.linalg.norm(reference.sample(1.-1e-8).velocity),1e-5)
+
+    def test_single_sample_and_invalid_time(self):
+        reference, position, _ = self.make_reference(valid=1)
+        np.testing.assert_array_equal(reference.sample(.4).position,position[0])
+        for elapsed in (float('nan'),float('inf')):
+            with self.assertRaises(ValueError): reference.sample(elapsed)
 
 
 GRIPPER_MESHES = {

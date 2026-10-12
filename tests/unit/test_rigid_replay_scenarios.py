@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from panda_cable_grasp.env.environment import EnvConfig
 from panda_cable_grasp.scenarios import get_scenario, list_scenarios
@@ -6,6 +7,26 @@ from panda_cable_grasp.scenarios.registry import SCENARIO_FAMILIES
 
 
 class ReplayScenarioRegistryTests(unittest.TestCase):
+    def test_current_shape_replay_uses_versioned_controller_only(self):
+        current=get_scenario('dev_rigid_replay_shape_nominal_x075_v1')
+        self.assertEqual(current.replay_controller_version,'continuous_ff_v2')
+        self.assertEqual(EnvConfig(**current.to_env_overrides()).replay_controller_version,'continuous_ff_v2')
+        legacy=replace(current,replay_controller_version='legacy_pd_v1')
+        self.assertNotEqual(current.scenario_id,legacy.scenario_id)
+        self.assertEqual(legacy.scenario_id,'scenario-v1-48ead0f573de9a62')
+        self.assertNotIn('replay_controller_version',legacy._identity_payload())
+        for name in ('id_rigid_replay_shape_nominal','dev_rigid_replay_midshape_v1_x075_v1'):
+            self.assertEqual(get_scenario(name).replay_controller_version,'legacy_pd_v1')
+
+    def test_controller_version_and_gain_validation(self):
+        with self.assertRaisesRegex(ValueError,'replay_controller_version'):
+            EnvConfig(replay_controller_version='typo')
+        with self.assertRaisesRegex(ValueError,'replay_controller_version'):
+            EnvConfig(replay_controller_version='continuous_ff_v2')
+        with self.assertRaises(ValueError):
+            EnvConfig(replay_position_gain=float('nan'))
+        with self.assertRaises(ValueError):
+            EnvConfig(replay_velocity_gain=-1.)
     def test_x075_complex_replay_pairs_snapshot_shape_and_position(self) -> None:
         name = "dev_rigid_replay_midshape_v1_x075_v1"
         self.assertNotIn(name, SCENARIO_FAMILIES["cable_x075_v1"])

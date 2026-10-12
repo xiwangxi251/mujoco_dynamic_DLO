@@ -89,6 +89,11 @@
 注册入口：`SCENARIO_FAMILIES["cable_x075_v1"]`；
 场景参数：`get_scenario(name).to_env_overrides()`。
 
+2026-10-12修正 **Shape replay** 的速度跟踪：当前该项采用具名版本
+`continuous_ff_v2`（连续参考、加速度前馈及独立增益），仅该项场景ID更新。
+历史配置缺省保持`legacy_pd_v1`，历史录像/结果保留原身份。
+实现、有限配对验证与限制见[Shape replay速度跟踪修正](shape_replay_tracking_fix_20261012.md)。
+
 第七项调整时的验证：原有 60 个场景 ID 全部保留；实际评测库的 20260804～20260813
 十个种子均通过初始化、快照构型及运动规则配对检查，中心化构型最大差异
 小于 6e-16 m。记录：`outputs/tmp/complex_simple_motion_20261009/verification.json`。

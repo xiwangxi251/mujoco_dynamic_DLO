@@ -4,10 +4,11 @@ A replay bank stores the free-run planar motion of every material node of the
 canonical cable for a set of episode seeds of a source scenario.  The
 ``rigid_replay_v1`` motion profile replays one recorded node trajectory as the
 rigid transform (planar COM translation plus yaw about the COM) of the whole
-shape-frozen cable.  Because a paired seed produces the same initial curve and
-target index, the replayed cable's tracked node has kinematics identical to
-the corresponding material point in the paired deforming episode, while every
-other node co-moves rigidly instead of deforming.
+shape-frozen cable. The tracked-node reference matches the recorded material
+point; actual force-driven tracking has finite error and must be measured.
+Every other node co-moves rigidly instead of deforming. The versioned v2
+controller evaluates a continuous reference with acceleration feedforward;
+historical v1 configurations retain their sampled PD controller.
 """
 
 from __future__ import annotations
@@ -31,6 +32,61 @@ class ReplayTrajectory:
     velocity: np.ndarray        # (T, 2) finite-difference node velocity
     delta_yaw: np.ndarray       # (T,) whole-cable rigid yaw minus t=0 yaw
     yaw_rate: np.ndarray        # (T,)
+
+
+@dataclass(frozen=True)
+class ReplaySample:
+    position: np.ndarray
+    velocity: np.ndarray
+    acceleration: np.ndarray
+    yaw: float
+    yaw_rate: float
+    yaw_acceleration: float
+
+
+class ContinuousReplayReference:
+    """C2 reference through recorded poses, with consistent time derivatives.
+
+    Only the valid bank interval is interpolated. The last valid pose is held
+    with zero derivatives afterwards; padding never changes the valid curve.
+    No smoothing, resampling, time warping, or bank rewriting is performed.
+    """
+
+    def __init__(self, trajectory: ReplayTrajectory, dt: float, valid_steps: int):
+        from scipy.interpolate import CubicSpline
+
+        count = min(int(valid_steps), len(trajectory.delta_position))
+        if count < 1 or not math.isfinite(dt) or dt <= 0:
+            raise ValueError("continuous replay requires valid samples and positive dt")
+        self.duration = (count - 1) * dt
+        self.values = np.column_stack((
+            trajectory.delta_position[:count], trajectory.delta_yaw[:count],
+        ))
+        self.spline = None
+        if count > 1:
+            start_rate = np.gradient(
+                self.values, dt, axis=0, edge_order=2 if count > 2 else 1,
+            )[0]
+            self.spline = CubicSpline(
+                np.arange(count) * dt, self.values,
+                bc_type=((1, start_rate), (1, np.zeros(3))),
+            )
+
+    def sample(self, elapsed: float) -> ReplaySample:
+        if not math.isfinite(elapsed):
+            raise ValueError("replay elapsed time must be finite")
+        if self.spline is None or elapsed >= self.duration:
+            value, rate, acceleration = self.values[-1], np.zeros(3), np.zeros(3)
+        elif elapsed < 0:
+            value, rate, acceleration = self.values[0], np.zeros(3), np.zeros(3)
+        else:
+            value = self.spline(elapsed)
+            rate = self.spline(elapsed, 1)
+            acceleration = self.spline(elapsed, 2)
+        return ReplaySample(
+            value[:2], rate[:2], acceleration[:2],
+            float(value[2]), float(rate[2]), float(acceleration[2]),
+        )
 
 
 class ReplayBank:
