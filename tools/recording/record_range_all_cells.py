@@ -5,6 +5,7 @@ SOURCE=Path('/root/rivermind-data/ppo_cpu_project/range-ppo-20261012')
 RUN=Path('/root/rivermind-data/runs/ppo_range_session_height_scratch_20m_20261012')
 OUT=Path(os.environ.get('RANGE_VIDEO_OUT',str(RUN/'all_cells_video400_20261012')))
 COMMIT='44af6e30f9ae95de99924776d0c3814174f8bdfa'
+WORKERS=int(os.environ.get('RANGE_VIDEO_WORKERS','8'))
 os.environ['PATH']=str(RUN/'video_bin')+os.pathsep+os.environ.get('PATH','')
 os.environ.update(PYTHONPATH=str(SOURCE/'src'),OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',MKL_NUM_THREADS='1',LP_NUM_THREADS='1',MUJOCO_GL='osmesa',PYOPENGL_PLATFORM='osmesa',PYTHONPYCACHEPREFIX=str(OUT/'pycache'))
 sys.path.insert(0,str(SOURCE/'src'))
@@ -43,8 +44,8 @@ def worker(index,smoke=False):
  model=PPO.load(OUT/'checkpoint.zip',device='cpu',custom_objects={'learning_rate':0.0,'lr_schedule':lambda _:0.0})
  assert model.num_timesteps==manifest['checkpoint_steps'] and all(torch.isfinite(v).all() for v in model.policy.parameters())
  from panda_cable_grasp.rl.range_curriculum import cells
- jobs=manifest['jobs'][::20] if smoke else manifest['jobs']
- jobs=jobs[index::8]
+ jobs=manifest.get('smoke_jobs',manifest['jobs'][::20]) if smoke else manifest.get('pending_jobs',manifest['jobs'])
+ jobs=jobs[index::WORKERS]
  b=env.base_env;b.model.vis.global_.offwidth=max(1280,b.model.vis.global_.offwidth);b.model.vis.global_.offheight=max(960,b.model.vis.global_.offheight)
  renderer=mujoco.Renderer(b.model,height=960,width=1280)
  cams={'global':'dynamicvla_opst_camera','wrist':'dynamicvla_wrist_camera'}
@@ -131,7 +132,7 @@ def supervise(smoke=False,fault=False):
  summary.update(supervisor=identity(os.getpid()),status='preflight' if smoke else 'starting',source_updated_at=time.time(),last_progress_at=time.time(),progress_deadline_at=time.time()+1200)
  dump(OUT/'summary.json',summary)
  try:
-  for i in range(8):
+  for i in range(WORKERS):
    command=[sys.executable,'-c','import sys;sys.exit(7)'] if fault else [sys.executable,__file__,'worker',str(i)]+(['smoke'] if smoke else [])
    with (OUT/f'worker_{i}.log').open('w') as f:p=subprocess.Popen(command,stdout=f,stderr=subprocess.STDOUT,env=os.environ.copy(),cwd=SOURCE)
    jobs.append((i,p));summary.setdefault('worker_identities',[]).append(identity(p.pid))
@@ -143,13 +144,13 @@ def supervise(smoke=False,fault=False):
      if p.returncode:raise RuntimeError(f'worker {i} exit {p.returncode}: '+(OUT/f'worker_{i}.log').read_text()[-1800:])
      jobs.remove((i,p))
    progress=max([summary['last_progress_at']]+[p.stat().st_mtime for p in OUT.glob('worker_*_progress.json')]+[p.stat().st_mtime for p in OUT.glob('worker_*_ready.json')])
-   ready=all((OUT/f'worker_{i}_ready.json').exists() for i in range(8))
-   summary.update(status='preflight' if smoke else ('recording' if ready else 'starting'),source_updated_at=now,heartbeat_at=now,last_progress_at=progress,progress_deadline_at=progress+1200,completed_episodes=len(episodes),groups=aggregate(episodes),worker_ready=ready)
+   ready=all((OUT/f'worker_{i}_ready.json').exists() for i in range(WORKERS))
+   summary.update(status='preflight' if smoke else ('recording' if ready else 'starting'),source_updated_at=now,heartbeat_at=now,last_progress_at=progress,progress_deadline_at=progress+1200,completed_episodes=len(episodes),groups=aggregate(episodes),worker_ready=ready,workers=WORKERS)
    dump(OUT/'summary.json',summary)
    if not jobs:break
    if now>summary['progress_deadline_at']:raise RuntimeError('No recording progress for 1200 seconds')
    time.sleep(2 if fault else 10)
-  assert len(episodes)==(20 if smoke else 400)
+  assert len(episodes)==(len(load(OUT/'manifest.json').get('smoke_jobs',load(OUT/'manifest.json')['jobs'][::20])) if smoke else 400)
   assert all(e['render_max_state_difference']==0 for e in episodes)
   if not smoke:assert all(g['episodes']==20 for g in summary['groups'])
   dump(OUT/('smoke_results.json' if smoke else 'results.json'),dict(episodes=episodes,groups=summary['groups']))
@@ -181,8 +182,19 @@ def prepare():
  dump(OUT/'manifest.json',manifest);dump(OUT/'summary.json',dict(status='prepared',source_updated_at=time.time(),last_progress_at=time.time(),progress_deadline_at=time.time()+1200,completed_episodes=0,expected_episodes=400,checkpoint_steps=steps,checkpoint_sha256=manifest['checkpoint_sha256'],run=str(OUT),workers=8));print(json.dumps({k:manifest[k] for k in ('checkpoint_steps','checkpoint_sha256','expected_episodes')}))
 def launch():
  assert load(OUT/'summary.json')['status']=='preflight_complete';assert not (OUT/'launch_receipt.json').exists()
+ manifest=load(OUT/'manifest.json')
  smoke=load(OUT/'smoke_results.json')['episodes'];assert len(smoke)==20 and all(e['steps']==3 and e['render_max_state_difference']==0 for e in smoke)
- summary=load(OUT/'summary.json');summary.update(status='starting',worker_identities=[],worker_ready=False,completed_episodes=0,source_updated_at=time.time(),last_progress_at=time.time(),progress_deadline_at=time.time()+1200);dump(OUT/'summary.json',summary)
+ if 'pending_jobs' in manifest:
+  proof=load(OUT/'parallel_preflight'/'summary.json');assert proof['status']=='preflight_complete'
+  assert load(OUT/'parallel_preflight'/'fault_receipt.json')['passed']
+  assert manifest['parallel_script_sha256']==hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+  existing=[load(p) for p in (OUT/'episodes').glob('*/metadata.json')]
+  assert sorted(e['job_id'] for e in existing)==sorted(manifest['preserved_job_ids'])
+  assert {j['id'] for j in manifest['pending_jobs']}.isdisjoint(manifest['preserved_job_ids'])
+  assert len(existing)+len(manifest['pending_jobs'])==400
+ summary=load(OUT/'summary.json');summary.update(status='starting',worker_identities=[],worker_ready=False,completed_episodes=len(manifest.get('preserved_job_ids',[])),source_updated_at=time.time(),last_progress_at=time.time(),progress_deadline_at=time.time()+1200,workers=WORKERS);summary.pop('error',None);dump(OUT/'summary.json',summary)
+ for key in ('children_exited','completed_at','result_path'):summary.pop(key,None)
+ dump(OUT/'summary.json',summary)
  for p in OUT.glob('worker_*_ready.json'):p.rename(p.with_suffix('.smoke.json'))
  for p in OUT.glob('worker_*_progress.json'):p.rename(p.with_suffix('.smoke.json'))
  with (OUT/'supervisor.log').open('w') as f:p=subprocess.Popen([sys.executable,__file__,'supervise'],stdout=f,stderr=subprocess.STDOUT,start_new_session=True,stdin=subprocess.DEVNULL,cwd=SOURCE,env=os.environ.copy())

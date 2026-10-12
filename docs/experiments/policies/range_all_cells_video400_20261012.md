@@ -8,7 +8,7 @@ Training source remains the frozen server snapshot of 44af6e30f9ae95de99924776d0
 - Test output: the run's `all_cells_video400_20261012` directory.
 - In-memory pause: 5,898,240 samples; 43 verified processes paused.
 - Frozen disk checkpoint: 5,800,000 samples, SHA256 `17d5078b136c3fcbb754c6c9ddffe9f2bb5fff349a119e3ea88b891db43d0ebd`.
-- Eight single-threaded simulation/recording workers. Each encoder and OSMesa renderer has a bounded thread count.
+- Initially eight single-threaded simulation/recording workers. Following the user's request to maximize throughput, recording expanded to 32 workers. The 8-worker run used 9.51 CPU cores out of a 40-core quota, with no CPU throttling. Each encoder and OSMesa renderer has a bounded thread count; 32 workers leave room within that quota for encoding.
 - Deterministic PPO actions. Every cell uses the corresponding seeds 20260804 through 20260823.
 - The initial-state/replay bank is the training bank, not a newly generated holdout bank. Reset seeds absent from the bank follow the original resampling fallback; actual bank source seeds are retained in each episode's `initial_info`. Repeated reset seeds across cells are corresponding executions, not new unique initial states. These results diagnose behavior and parameter sensitivity, not unseen-state generalization.
 - Parameters are sampled continuously and uniformly within the selected cell at reset, then held fixed throughout the episode. Adaptive cell selection is disabled.
@@ -24,3 +24,9 @@ Training source remains the frozen server snapshot of 44af6e30f9ae95de99924776d0
 Preflight executes three real policy steps in each of all 20 cells through the same worker path. It verifies finite observations/actions, valid MP4 encoding, bitwise identical observations, rewards, qpos and qvel against a non-camera environment, and zero render-induced physical state changes. An independent intentional exit-7 test verifies that the supervisor reports failure. Smoke executions are separate from the formal 400 results.
 
 Supervisor atomically records identity, worker-ready receipts, source heartbeat, real progress and failures. After launch, confirm survival after launcher exit and fresh worker-ready evidence. A separate collector reads existing results and downloads every episode; it never performs simulation. Present per-cell denominators, every episode's video and CSV/JSON exports. Twenty episodes per cell have substantial sampling uncertainty.
+
+## Expansion handoff
+
+The original 8-worker recorder generation is stopped by verified supervisor PID/birth/command and descendant identities. Seventeen complete episodes are validated and retained unchanged; 383 pending jobs are assigned disjointly to 32 workers. Incomplete recordings are archived separately and restarted, never included in results. Pending/completed IDs form exactly the original 400-job set. The checkpoint, reset seeds, parameter ranges, deterministic actions, video resolution/frame rate and training source stay fixed. A two-worker, six-real-step preflight and an intentional exit-7 supervisor test verify the revised dispatcher before cutover. The original all-20-cell preflight is retained.
+
+The expansion receipt, previous generation, preserved IDs and parallel recorder SHA256 are stored with the test. New supervisor PID 52965 / birth 112797145; boot ID remains 9ce8123f-b48a-44d1-ad8d-60e76819fd5c. Training remains paused; no training process is included in the recorder tree cutover.
