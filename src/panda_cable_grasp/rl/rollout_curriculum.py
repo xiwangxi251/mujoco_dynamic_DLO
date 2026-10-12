@@ -16,10 +16,31 @@ PROTOCOL=dict(version=VERSION,target_episodes=100,replay_episodes=50,consecutive
 FAST_PROTOCOL = dict(PROTOCOL, version='ordered_rollout_gate_fast_v2', replay_episodes=20,
     consecutive_windows=1, success=.4, loaded=.5, secured=.4, replay_success=.3)
 PROFILES = {'strict': PROTOCOL, 'fast': FAST_PROTOCOL}
+ALL_SCENES = tuple(n for group in GROUPS for n in group)
+CONSOLIDATION_MIX = tuple((n, .3 if n in (GROUPS[1][0], GROUPS[3][0]) else .08)
+                          for n in ALL_SCENES)
+CONSOLIDATION_PROTOCOL = dict(FAST_PROTOCOL, version='ordered_rollout_consolidation_v3',
+    terminal_stage='all scenes at nominal difficulty; optimize to original budget',
+    terminal_training_mix=CONSOLIDATION_MIX, terminal_episodes_per_scene=100)
+PROFILES['consolidate'] = CONSOLIDATION_PROTOCOL
 
 
 def protocol_for(profile):
     return dict(PROFILES[profile])
+
+
+def structure_for(profile):
+    if profile == 'consolidate':
+        return GROUPS + (ALL_SCENES,), PHASES + ((6, 1.),), MIXES + (CONSOLIDATION_MIX,)
+    return GROUPS, PHASES, MIXES
+
+
+def restored_phase(state, default, profile):
+    phase = int(state.get('phase', default))
+    if profile == 'consolidate' and phase == 13 and state.get('windows', {}).get('consecutive', 0) >= 1:
+        # The existing checkpoint already contains a completed passing final-stage window.
+        phase = 14
+    return phase
 
 class Windows:
     def __init__(self, targets, replay, state=None, protocol=None):
@@ -58,15 +79,17 @@ class Windows:
                     promote=self.consecutive>=self.protocol['consecutive_windows'])
 
 def difficulties(phase):
+    if phase == 14:
+        return {n:float(0. if g < 2 else 1.) for g,names in enumerate(GROUPS) for n in names}
     group,difficulty=PHASES[phase]
     return {n:float(difficulty if g==group else 0. if g<2 else 1.)
             for g,names in enumerate(GROUPS[:group+1]) for n in names}
 
 def configure_env(env,phase):
-    mix=MIXES[PHASES[phase][0]]
+    mix=CONSOLIDATION_MIX if phase == 14 else MIXES[PHASES[phase][0]]
     env.set_rollout_curriculum(phase,tuple(n for n,p in mix),tuple(p for n,p in mix),difficulties(phase))
 
-def checkpoint_phase(path):
+def checkpoint_phase(path, gate_profile='strict'):
     """Read JSON curriculum identity before spawned workers perform their first reset."""
     if path is None:return 0
     path=Path(path)
@@ -75,13 +98,20 @@ def checkpoint_phase(path):
     state=data.get('rollout_gate_state',{})
     if state and state.get('version') not in {p['version'] for p in PROFILES.values()}:
         raise ValueError('Incompatible rollout curriculum checkpoint version')
-    phase=int(state.get('phase',data.get('ordinary_evaluation_phase',0)))
-    if not 0<=phase<len(PHASES):raise ValueError('Invalid checkpoint curriculum phase')
+    if state.get('version') == CONSOLIDATION_PROTOCOL['version'] and gate_profile != 'consolidate':
+        raise ValueError('Consolidation checkpoint requires consolidate gate profile')
+    phase=restored_phase(state,data.get('ordinary_evaluation_phase',0),gate_profile)
+    if not 0<=phase<len(structure_for(gate_profile)[1]):raise ValueError('Invalid checkpoint curriculum phase')
     return phase
 
 class RolloutMotionCurriculum(OrderedMotionCurriculum):
     def __init__(self, output_dir, initial_phase=0, gate_profile='strict', **kwargs):
+        self.gate_profile = gate_profile
+        groups, phases, mixes = structure_for(gate_profile)
+        if gate_profile == 'consolidate':
+            kwargs.update(stages=groups, training_mixes=mixes)
         super().__init__(**kwargs)
+        self.phases = phases
         self.protocol = protocol_for(gate_profile)
         self.output=Path(output_dir)
         self.initial_phase=int(initial_phase)
@@ -99,15 +129,16 @@ class RolloutMotionCurriculum(OrderedMotionCurriculum):
             qualifying_evaluations=self.windows.consecutive).items(): self.logger.record('curriculum/'+k,v)
 
     def _new_windows(self,state=None):
-        replay=tuple(n for names in GROUPS[:self.stage_index] for n in names)
+        replay=() if self.phase_index == 14 else tuple(n for names in GROUPS[:self.stage_index] for n in names)
         self.windows=Windows(self.current_scenarios,replay,state,self.protocol)
 
     def _on_training_start(self):
         saved=getattr(self.model,'rollout_gate_state',{})
         if saved and saved.get('version') not in {p['version'] for p in PROFILES.values()}:
             raise ValueError('Incompatible rollout curriculum state')
-        self.phase_index=int(saved.get('phase',self.initial_phase))
-        changed = bool(saved and saved.get('version') != self.protocol['version'])
+        self.phase_index=restored_phase(saved,self.initial_phase,self.gate_profile)
+        changed = bool(saved and (saved.get('version') != self.protocol['version']
+                                  or saved.get('phase') != self.phase_index))
         self._new_windows(None if changed else saved.get('windows'))
         if changed:
             self.model.rollout_gate_migration = dict(from_version=saved['version'],
@@ -163,6 +194,8 @@ class RolloutMotionCurriculum(OrderedMotionCurriculum):
     def _on_rollout_end(self):
         decision=self.windows.decide()
         if decision:
+            if self.phase_index == 14:
+                decision['promote'] = False
             record=dict(timesteps=self.num_timesteps,phase=self.phase_index,difficulty=self.difficulty,**decision)
             if decision['promote'] and self.phase_index<len(self.phases)-1:
                 self.phase_index+=1;self._new_windows();self._apply()

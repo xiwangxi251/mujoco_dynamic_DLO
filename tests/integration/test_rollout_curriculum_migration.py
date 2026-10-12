@@ -8,7 +8,7 @@ import pytest
 from stable_baselines3 import PPO
 
 from panda_cable_grasp.rl import train
-from panda_cable_grasp.rl.rollout_curriculum import GROUPS, VERSION, FAST_PROTOCOL, difficulties, Windows
+from panda_cable_grasp.rl.rollout_curriculum import GROUPS, VERSION, FAST_PROTOCOL, difficulties, Windows, CONSOLIDATION_PROTOCOL
 
 
 def cli(output, extra=()):
@@ -95,6 +95,22 @@ def test_native_spawned_train_and_resume_without_eval(tmp_path, monkeypatch):
     assert len(fast.rollout_gate_state['windows']['queues'][GROUPS[1][0]]) == 0
     cfg = json.loads((third / 'training_config.json').read_text())
     assert cfg['rollout_gate_profile'] == 'fast' and cfg['actual_eval_workers'] == 0
+
+    fast.rollout_gate_state=dict(version=FAST_PROTOCOL['version'],phase=13,
+        windows=dict(consecutive=18),episode_counter=2000)
+    qualified=third/'qualified.zip';fast.save(qualified)
+    fourth=tmp_path/'consolidate'
+    monkeypatch.setattr(sys,'argv',cli(fourth,['--resume',str(qualified),'--timesteps','6',
+        '--schedule-total-timesteps','0','--rollout-gate-profile','consolidate']))
+    train.main()
+    consolidated=PPO.load(fourth/'final_model.zip',device='cpu')
+    assert consolidated.num_timesteps==38
+    assert consolidated.rollout_gate_state['phase']==14
+    assert consolidated.rollout_gate_state['version']==CONSOLIDATION_PROTOCOL['version']
+    cfg=json.loads((fourth/'training_config.json').read_text())
+    assert cfg['rollout_initial_phase']==14 and len(cfg['ordered_curriculum']['phases'])==15
+    assert cfg['actual_eval_workers']==0
+    assert len(consolidated.rollout_gate_state['windows']['queues'])==7
 
 
 def test_rollout_cli_rejects_independent_eval(tmp_path, monkeypatch):

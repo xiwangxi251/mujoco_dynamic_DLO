@@ -1150,7 +1150,7 @@ def parse_args() -> argparse.Namespace:
         help='Continuous independent motion parameters with per-cell training episode gates')
     parser.add_argument('--rollout-ability-curriculum', action='store_true',
                         help='Use independent training-episode windows for ordered scene promotion; no eval environments')
-    parser.add_argument('--rollout-gate-profile', choices=('strict', 'fast'), default='strict',
+    parser.add_argument('--rollout-gate-profile', choices=('strict', 'fast', 'consolidate'), default='strict',
                         help='Per-scene promotion thresholds; fast uses 40/50/40%% and one complete window')
     parser.add_argument('--schedule-total-timesteps', type=int, default=0,
                         help='Global schedule horizon; preserved in checkpoint across continuations')
@@ -1411,6 +1411,9 @@ def parse_args() -> argparse.Namespace:
             parser.error('Ordered curriculum requires ordinary family curriculum, enabled stages, 20 episodes per target and 50 seed pool')
         from .ordered_curriculum import GROUPS, MIXES
         args.curriculum_stages, args.curriculum_training_mixes = GROUPS, MIXES
+        if args.rollout_ability_curriculum:
+            from .rollout_curriculum import structure_for
+            args.curriculum_stages, _, args.curriculum_training_mixes = structure_for(args.rollout_gate_profile)
     if (
         args.training_distribution != "l1"
         and args.curriculum_stage_steps > 0
@@ -1461,7 +1464,7 @@ def parse_args() -> argparse.Namespace:
             args.rollout_initial_phase=args.range_initial_state.get('phase',0)
         else:
             from .rollout_curriculum import checkpoint_phase
-            args.rollout_initial_phase = checkpoint_phase(args.resume)
+            args.rollout_initial_phase = checkpoint_phase(args.resume, args.rollout_gate_profile)
     if not rl_config_from_args(args).arm_velocity_limits_enabled:
         if (args.robot, args.controller_profile, args.action_mode) != (
                 'nero', 'enhanced6_bounded_dls_v1', 'task_space_vertical_down'):
@@ -1987,8 +1990,9 @@ def main() -> None:
         configuration['learning_rate_schedule'] = 'linear over cumulative global samples'
         configuration['entropy_coef_schedule'] = 'linear over cumulative global samples; updated per rollout'
     if args.rollout_ability_curriculum:
-        from .rollout_curriculum import protocol_for, PHASES, GROUPS, MIXES
-        configuration['ordered_curriculum'] = dict(protocol_for(args.rollout_gate_profile), phases=PHASES, groups=GROUPS, training_mixes=MIXES)
+        from .rollout_curriculum import protocol_for, structure_for
+        groups, phases, mixes = structure_for(args.rollout_gate_profile)
+        configuration['ordered_curriculum'] = dict(protocol_for(args.rollout_gate_profile), phases=phases, groups=groups, training_mixes=mixes)
         configuration['rollout_gate_profile'] = args.rollout_gate_profile
         configuration['statistics_source'] = 'stochastic training episodes'
         configuration['rollout_initial_phase'] = args.rollout_initial_phase
