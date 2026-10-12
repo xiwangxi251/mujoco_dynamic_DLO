@@ -1,4 +1,4 @@
-"""Frozen seven-scene evaluation of the material-preserving geometry rule."""
+"""Frozen geometry-rule evaluation with a paired material/nearest lock ablation."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import csv
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -25,10 +26,16 @@ from shape_selection_pilot import GeometrySelector
 from run_node_feedback_family import NodeOnlyEnv
 from panda_cable_grasp.env.environment import CableGraspEnv, EnvConfig
 from panda_cable_grasp.env.control import configure_profile
-from panda_cable_grasp.policies.scripted import PolicyConfig
+from panda_cable_grasp.policies.scripted import DynamicCableGraspPolicy, PolicyConfig
 from panda_cable_grasp.scenarios.registry import SCENARIO_FAMILIES, get_scenario
 from record_scripted_scene_family import project_camera_manifest
 from build_scripted_family_gallery import SCENE_LABELS
+
+
+class ConfigurableGeometrySelector(GeometrySelector):
+    """Reuse geometric scoring while respecting the explicit lock treatment."""
+    def __init__(self, env, config):
+        DynamicCableGraspPolicy.__init__(self, env, config)
 
 
 def now():
@@ -82,14 +89,18 @@ def prepare(args):
         assert manifest['utility_sha256'] == sha(__file__), 'Runner changed after freeze'
         assert manifest['bank'] == str(args.bank), 'Bank changed'
         assert manifest['smoke'] == args.smoke
+        assert manifest['target_lock_mode'] == args.target_lock_mode
+        assert manifest['scenes'] == (args.scenes or list(SCENARIO_FAMILIES['cable_x075_v1']))
+        assert manifest.get('baseline_run') == (str(args.baseline) if args.baseline else None)
         return manifest
     with np.load(args.bank/'replay_src_shape_nominal_v1.npz') as data:
         seeds = [int(x) for x in data['seeds']]
     assert seeds == list(range(20260804, 20260854)), seeds
     if args.smoke:
         seeds = seeds[:1]
-    scenes = list(SCENARIO_FAMILIES['cable_x075_v1'])
-    assert len(scenes) == 7
+    scenes = args.scenes or list(SCENARIO_FAMILIES['cable_x075_v1'])
+    assert scenes and len(set(scenes)) == len(scenes)
+    assert set(scenes) <= set(SCENARIO_FAMILIES['cable_x075_v1'])
     # Interleave scenes so all seven receive startup coverage.
     jobs = [dict(scene=scene, seed=seed) for seed in seeds for scene in scenes]
     sources = list((ROOT/'src').rglob('*.py')) + [Path(__file__),
@@ -100,7 +111,7 @@ def prepare(args):
         target = out/'source'/source.relative_to(ROOT)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source.read_bytes())
-    policy = asdict(PolicyConfig(preserve_selected_material_target=True,
+    policy = asdict(PolicyConfig(preserve_selected_material_target=args.target_lock_mode == 'material',
         follow_target_tangent=True, use_contact_feedback=False))
     manifest = dict(run_id=out.name, created_at=now().isoformat(), source_directory=str(ROOT),
         commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
@@ -112,7 +123,8 @@ def prepare(args):
         jobs=jobs, scenes=scenes, seeds=seeds, planned_episodes=len(jobs), smoke=args.smoke,
         policy_config=policy, controller='enhanced6_bounded_dls_v1', table_guard=True,
         arm_wait_s=.82, episode_seconds=15, arm_velocity_limits_enabled=True, arm_velocity_limit_scale=1.,
-        selection='GeometrySelector with preserve_selected_material_target=True; tangent following and node-height feedback',
+        target_lock_mode=args.target_lock_mode, baseline_run=str(args.baseline) if args.baseline else None,
+        selection=f'GeometrySelector with preserve_selected_material_target={policy["preserve_selected_material_target"]}; tangent following and node-height feedback',
         sampling='All 50 paired bank seeds; canonical scenario 30-70% snapshot sampling; no screening or outcome selection',
         limitations=['Development-scene results, not held-out generalization.',
             'Complex snapshots are unfiltered; distribution differs from the earlier selected ten-snapshot pilot.',
@@ -121,8 +133,22 @@ def prepare(args):
         success_definition='Unmodified low-level environment ever_success; policy truth reads blocked',
         scene_definitions={name: dict(scenario_id=get_scenario(name).scenario_id,
             overrides=get_scenario(name).to_env_overrides()) for name in scenes})
+    if args.baseline:
+        baseline = load(args.baseline/'manifest.json')
+        assert baseline['bank_sha256'] == manifest['bank_sha256']
+        assert set(seeds) <= set(baseline['seeds'])
+        baseline_hashes = {p.replace('\\', '/'): h for p, h in baseline['source_sha256'].items()}
+        control_sources = {p: h for p, h in hashes.items()
+            if p != Path(__file__).relative_to(ROOT).as_posix()}
+        assert all(baseline_hashes.get(p) == h for p, h in control_sources.items()), 'Baseline control source differs'
+        expected_policy = dict(baseline['policy_config'])
+        expected_policy['preserve_selected_material_target'] = policy['preserve_selected_material_target']
+        assert digest(policy) == digest(expected_policy), 'More than target lock changed'
+        assert all(digest(manifest['scene_definitions'][s]) == digest(baseline['scene_definitions'][s]) for s in scenes)
+        manifest['baseline_configuration_hash'] = baseline['configuration_hash']
+        manifest['control_sources_identical'] = True
     manifest['configuration_hash'] = digest({k: manifest[k] for k in
-        ('source_sha256', 'bank_sha256', 'jobs', 'policy_config', 'scene_definitions', 'sampling')})
+        ('source_sha256', 'bank_sha256', 'jobs', 'policy_config', 'scene_definitions', 'sampling', 'target_lock_mode', 'baseline_run')})
     save(out/'manifest.json', manifest)
     return manifest
 
@@ -139,8 +165,8 @@ def worker(args):
     started = time.monotonic()
     try:
         env.reset(seed=job['seed'])
-        policy = GeometrySelector(NodeOnlyEnv(env), PolicyConfig(**manifest['policy_config']))
-        assert policy.config.preserve_selected_material_target
+        policy = ConfigurableGeometrySelector(NodeOnlyEnv(env), PolicyConfig(**manifest['policy_config']))
+        assert digest(asdict(policy.config)) == digest(manifest['policy_config'])
         state_kind = mujoco.mjtState.mjSTATE_INTEGRATION
         states, times, actions, phases, targets, quaternions, cables = [], [], [], [], [], [], []
         phase_changes = []
@@ -160,9 +186,21 @@ def worker(args):
             quaternions.append(policy.desired_quat.copy())
             cables.append(env.data.xpos[env.cable_ids].copy())
         initial_info = env.info()
+        initial_state = np.empty(mujoco.mj_stateSize(env.model, state_kind))
+        mujoco.mj_getState(env.model, env.data, initial_state, state_kind)
+        initial_pair_verified = None
+        if manifest.get('baseline_run'):
+            baseline_dir = Path(manifest['baseline_run'])/'episodes'/job['scene']/f"seed_{job['seed']}"
+            baseline_ready = load(baseline_dir/'ready.json')
+            assert digest(baseline_ready['env_config']) == digest(asdict(cfg)), 'Paired environment config differs'
+            with np.load(baseline_dir/'trajectory.npz', allow_pickle=False) as baseline_data:
+                assert np.array_equal(initial_state, baseline_data['states'][0]), 'Paired initial physics differs'
+            initial_pair_verified = True
         save(dest/'ready.json', dict(**job, pid=os.getpid(), ready_at=now().isoformat(),
             run_id=manifest['run_id'], configuration_hash=manifest['configuration_hash'],
             env_config=asdict(cfg), effective_policy_config=asdict(policy.config),
+            initial_state_sha256=hashlib.sha256(initial_state.tobytes()).hexdigest(),
+            initial_pair_verified=initial_pair_verified,
             initial_shape_step=initial_info.get('initial_shape_step'),
             initial_shape_source_seed=initial_info.get('initial_shape_source_seed')))
         capture()
@@ -193,6 +231,7 @@ def worker(args):
         final_info = env.info()
         save(dest/'result.json', dict(**job, run_id=manifest['run_id'],
             configuration_hash=manifest['configuration_hash'], task_success=bool(env.ever_success),
+            initial_pair_verified=initial_pair_verified,
             duration_s=float(env.data.time), steps=steps, frames=len(states),
             retries=policy.retry_count, policy_result=policy.result,
             last_attempt_failure=policy.last_attempt_failure,
@@ -240,6 +279,31 @@ def finalize(args, manifest, rows):
     summary = dict(run_id=manifest['run_id'], configuration_hash=manifest['configuration_hash'],
         completed=len(rows), planned=len(manifest['jobs']), successes=sum(r['task_success'] for r in rows),
         by_scene=by_scene, states_verified=True, state_files=len(rows), smoke=manifest['smoke'])
+    if manifest.get('baseline_run'):
+        assert all(r['initial_pair_verified'] for r in rows)
+        comparisons = {}
+        for scene in manifest['scenes']:
+            pairs = []
+            for row in (r for r in rows if r['scene'] == scene):
+                baseline_path = Path(manifest['baseline_run'])/'episodes'/scene/f"seed_{row['seed']}"/'result.json'
+                baseline = load(baseline_path)
+                assert baseline['scene'] == scene and baseline['seed'] == row['seed']
+                assert baseline['configuration_hash'] == manifest['baseline_configuration_hash']
+                pairs.append(dict(seed=row['seed'], material_success=baseline['task_success'],
+                    nearest_success=row['task_success'], initial_pair_verified=True))
+            gained = sum(not p['material_success'] and p['nearest_success'] for p in pairs)
+            lost = sum(p['material_success'] and not p['nearest_success'] for p in pairs)
+            discordant = gained+lost
+            probability = min(1., 2*sum(math.comb(discordant, i) for i in range(min(gained, lost)+1))/2**discordant) if discordant else 1.
+            comparisons[scene] = dict(paired_episodes=len(pairs),
+                material_successes=sum(p['material_success'] for p in pairs),
+                nearest_successes=sum(p['nearest_success'] for p in pairs),
+                gained=gained, lost=lost, net=gained-lost, delta_percentage_points=100*(gained-lost)/len(pairs),
+                mcnemar_exact_two_sided_p=probability, all_initial_states_identical=True, pairs=pairs)
+        summary.update(paired_comparison=comparisons, initial_pair_verified_count=len(rows),
+            control_sources_identical=manifest['control_sources_identical'],
+            baseline_run=manifest['baseline_run'])
+        save(args.output/'comparison.json', comparisons)
     save(args.output/'summary.json', summary)
     columns = ['scene', 'seed', 'task_success', 'duration_s', 'steps', 'retries',
         'task_failure_type', 'termination_reason', 'initial_shape_step', 'initial_shape_source_seed', 'wall_seconds']
@@ -247,8 +311,9 @@ def finalize(args, manifest, rows):
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(sorted(rows, key=lambda r:(r['scene'], r['seed'])))
-    lines = ['# 材料点保持规则：七场景评测', '',
-        '几何选点、保持所选材料点、切线跟随、节点高度反馈；NERO、增强6有界DLS、碰桌保护、0.82秒等待、15秒上限。',
+    lock_label = '保持所选材料点' if manifest['target_lock_mode'] == 'material' else '恢复夹爪最近线段锁定'
+    lines = [f'# 规则评测：{lock_label}', '',
+        f'几何选点、{lock_label}、切线跟随、节点高度反馈；NERO、增强6有界DLS、碰桌保护、0.82秒等待、15秒上限。',
         '完整种子集按原场景取快照，无筛选；不能与此前筛选后的十样本直接作为同分布配对比较。',
         '保存完整状态、动作、时间戳和项目相机配置，未渲染视频。', '',
         '| 初始形状＋整体运动＋形状变化 | 成功数 | 成功率 | Wilson 95% |', '|---|---:|---:|---:|']
@@ -258,6 +323,13 @@ def finalize(args, manifest, rows):
     lines += ['', f"合计：{summary['successes']}/{len(rows)}（{summary['successes']/len(rows):.1%}）。",
         '', f"源码提交：`{manifest['commit']}`；分支：`{manifest['branch']}`。",
         f"配置身份：`{manifest['configuration_hash']}`。", 'Smoke 与正式结果分目录，不能合并样本。']
+    if 'paired_comparison' in summary:
+        lines += ['', '逐回合初始物理状态完全相同；控制源码、环境配置和种子匹配，仅材料点保持开关不同。', '',
+            '| 场景 | 固定材料点 | 最近线段 | 差值 | 新增成功 | 丢失成功 | McNemar双侧精确p |',
+            '|---|---:|---:|---:|---:|---:|---:|']
+        for scene, item in summary['paired_comparison'].items():
+            label = '形变' if 'shape_nominal_current' in scene else '组合运动'
+            lines.append(f"| {label} | {item['material_successes']}/{item['paired_episodes']} | {item['nearest_successes']}/{item['paired_episodes']} | {item['delta_percentage_points']:+.1f} pp | {item['gained']} | {item['lost']} | {item['mcnemar_exact_two_sided_p']:.4g} |")
     (args.output/'report.md').write_text('\n'.join(lines)+'\n', encoding='utf-8')
     return summary
 
@@ -349,14 +421,26 @@ def main():
     parser.add_argument('--prepare', action='store_true')
     parser.add_argument('--smoke', action='store_true')
     parser.add_argument('--fail-probe', action='store_true')
+    parser.add_argument('--scenes', nargs='+')
+    parser.add_argument('--target-lock-mode', choices=('material', 'nearest'), default='material')
+    parser.add_argument('--baseline', type=Path)
     args = parser.parse_args()
     args.output, args.bank = args.output.resolve(), args.bank.resolve()
+    if args.baseline:
+        args.baseline = args.baseline.resolve()
     if args.worker is not None:
         worker(args)
     elif args.prepare:
         prepare(args)
     else:
-        supervise(args)
+        try:
+            supervise(args)
+        except BaseException:
+            if not (args.output/'status.json').exists():
+                save(args.output/'status.json', dict(run_id=args.output.name, status='failed',
+                    experiment_state='failed', stage='preparation', supervisor_pid=os.getpid(),
+                    heartbeat_at=now().isoformat(), exit_code=1, error=traceback.format_exc()))
+            raise
 
 
 if __name__ == '__main__':
