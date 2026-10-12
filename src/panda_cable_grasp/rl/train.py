@@ -871,6 +871,8 @@ class StrictSuccessEvalCallback(BaseCallback):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO for dynamic cable grasping")
+    parser.add_argument('--async-sampling', action='store_true',
+                        help='fixed-total-batch on-policy sampling from independently ready workers')
     from .workspace import add_workspace_arguments, WORKSPACE_SCENE_FAMILIES
     add_workspace_arguments(parser)
     parser.add_argument("--workspace-curriculum", action="store_true")
@@ -1451,18 +1453,28 @@ def main() -> None:
     check_candidate.close()
 
     factories = [make_worker(rank, args) for rank in range(args.workers)]
-    if args.workers == 1:
+    if args.async_sampling:
+        from .async_sampling import ReadyWorkerVecEnv, ReadyWorkerPPO
+        if args.eval_freq or args.observation_mode != 'state' or not args.rollout_ability_curriculum:
+            raise ValueError('Async sampling requires state observations, rollout curriculum and no independent evaluation')
+        model_class = ReadyWorkerPPO
+        vector_env = ReadyWorkerVecEnv(factories, filename=str(args.output/'monitor.csv'),
+            info_keywords=('success', 'strict_success', 'ever_pinched', 'ever_aligned_pinch',
+                           'lift_attempt', 'loaded_lift', 'ever_grasped', 'lifted_fraction'))
+    elif args.workers == 1:
         vector_env = DummyVecEnv(factories)
     else:
         vector_env = SubprocVecEnv(factories, start_method="spawn")
-    vector_env = VecMonitor(
-        vector_env,
-        filename=str(args.output / "monitor.csv"),
-        info_keywords=(
-            "success", "strict_success", "ever_pinched", "ever_aligned_pinch", "lift_attempt",
-            "loaded_lift", "ever_grasped", "lifted_fraction",
-        ),
-    )
+    if not args.async_sampling:
+        model_class = PPO
+        vector_env = VecMonitor(
+            vector_env,
+            filename=str(args.output / "monitor.csv"),
+            info_keywords=(
+                "success", "strict_success", "ever_pinched", "ever_aligned_pinch", "lift_attempt",
+                "loaded_lift", "ever_grasped", "lifted_fraction",
+            ),
+        )
 
     warm_start_record = None
     if args.resume is None:
@@ -1487,7 +1499,7 @@ def main() -> None:
         }
         if args.observation_mode == "pointcloud":
             policy_kwargs["features_extractor_class"] = PointNet2FeaturesExtractor
-        model = PPO(
+        model = model_class(
             policy_name,
             vector_env,
             learning_rate=learning_rate,
@@ -1510,7 +1522,7 @@ def main() -> None:
     else:
         # Explicit overrides make resumed training use this invocation's CLI
         # settings instead of silently inheriting unstable legacy defaults.
-        model = PPO.load(
+        model = model_class.load(
             args.resume,
             env=vector_env,
             device=args.device,
@@ -1577,6 +1589,10 @@ def main() -> None:
         save_path=str(args.output / "checkpoints"),
         name_prefix="ppo_cable",
     )
+    if args.async_sampling:
+        from .async_sampling import SampleCheckpointCallback
+        checkpoint_callback = SampleCheckpointCallback(args.checkpoint_steps,
+            args.output/'checkpoints', starting_timesteps)
     metrics_path = args.output / "training_metrics.csv"
     metrics_callback = TrainingMetricsCallback(metrics_path, window=100,
                                                goal_task=args.target_node_task)
@@ -1917,18 +1933,25 @@ def main() -> None:
             hold_reward_timer_version='strict_height_band_hold_v1',
             strict_hold_reward_version='strict_in_height_band_high_water_v1',
             session_lift_node_switch='refund old balance; new node uses its own previous-step height')
+    configuration['async_sampling'] = bool(args.async_sampling)
+    if args.async_sampling:
+        from .async_sampling import VERSION
+        configuration['sampling_protocol'] = dict(version=VERSION, batch_samples=args.workers*args.n_steps,
+            per_worker_steps_fixed=False, terminal_before_reset=True, policy_fixed_during_batch=True,
+            gae='independent worker chains; timeout terminal-value bootstrap',
+            scene_exposure='80/20 episode reset selection retained; actual transition exposure recorded')
     (args.output / "training_config.json").write_text(
         json.dumps(configuration, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     try:
-        if args.ordinary_reward_profile == 'session_height_v1' or args.rollout_ability_curriculum:
+        if not args.async_sampling and (args.ordinary_reward_profile == 'session_height_v1' or args.rollout_ability_curriculum):
             from .exact_budget import install_exact_budget
             install_exact_budget()
         model.learn(
             total_timesteps=args.timesteps,
             callback=callbacks,
-            progress_bar=True,
+            progress_bar=not args.async_sampling,
             reset_num_timesteps=args.resume is None,
         )
         model.save(args.output / "final_model")
