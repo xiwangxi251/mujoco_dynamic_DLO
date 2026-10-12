@@ -57,10 +57,11 @@ def prepare_force_replay(env):
     teacher.model = copy.copy(env.model)
     teacher.data = mujoco.MjData(teacher.model)
     mujoco.mj_copyData(teacher.data, teacher.model, env.data)
+    calibration = FORCE_COMPILER_PARAMETERS if env._uses_replay_motion else {}
     teacher.config = replace(
-        env.config, replay_controller_version="continuous_ff_v2",
-        rigid_motion_contact_only=False,
-        **FORCE_COMPILER_PARAMETERS,
+        env.config, rigid_drive_version="feedback_v1",
+        replay_controller_version="continuous_ff_v2" if env._uses_replay_motion else env.config.replay_controller_version,
+        rigid_motion_contact_only=False, **calibration,
     )
     robot_geoms = list(env.geometric_safety_geom_ids)
     teacher.model.geom_contype[robot_geoms] = 0
@@ -101,11 +102,13 @@ def compile_force_replay(teacher) -> ForceReplayTape:
         # calibration loses translation/rotation even without a robot.
         force = supported_force_distribution(
             teacher.data.xpos[teacher.cable_ids],
-            teacher._last_ungated_scene_force,
+            teacher._last_ungated_rigid_force,
             teacher._cable_table_contact_mask(),
         )
         forces[index] = force
-        teacher.data.xfrc_applied[teacher.cable_ids, :3] = force
+        teacher.data.xfrc_applied[teacher.cable_ids, :3] = (
+            force + teacher.cable_mass[:, None] * teacher._last_shape_acceleration
+        )
         teacher.data.ctrl[:] = teacher.ready_ctrl
         teacher._physics_step()
     if not np.isfinite(forces).all():

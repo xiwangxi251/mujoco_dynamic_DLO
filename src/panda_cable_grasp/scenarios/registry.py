@@ -148,6 +148,7 @@ class ScenarioConfig:
     # rigid_replay_v1 场景专用的轨迹库名；非回放场景必须为 None。
     replay_bank: str | None = None
     replay_controller_version: str = "legacy_pd_v1"
+    rigid_drive_version: str = "feedback_v1"
     # static / 简单整体运动 / 复杂整体回放的初始形状库名：reset 时按 seed
     # 取条目、在有效区间采一个中间帧构型作为初始线缆形状。
     initial_shape_bank: str | None = None
@@ -260,6 +261,12 @@ class ScenarioConfig:
                 "rigid and combined scenarios must explicitly select "
                 "Level-1/Level-2 or the replay profile"
             )
+        if self.rigid_drive_version not in {"feedback_v1", "force_tape_v1"}:
+            raise ValueError("unsupported rigid_drive_version")
+        if self.rigid_drive_version == "force_tape_v1" and self.motion_profile_version not in {
+            "rigid_level1_single_pass_v2", "rigid_level2_single_pass_v2",
+        }:
+            raise ValueError("rigid_drive_version requires L1/L2 motion")
         if self.replay_controller_version not in {"legacy_pd_v1", "continuous_ff_v2", "continuous_ff_v3", "continuous_ff_v4", "force_tape_v5"}:
             raise ValueError("unsupported replay_controller_version")
         if self.replay_controller_version != "legacy_pd_v1" and self.motion_profile_version != "rigid_replay_v1":
@@ -620,6 +627,7 @@ class ScenarioConfig:
             "gait_swim_speed": None,
             "replay_bank": None,
             "replay_controller_version": "legacy_pd_v1",
+            "rigid_drive_version": "feedback_v1",
             "initial_shape_bank": None,
             "replay_use_snapshot_position": False,
             "initial_cable_center_x": None,
@@ -670,6 +678,7 @@ class ScenarioConfig:
             "motion_profile_version": self.motion_profile_version,
             "replay_bank": self.replay_bank,
             "replay_controller_version": self.replay_controller_version,
+            "rigid_drive_version": self.rigid_drive_version,
             "initial_shape_bank": self.initial_shape_bank,
             "replay_use_snapshot_position": self.replay_use_snapshot_position,
             "initial_cable_center_x": self.initial_cable_center_x,
@@ -1330,6 +1339,12 @@ def _registered_scenarios() -> list[ScenarioConfig]:
                 0.82 if variant_name in CABLE_X075_SCENARIO_NAMES else source.arm_motion_start_delay
             ),
             replay_use_snapshot_position=source_name == "id_rigid_replay_midshape_v1",
+            rigid_drive_version=(
+                "force_tape_v1" if variant_name in {
+                    "dev_rigid_l1_nominal_x075_v1", "dev_rigid_l1_midshape_v1_x075_v1",
+                    "dev_combined_l1_nominal_x075_v1",
+                } else source.rigid_drive_version
+            ),
             replay_controller_version=(
                 "force_tape_v5" if variant_name == "dev_rigid_replay_shape_nominal_x075_v1"
                 else source.replay_controller_version

@@ -361,6 +361,7 @@ class EnvConfig:
     replay_seed_fallback: str = "resample"  # resample / error：seed 不在库中时的行为
     # Missing in historical configs: preserve the original controller exactly.
     replay_controller_version: str = "legacy_pd_v1"
+    rigid_drive_version: str = "feedback_v1"
     replay_position_gain: float = 800.0
     replay_velocity_gain: float = 56.0
     replay_yaw_position_gain: float = 160.0
@@ -551,6 +552,14 @@ class EnvConfig:
                 "Level-1/Level-2/replay profiles require rigid or combined motion"
             )
         uses_replay = self.motion_profile_version == REPLAY_MOTION_PROFILE
+        if self.rigid_drive_version not in {"feedback_v1", "force_tape_v1"}:
+            raise ValueError("unsupported rigid_drive_version")
+        if self.rigid_drive_version == "force_tape_v1" and (
+            self.motion_profile_version not in RIGID_MOTION_PROFILES
+            or self.motion_mode not in {"rigid", "combined"}
+            or self._uses_object_scene
+        ):
+            raise ValueError("rigid_drive_version requires canonical L1/L2 rigid or combined motion")
         if self.replay_controller_version not in {"legacy_pd_v1", FORCE_REPLAY_CONTROLLER, *CONTINUOUS_REPLAY_CONTROLLERS}:
             raise ValueError("unsupported replay_controller_version")
         if self.replay_controller_version != "legacy_pd_v1" and not uses_replay:
@@ -1636,6 +1645,7 @@ class CableGraspEnv:
         self._replay_force_tape = None
         self._replay_force_compiler = None
         self._last_ungated_scene_force = np.zeros((node_count, 3))
+        self._last_ungated_rigid_force = np.zeros((node_count, 3))
         self._last_replay_force_grounded = np.zeros(node_count, dtype=bool)
         self._replay_was_suspended = False
         self._replay_contact_blocked = False
@@ -2161,6 +2171,10 @@ class CableGraspEnv:
                 f"|{self.config.replay_yaw_velocity_gain:.17g}"
             ).encode("ascii")
         self.motion_profile_hash = hashlib.sha256(profile_bytes).hexdigest()
+        if self.config.rigid_drive_version != "feedback_v1":
+            self.motion_profile_hash = hashlib.sha256(
+                (self.motion_profile_hash + "|" + self.config.rigid_drive_version).encode("ascii")
+            ).hexdigest()
 
         self.grasp_state = None
         self.success_hold = 0.0
@@ -2229,6 +2243,7 @@ class CableGraspEnv:
         self._replay_force_tape = None
         self._replay_force_compiler = None
         self._last_ungated_scene_force[:] = 0.
+        self._last_ungated_rigid_force[:] = 0.
         self._last_replay_force_grounded[:] = False
         if self._uses_force_replay:
             from .force_replay import prepare_force_replay
@@ -2851,7 +2866,7 @@ class CableGraspEnv:
 
     def info(self) -> dict:
         force_compiler_parameters = None
-        if self._uses_force_replay:
+        if self._uses_force_replay and self._uses_replay_motion:
             from .force_replay import FORCE_COMPILER_PARAMETERS
             force_compiler_parameters = dict(FORCE_COMPILER_PARAMETERS)
         cable_positions = self.data.xpos[self.cable_ids]
@@ -3004,6 +3019,8 @@ class CableGraspEnv:
                 if self._replay_force_tape is not None else None
             ),
             "replay_force_compiler_parameters": force_compiler_parameters,
+            "rigid_drive_version": self.config.rigid_drive_version,
+            "rigid_force_elapsed": self._replay_elapsed if self._uses_force_replay else None,
             "replay_force_tape_step": (
                 self._replay_force_tape.index(self.data.time) if self._replay_force_tape is not None else None
             ),
@@ -3902,6 +3919,9 @@ class CableGraspEnv:
         self._last_ungated_scene_force[:] = self.cable_mass[:, None] * (
             shape + translation + rotation + shape_hold
         )
+        self._last_ungated_rigid_force[:] = self.cable_mass[:, None] * (
+            translation + rotation + shape_hold
+        )
         if (
             self.config.rigid_motion_contact_only
             and self.config.motion_mode in {"rigid", "combined"}
@@ -3925,7 +3945,9 @@ class CableGraspEnv:
 
     @property
     def _uses_force_replay(self) -> bool:
-        return self._uses_replay_motion and self.config.replay_controller_version == FORCE_REPLAY_CONTROLLER
+        return (
+            self._uses_replay_motion and self.config.replay_controller_version == FORCE_REPLAY_CONTROLLER
+        ) or getattr(self.config, "rigid_drive_version", "feedback_v1") == "force_tape_v1"
 
     def _apply_replay_force_tape(self) -> None:
         if self._replay_force_tape is None:
@@ -3939,11 +3961,17 @@ class CableGraspEnv:
         assert self._replay_force_tape is not None
         forces = self._replay_force_tape.sample(float(self.data.time))
         self._last_ungated_scene_force[:] = forces
+        self._last_ungated_rigid_force[:] = forces
         grounded = self._cable_table_contact_mask()
         self._last_replay_force_grounded[:] = grounded
         forces[~grounded] = 0.
         self.data.xfrc_applied[self.cable_ids, :3] += forces
-        self._last_shape_acceleration[:] = 0.
+        shape = np.zeros_like(forces)
+        if getattr(self.config, "motion_mode", "rigid") == "combined":
+            t = self.phase_offset + self.config.motion_frequency_scale * float(self.data.time)
+            shape = self._shape_acceleration(t, self.spatial_phase)
+            self.data.xfrc_applied[self.cable_ids, :3] += self.cable_mass[:, None] * shape
+        self._last_shape_acceleration[:] = shape
         self._last_rigid_translation_acceleration[:] = forces / self.cable_mass[:, None]
         self._last_rigid_rotation_acceleration[:] = 0.
         self._last_rigid_shape_hold_acceleration[:] = 0.

@@ -16,6 +16,7 @@ def fixture():
     forces.setflags(write=False)
     env._replay_force_tape=ForceReplayTape(forces,.002,0.,'test')
     env._last_ungated_scene_force=np.zeros((2,3))
+    env._last_ungated_rigid_force=np.zeros((2,3))
     env._last_replay_force_grounded=np.zeros(2,dtype=bool)
     for name in ('_last_shape_acceleration','_last_rigid_translation_acceleration','_last_rigid_rotation_acceleration','_last_rigid_shape_hold_acceleration'):
         setattr(env,name,np.zeros((2,3)))
