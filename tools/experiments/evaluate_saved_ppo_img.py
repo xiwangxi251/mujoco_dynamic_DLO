@@ -254,6 +254,62 @@ def worker(args):
         env.close()
 
 
+def prepare_remaining(args):
+    """Prepare disjoint remaining seeds without changing or launching the first run."""
+    out, previous = args.output, args.previous_run
+    assert not out.exists(), 'Refusing to overwrite an existing continuation'
+    old = read(previous / 'manifest.json')
+    assert read(previous / 'smoke_status.json')['status'] == 'smoke_complete'
+    assert read(previous / 'fault_status.json')['status'] == 'failed'
+    baseline_root = Path(old['baseline_root'])
+    baseline_manifest = read(baseline_root / 'manifest.json')
+    baseline_summary = read(baseline_root / 'summary.json')
+    assert baseline_summary['status'] == 'complete'
+    assert old['checkpoint_sha256'] == baseline_manifest['checkpoint_sha256']
+    assert old['source_commit'] == baseline_manifest['source_commit']
+    seeds = [s for s in baseline_manifest['seeds'] if s not in old['seeds']]
+    assert len(seeds) == args.episodes and not set(seeds).intersection(old['seeds'])
+    selected = [e for e in baseline_summary['episodes'] if e['seed'] in seeds]
+    for scene in old['scenarios']:
+        assert len([e for e in selected if e['scenario_name'] == scene]) == args.episodes
+    for name, expected in [('checkpoint.zip', old['checkpoint_sha256']),
+                           ('img_checkpoint.pt', old['img_checkpoint_sha256']),
+                           ('training_config.json', old['configuration_sha256'])]:
+        assert sha(previous / name) == expected
+    original_source = Path(old['frozen_source'])
+    for relative, expected in old['source_hashes'].items():
+        assert sha(original_source / relative) == expected
+    out.mkdir(parents=True)
+    for name in ['checkpoint.zip', 'img_checkpoint.pt', 'training_config.json',
+                 'fault_status.json', 'smoke_status.json']:
+        shutil.copy2(previous / name, out / name)
+    frozen = out / 'frozen_source'
+    shutil.copytree(original_source, frozen, ignore=shutil.ignore_patterns('__pycache__'))
+    shutil.copy2(__file__, out / 'runner.py')
+    write(out / 'baseline_episodes.json', selected)
+    manifest = dict(old)
+    manifest.update(run_id=out.name, frozen_source=str(frozen), seeds=seeds,
+                    episodes_per_scene=args.episodes, expected_episodes=len(selected),
+                    predecessor_root=str(previous), predecessor_expected_episodes=old['expected_episodes'],
+                    script_sha256=sha(out / 'runner.py'), development_commit=args.development_commit,
+                    baseline_episodes_sha256=sha(out / 'baseline_episodes.json'),
+                    preflight_inherited_from=str(previous),
+                    preflight_semantics='Identical frozen worker, model, config, banks and physics; prior seven-scene GT and perception checks reused',
+                    planned_wall_budget_seconds=5400)
+    write(out / 'manifest.json', manifest)
+    now = time.time()
+    write(out / 'status.json', dict(run_id=out.name, status='prepared_waiting_predecessor',
+          experiment_state='prepared_waiting_predecessor', sync_state='not_started',
+          source_updated_at=now, heartbeat_at=now, last_progress_at=now,
+          heartbeat_timeout_seconds=120, progress_deadline_at=None,
+          completed_episodes=0, planned_episodes=len(selected), recovery_attempts=0,
+          recovery_limit=2, last_recovery_action=None, last_recovery_at=None,
+          error=None, exit_code=None, result_path=str(out / 'comparison.json'),
+          manifest_path=str(out / 'manifest.json'), predecessor_root=str(previous)))
+    print(json.dumps(dict(run_id=out.name, status='prepared_waiting_predecessor',
+          episodes=len(selected), seeds=seeds, checkpoint_sha256=old['checkpoint_sha256'])), flush=True)
+
+
 def aggregate(out):
     manifest = read(out / 'manifest.json')
     episodes = [read(p) for p in sorted((out/'formal').glob('scene_*/seed_*.json'))]
@@ -341,6 +397,18 @@ def supervise(args):
 
 def launch(args):
     out = args.output
+    manifest = read(out / 'manifest.json')
+    if manifest.get('predecessor_root'):
+        previous = Path(manifest['predecessor_root'])
+        assert read(previous / 'status.json')['status'] == 'complete', 'Previous batch not complete'
+        result = read(previous / 'comparison.json')
+        assert result['status'] == 'complete'
+        assert result['completed_episodes'] == manifest['predecessor_expected_episodes']
+        assert all(s['completed'] == s['planned'] for s in result['scenes'])
+        old = read(previous / 'manifest.json')
+        assert not set(manifest['seeds']).intersection(old['seeds'])
+        for key in ['checkpoint_sha256', 'img_checkpoint_sha256', 'configuration_sha256', 'source_commit', 'bank_sha256']:
+            assert manifest[key] == old[key]
     assert read(out/'smoke_status.json')['status'] == 'smoke_complete'
     assert read(out/'fault_status.json')['status'] == 'failed'
     assert 'Intentional supervisor failure test' in read(out/'fault_status.json')['error']
@@ -359,9 +427,10 @@ def launch(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['prepare','worker','supervise','launch'], required=True)
+    parser.add_argument('--mode', choices=['prepare','prepare_remaining','worker','supervise','launch'], required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--baseline', type=Path)
+    parser.add_argument('--previous-run', type=Path)
     parser.add_argument('--img-checkpoint', type=Path)
     parser.add_argument('--development-commit')
     parser.add_argument('--episodes', type=int, default=20)
