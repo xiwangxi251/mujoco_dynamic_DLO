@@ -303,6 +303,8 @@ def make_worker(rank: int, args: argparse.Namespace):
             seed=args.seed + rank,
             scenario_names=args.training_scenario_names,
         )
+        if getattr(args, 'future_reset_prefetch', False):
+            env.enable_reset_prefetch()
         if (
             args.training_distribution == "l1"
             and args.curriculum_stage_steps > 0
@@ -1131,6 +1133,8 @@ def parse_args() -> argparse.Namespace:
                         help='Per-scene promotion thresholds; fast uses 40/50/40%% and one complete window')
     parser.add_argument('--future-geometry', action='store_true',
                         help='Add fixed episode 0..3s natural-motion geometry; ordinary actions remain unchanged')
+    parser.add_argument('--future-reset-prefetch', action='store_true',
+                        help='Linux: precompute one exact next reset in a separate process')
     parser.add_argument('--schedule-total-timesteps', type=int, default=0,
                         help='Global schedule horizon; preserved in checkpoint across continuations')
     parser.add_argument('--action-workspace', type=Path, help='Measured TCP execution map; does not enable target-node task')
@@ -1368,6 +1372,8 @@ def parse_args() -> argparse.Namespace:
         args.ordered_ability_curriculum = True
         if args.eval_freq != 0:
             parser.error('Rollout curriculum requires --eval-freq 0')
+    if args.future_reset_prefetch and not args.future_geometry:
+        parser.error('Future reset prefetch requires --future-geometry')
     if args.future_geometry and (args.observation_mode != 'state' or args.target_node_task):
         parser.error('Future geometry requires ordinary free-point state observations')
     if args.schedule_total_timesteps < 0 or (args.schedule_total_timesteps and args.restart_schedules_on_resume):
@@ -1547,6 +1553,7 @@ def main() -> None:
         model.lr_schedule = learning_rate
 
     saved_global_schedule = getattr(model, 'training_global_schedule', None)
+    model.future_reset_prefetch_enabled = bool(args.future_reset_prefetch)
     global_schedule = resolve_global_schedule(args, saved_global_schedule, starting_timesteps)
     if global_schedule:
         horizon = global_schedule['total_timesteps']
@@ -1883,6 +1890,7 @@ def main() -> None:
     if args.future_geometry:
         from .future_geometry import PROTOCOL as FUTURE_PROTOCOL
         configuration['future_geometry'] = FUTURE_PROTOCOL
+        configuration['future_reset_prefetch'] = bool(args.future_reset_prefetch)
         configuration['observation_interface_version'] = 'state99_future3s_1419_v1'
         configuration['observation_dim'] = 1419
         configuration['observation_names'] += [

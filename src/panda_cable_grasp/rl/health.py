@@ -65,6 +65,13 @@ class TrainingHealthCallback(BaseCallback):
                       optimizer_and_bookkeeping_seconds=getattr(self, 'optimizer_and_bookkeeping_seconds', None))
         record['penalty_ramp_schedule'] = getattr(self.model, 'penalty_ramp_schedule', None)
         record['target_evaluation_stage'] = getattr(self.model, 'target_evaluation_stage', None)
+        if getattr(self.model, 'future_reset_prefetch_enabled', False):
+            states = self.training_env.env_method('future_prefetch_status')
+            record['future_reset_prefetch'] = dict(
+                workers=len(states), hits=sum(s['hits'] for s in states),
+                misses=sum(s['misses'] for s in states), errors=sum(s['errors'] for s in states),
+                wait_seconds=sum(s['wait_seconds'] for s in states),
+                pending=sum(s['pending_pid'] is not None for s in states))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix('.tmp')
         temporary.write_text(json.dumps(record, indent=2), encoding='utf-8')

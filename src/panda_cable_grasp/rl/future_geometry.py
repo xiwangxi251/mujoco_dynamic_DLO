@@ -143,6 +143,15 @@ class FutureGeometryObservation(gym.Wrapper):
         self.enabled = False
         self.frames = np.zeros((30, 14, 3))
         self.first_contact_time = None
+        self.reset_prefetch = None
+
+    def enable_reset_prefetch(self):
+        from .future_prefetch import ResetPrefetch
+        if self.reset_prefetch is None:
+            self.reset_prefetch = ResetPrefetch()
+
+    def future_prefetch_status(self):
+        return self.reset_prefetch.status() if self.reset_prefetch else dict(enabled=False)
 
     def __getattr__(self, name):
         if name.startswith('_'):
@@ -167,7 +176,13 @@ class FutureGeometryObservation(gym.Wrapper):
         current, info = self.env.reset(**kwargs)
         self.enabled = True
         self.first_contact_time = None
-        self.frames, self.precompute_seconds, self.material_mapping = precompute(self.env.base_env, self.env._target_object_slice())
+        cached = (self.reset_prefetch.take(self.env,
+            eligible=kwargs.get('seed') is None and not kwargs.get('options'))
+            if self.reset_prefetch else None)
+        if cached is None:
+            self.frames, self.precompute_seconds, self.material_mapping = precompute(self.env.base_env, self.env._target_object_slice())
+        else:
+            self.frames, self.precompute_seconds, self.material_mapping = cached['frames'], cached['seconds'], cached['mapping']
         base = self.env.base_env
         if getattr(base, '_future_contact_owner', None) is not self:
             original = base._update_physical_grasp_state
@@ -181,7 +196,14 @@ class FutureGeometryObservation(gym.Wrapper):
         if robot_cable_contact(base):
             self.enabled = False
             self.first_contact_time = float(base.data.time)
+        if self.reset_prefetch:
+            self.reset_prefetch.start(self.env)
         return self._observation(current), self._info(info)
+
+    def close(self):
+        if self.reset_prefetch:
+            self.reset_prefetch.close()
+        return self.env.close()
 
     def step(self, action):
         current, reward, terminated, truncated, info = self.env.step(action)
