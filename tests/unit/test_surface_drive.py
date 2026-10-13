@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from panda_cable_grasp.env.environment import EnvConfig
-from panda_cable_grasp.env.surface_drive import surface_accelerations
+from panda_cable_grasp.env.surface_drive import surface_accelerations, table_support_mask
 from panda_cable_grasp.scenarios import SCENARIO_FAMILIES, get_scenario
 
 
@@ -73,3 +73,16 @@ def test_surface_configuration_rejects_unsupported_drivers():
     replay=EnvConfig(**get_scenario('dev_rigid_replay_shape_nominal_x075_surface_v1').to_env_overrides())
     with pytest.raises(ValueError,match='surface_velocity_v1'):replace(replay,replay_controller_version='force_tape_v5')
     with pytest.raises(ValueError,match='surface_velocity_v1'):replace(replay,motion_profile_version='rigid_level2_single_pass_v2',replay_bank=None)
+
+
+def test_table_support_hysteresis_distinguishes_near_table_from_lifted():
+    gaps = np.array([-.0001, .0008, .002, .004, np.inf])
+    np.testing.assert_array_equal(table_support_mask(gaps, np.zeros(5, dtype=bool)),
+                                  [True, True, False, False, False])
+    np.testing.assert_array_equal(table_support_mask(gaps, np.ones(5, dtype=bool)),
+                                  [True, True, True, False, False])
+    state = np.array([True])
+    for gap, expected in ((.002, True), (.0028, True), (.0032, False),
+                          (.002, False), (.0008, True)):
+        state = table_support_mask([gap], state)
+        assert bool(state[0]) == expected

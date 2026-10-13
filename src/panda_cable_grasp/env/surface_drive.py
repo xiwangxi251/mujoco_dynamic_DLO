@@ -4,6 +4,12 @@ from __future__ import annotations
 import numpy as np
 
 
+def table_support_mask(gaps, previous):
+    """Re-enable within 1 mm; remain enabled until lifted above 3 mm."""
+    gaps = np.asarray(gaps)
+    return (gaps <= .001) | (np.asarray(previous, dtype=bool) & (gaps <= .003))
+
+
 def surface_accelerations(positions, velocities, mass, grounded, target_velocity,
                           target_yaw_rate, *, velocity_gain, max_acceleration,
                           yaw_velocity_gain, yaw_feedforward=0., reference=None,

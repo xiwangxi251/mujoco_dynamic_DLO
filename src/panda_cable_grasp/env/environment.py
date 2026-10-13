@@ -1503,6 +1503,15 @@ class CableGraspEnv:
             if int(self.model.geom_bodyid[geom_id]) in self.cable_set
         ], dtype=int)
         self.cable_radius = float(self.model.geom_size[self.cable_geom_ids, 0].max())
+        self._surface_geom_nodes = np.array([
+            self.cable_index[int(self.model.geom_bodyid[geom_id])]
+            for geom_id in self.cable_geom_ids
+        ], dtype=int)
+        # Cable collision bodies are capsules (or spherical end pieces).
+        self._surface_geom_half_lengths = np.where(
+            self.model.geom_type[self.cable_geom_ids] == mujoco.mjtGeom.mjGEOM_CAPSULE,
+            self.model.geom_size[self.cable_geom_ids, 1], 0.,
+        )
         self.cable_free_qadr = self._find_cable_free_qpos_address()
         self.cable_free_joint_id = int(np.flatnonzero(
             self.model.jnt_qposadr == self.cable_free_qadr
@@ -1653,6 +1662,8 @@ class CableGraspEnv:
         self._last_ungated_scene_force = np.zeros((node_count, 3))
         self._last_ungated_rigid_force = np.zeros((node_count, 3))
         self._last_replay_force_grounded = np.zeros(node_count, dtype=bool)
+        self._surface_supported = np.zeros(node_count, dtype=bool)
+        self._surface_table_gaps = np.full(node_count, np.inf)
         self._replay_was_suspended = False
         self._replay_contact_blocked = False
         self._replay_gripper_contact_count = 0
@@ -2251,6 +2262,8 @@ class CableGraspEnv:
         self._last_ungated_scene_force[:] = 0.
         self._last_ungated_rigid_force[:] = 0.
         self._last_replay_force_grounded[:] = False
+        self._surface_supported[:] = False
+        self._surface_table_gaps[:] = np.inf
         if self._uses_force_replay:
             from .force_replay import prepare_force_replay
             self._replay_force_compiler = prepare_force_replay(self)
@@ -3961,9 +3974,36 @@ class CableGraspEnv:
     def _uses_surface_drive(self) -> bool:
         return getattr(self.config, "rigid_drive_version", "feedback_v1") == "surface_velocity_v1"
 
+    def _surface_table_support_mask(self) -> np.ndarray:
+        """Use collision geometry height, independent of sparse contact pairs.
+
+        The lowest point of each capsule includes its radius and orientation.
+        A segment near the tabletop keeps its drive even without a contact pair.
+        Only this experimental controller uses the hysteretic support state.
+        """
+        from .surface_drive import table_support_mask
+
+        table = self.table_geom_id
+        rotation = self.data.geom_xmat[table].reshape(3, 3)
+        local_centers = (self.data.geom_xpos[self.cable_geom_ids]
+                         - self.data.geom_xpos[table]) @ rotation
+        capsule_axes = self.data.geom_xmat[self.cable_geom_ids].reshape(-1, 3, 3)[:, :, 2] @ rotation
+        radii = self.model.geom_size[self.cable_geom_ids, 0]
+        extents = np.abs(capsule_axes) * self._surface_geom_half_lengths[:, None] + radii[:, None]
+        gaps = local_centers[:, 2] - extents[:, 2] - self.model.geom_size[table, 2]
+        # A low segment outside the tabletop must not acquire conveyor drive.
+        overlaps_table = np.all(
+            np.abs(local_centers[:, :2]) <= self.model.geom_size[table, :2] + extents[:, :2], axis=1
+        )
+        gaps = np.where(overlaps_table, gaps, np.inf)
+        self._surface_table_gaps[:] = np.inf
+        np.minimum.at(self._surface_table_gaps, self._surface_geom_nodes, gaps)
+        self._surface_supported[:] = table_support_mask(self._surface_table_gaps, self._surface_supported)
+        return self._surface_supported.copy()
+
     def _apply_surface_velocity_drive(self) -> None:
         from .surface_drive import surface_accelerations
-        grounded = self._cable_table_contact_mask()
+        grounded = self._surface_table_support_mask()
         self._last_replay_force_grounded[:] = grounded
         positions = self.data.xpos[self.cable_ids]
         velocities = np.zeros_like(positions)

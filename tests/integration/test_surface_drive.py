@@ -71,7 +71,7 @@ class SurfaceDriveTests(unittest.TestCase):
             qadr=int(env.cable_ball_qadr[len(env.cable_ball_qadr)//2])
             env.data.qpos[qadr:qadr+4]=[np.cos(np.pi/6),0.,-np.sin(np.pi/6),0.]
             mujoco.mj_forward(env.model,env.data)
-            grounded=env._cable_table_contact_mask()
+            grounded=env._surface_table_support_mask()
             assert grounded.any() and not grounded.all(),grounded
             env.grasp_state=GraspState(body_id=int(env.target_body_id),candidate_time=env.data.time,
                 bilateral_confirmed=True,last_bilateral_time=env.data.time,lost_contact_time=env.data.time)
@@ -98,12 +98,46 @@ class SurfaceDriveTests(unittest.TestCase):
                         # last integration stage. Compare two equally refreshed
                         # states, so this check changes only world translation.
                         mujoco.mj_forward(env.model,env.data)
-                        mask=env._cable_table_contact_mask().copy()
-                        env._cable_table_contact_mask=lambda:mask
+                        mask=env._surface_table_support_mask()
                         env._apply_cable_disturbance();before=env._last_ungated_rigid_force.copy()
                         env.data.qpos[env.cable_free_qadr:env.cable_free_qadr+2]+=[.2,-.2]
                         mujoco.mj_forward(env.model,env.data)
                         env._apply_cable_disturbance()
+                        np.testing.assert_array_equal(env._last_replay_force_grounded,mask)
                         np.testing.assert_allclose(env._last_ungated_rigid_force,before,atol=1e-9)
                         assert env._replay_anchor_elapsed==0.
                 finally:env.close()
+
+    def test_near_table_without_contacts_stays_driven_and_lift_return_has_hysteresis(self):
+        env=self.make(NAMES[0])
+        try:
+            env.reset(seed=fixtures.SEED)
+            # Straight, horizontal cable: translate its real collision geometry
+            # to known positive gaps, where no penetration contacts exist.
+            env.data.qpos[env.cable_free_qadr+3:env.cable_free_qadr+7]=[1.,0.,0.,0.]
+            for qadr in env.cable_ball_qadr:
+                env.data.qpos[qadr:qadr+4]=[1.,0.,0.,0.]
+            env.data.qvel[:]=0.
+            env.data.time=.9
+            mujoco.mj_forward(env.model,env.data)
+            env._surface_table_support_mask()
+            assert np.ptp(env._surface_table_gaps)<1e-10
+            for gap,expected in ((.0005,True),(.002,True),(.0035,False),
+                                 (.002,False),(.0005,True)):
+                env.data.qpos[env.cable_free_qadr+2]+=gap-env._surface_table_gaps[0]
+                mujoco.mj_forward(env.model,env.data)
+                assert not env._cable_table_contact_mask().any()
+                with patch.object(env,'_cable_table_contact_mask',side_effect=AssertionError('contact gate')):
+                    env._apply_cable_disturbance()
+                np.testing.assert_allclose(env._surface_table_gaps,gap,atol=1e-10)
+                np.testing.assert_array_equal(env._last_replay_force_grounded,expected)
+                if expected:assert np.linalg.norm(env._last_ungated_rigid_force)>0.
+                else:np.testing.assert_array_equal(env._last_ungated_rigid_force,0.)
+            # A near-height strand outside the table has no table drive.
+            env.data.qpos[env.cable_free_qadr]+=10.
+            mujoco.mj_forward(env.model,env.data)
+            assert not env._surface_table_support_mask().any()
+            env.reset(seed=fixtures.SEED)
+            assert not env._surface_supported.any()
+            assert np.isinf(env._surface_table_gaps).all()
+        finally:env.close()
