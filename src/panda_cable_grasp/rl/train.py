@@ -305,6 +305,9 @@ def make_worker(rank: int, args: argparse.Namespace):
     def initialize():
         from .affinity import bind_worker
         bind_worker(args, rank)
+        if getattr(args, 'range_output_response', None):
+            from .range_curriculum import configure_output_response
+            configure_output_response(args.range_output_response)
         env = make_configured_env(
             args,
             seed=args.seed + rank,
@@ -1146,6 +1149,8 @@ def parse_args() -> argparse.Namespace:
                         table_execution_guard=None)
     parser.add_argument('--ordinary-reward-profile', choices=('legacy', 'physical_progress_v1', 'physical_progress_v2', 'session_height_v1'), default='legacy')
     parser.add_argument('--ordered-ability-curriculum', action='store_true')
+    parser.add_argument('--range-output-response', type=Path, default=None,
+        help='Independently validated actual amplitude/speed response map; original shape drive stays active')
     parser.add_argument('--range-motion-curriculum', action='store_true',
         help='Continuous independent motion parameters with per-cell training episode gates')
     parser.add_argument('--rollout-ability-curriculum', action='store_true',
@@ -1398,11 +1403,18 @@ def parse_args() -> argparse.Namespace:
             tuple((n, b / len(static)) for n in static) + tuple((n, c / len(component)) for n in component) + ((combined[0], 1-b-c),),
         )
     if args.range_motion_curriculum:
+        if args.range_output_response:
+            if args.resume:
+                parser.error('Actual-output response range starts from scratch; legacy evidence/checkpoints cannot be reused')
+            from .range_curriculum import configure_output_response
+            configure_output_response(args.range_output_response)
         if args.workspace_scene_family == 'cable_x075_force_v1':
             parser.error('Range curriculum retains its original scene family; force family requires fixed scene motion')
         args.rollout_ability_curriculum = True
         if args.eval_workers != 0 or args.target_node_task:
             parser.error('Range curriculum requires 0 eval workers and ordinary non-target-node PPO')
+    if args.range_output_response and not args.range_motion_curriculum:
+        parser.error('--range-output-response requires --range-motion-curriculum')
     if args.rollout_ability_curriculum:
         args.ordered_ability_curriculum = True
         if args.eval_freq != 0:
