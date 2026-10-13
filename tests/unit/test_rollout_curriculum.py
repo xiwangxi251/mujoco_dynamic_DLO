@@ -4,7 +4,7 @@ import zipfile
 
 import pytest
 
-from panda_cable_grasp.rl.rollout_curriculum import Windows, checkpoint_phase, difficulties, VERSION, RolloutMotionCurriculum, FAST_PROTOCOL
+from panda_cable_grasp.rl.rollout_curriculum import Windows, checkpoint_phase, difficulties, VERSION, RolloutMotionCurriculum, FAST_PROTOCOL, ALL_SCENES, CONSOLIDATION_MIX, CONSOLIDATION_PROTOCOL, structure_for
 from panda_cable_grasp.rl.ordered_curriculum import GROUPS, MIXES
 from panda_cable_grasp.rl.train import cumulative_linear_schedule, resolve_global_schedule
 
@@ -163,3 +163,43 @@ def test_saved_global_schedule_restores_without_new_horizon_and_rejects_extensio
     args.schedule_total_timesteps = 30_000_000
     with pytest.raises(ValueError, match='differs'):
         resolve_global_schedule(args, saved, 1_399_776)
+
+
+def test_consolidation_mix_and_nominal_difficulty():
+    groups, phases, mixes = structure_for('consolidate')
+    assert len(phases) == 15 and phases[-1] == (6, 1.)
+    assert sum(p for n,p in CONSOLIDATION_MIX) == pytest.approx(1)
+    assert dict(CONSOLIDATION_MIX)[GROUPS[1][0]] == .3
+    assert dict(CONSOLIDATION_MIX)[GROUPS[3][0]] == .3
+    assert len(groups[-1]) == 7 and mixes[-1] == CONSOLIDATION_MIX
+    assert all(difficulties(14)[n] == (0 if g<2 else 1)
+               for g,names in enumerate(GROUPS) for n in names)
+
+
+def test_passing_checkpoint_enters_consolidation_before_first_reset(tmp_path):
+    p = tmp_path/'passed.zip'
+    state=dict(version=FAST_PROTOCOL['version'],phase=13,windows=dict(consecutive=18))
+    with zipfile.ZipFile(p,'w') as z:z.writestr('data',json.dumps(dict(rollout_gate_state=state)))
+    assert checkpoint_phase(p,'consolidate') == 14
+    assert checkpoint_phase(p,'fast') == 13
+    state['windows']['consecutive']=0
+    with zipfile.ZipFile(p,'w') as z:z.writestr('data',json.dumps(dict(rollout_gate_state=state)))
+    assert checkpoint_phase(p,'consolidate') == 13
+
+
+def test_terminal_stage_tracks_every_scene_without_further_promotion(tmp_path):
+    c=RolloutMotionCurriculum(output_dir=tmp_path,gate_profile='consolidate')
+    model=SimpleNamespace(rollout_gate_state=dict(version=FAST_PROTOCOL['version'],phase=13,
+        windows=dict(consecutive=18),episode_counter=2000),
+        get_env=lambda:SimpleNamespace(env_method=lambda *a:None),logger=SimpleNamespace(record=lambda *a:None))
+    c.model=model;c.num_timesteps=10_000_000;c._on_training_start()
+    try:
+        assert c.phase_index==14 and c.current_scenarios==ALL_SCENES
+        assert c.windows.replay == ()
+        assert len(c.windows.queues)==7 and all(q.maxlen==100 for q in c.windows.queues.values())
+        for n in ALL_SCENES:fill(c.windows,n,100)
+        c._on_rollout_end()
+        record=json.loads((tmp_path/'rollout_gate_rounds.jsonl').read_text())
+        assert record['passed'] and not record['promote'] and record['next_phase']==14
+        assert model.rollout_gate_state['version']==CONSOLIDATION_PROTOCOL['version']
+    finally:c._on_training_end()

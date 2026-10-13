@@ -1131,7 +1131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--ordered-ability-curriculum', action='store_true')
     parser.add_argument('--rollout-ability-curriculum', action='store_true',
                         help='Use independent training-episode windows for ordered scene promotion; no eval environments')
-    parser.add_argument('--rollout-gate-profile', choices=('strict', 'fast'), default='strict',
+    parser.add_argument('--rollout-gate-profile', choices=('strict', 'fast', 'consolidate'), default='strict',
                         help='Per-scene promotion thresholds; fast uses 40/50/40%% and one complete window')
     parser.add_argument('--future-geometry', action='store_true',
                         help='Add fixed episode 0..3s natural-motion geometry; ordinary actions remain unchanged')
@@ -1430,7 +1430,7 @@ def parse_args() -> argparse.Namespace:
             )
     if args.rollout_ability_curriculum:
         from .rollout_curriculum import checkpoint_phase
-        args.rollout_initial_phase = checkpoint_phase(args.resume)
+        args.rollout_initial_phase = checkpoint_phase(args.resume, args.rollout_gate_profile)
     return args
 
 
@@ -1918,7 +1918,8 @@ def main() -> None:
         configuration['learning_rate_schedule'] = 'linear over cumulative global samples'
         configuration['entropy_coef_schedule'] = 'linear over cumulative global samples; updated per rollout'
     if args.rollout_ability_curriculum:
-        from .rollout_curriculum import protocol_for, PHASES, GROUPS, MIXES
+        from .rollout_curriculum import protocol_for, structure_for
+        GROUPS, PHASES, MIXES = structure_for(args.rollout_gate_profile)
         configuration['ordered_curriculum'] = dict(protocol_for(args.rollout_gate_profile), phases=PHASES, groups=GROUPS, training_mixes=MIXES)
         configuration['rollout_gate_profile'] = args.rollout_gate_profile
         configuration['statistics_source'] = 'stochastic training episodes'
