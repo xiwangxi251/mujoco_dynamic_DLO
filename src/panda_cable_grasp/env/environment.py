@@ -552,7 +552,7 @@ class EnvConfig:
                 "Level-1/Level-2/replay profiles require rigid or combined motion"
             )
         uses_replay = self.motion_profile_version == REPLAY_MOTION_PROFILE
-        if self.rigid_drive_version not in {"feedback_v1", "force_tape_v1"}:
+        if self.rigid_drive_version not in {"feedback_v1", "force_tape_v1", "surface_velocity_v1"}:
             raise ValueError("unsupported rigid_drive_version")
         if self.rigid_drive_version == "force_tape_v1" and (
             self.motion_profile_version not in RIGID_MOTION_PROFILES
@@ -560,6 +560,12 @@ class EnvConfig:
             or self._uses_object_scene
         ):
             raise ValueError("rigid_drive_version requires canonical L1/L2 rigid or combined motion")
+        if self.rigid_drive_version == "surface_velocity_v1" and (
+            self.motion_profile_version not in {"rigid_level1_single_pass_v2", REPLAY_MOTION_PROFILE}
+            or self.motion_mode not in {"rigid", "combined"} or self._uses_object_scene
+            or self.replay_controller_version == FORCE_REPLAY_CONTROLLER
+        ):
+            raise ValueError("surface_velocity_v1 requires canonical L1 or replay velocity motion without force tape")
         if self.replay_controller_version not in {"legacy_pd_v1", FORCE_REPLAY_CONTROLLER, *CONTINUOUS_REPLAY_CONTROLLERS}:
             raise ValueError("unsupported replay_controller_version")
         if self.replay_controller_version != "legacy_pd_v1" and not uses_replay:
@@ -1497,6 +1503,15 @@ class CableGraspEnv:
             if int(self.model.geom_bodyid[geom_id]) in self.cable_set
         ], dtype=int)
         self.cable_radius = float(self.model.geom_size[self.cable_geom_ids, 0].max())
+        self._surface_geom_nodes = np.array([
+            self.cable_index[int(self.model.geom_bodyid[geom_id])]
+            for geom_id in self.cable_geom_ids
+        ], dtype=int)
+        # Cable collision bodies are capsules (or spherical end pieces).
+        self._surface_geom_half_lengths = np.where(
+            self.model.geom_type[self.cable_geom_ids] == mujoco.mjtGeom.mjGEOM_CAPSULE,
+            self.model.geom_size[self.cable_geom_ids, 1], 0.,
+        )
         self.cable_free_qadr = self._find_cable_free_qpos_address()
         self.cable_free_joint_id = int(np.flatnonzero(
             self.model.jnt_qposadr == self.cable_free_qadr
@@ -1647,6 +1662,8 @@ class CableGraspEnv:
         self._last_ungated_scene_force = np.zeros((node_count, 3))
         self._last_ungated_rigid_force = np.zeros((node_count, 3))
         self._last_replay_force_grounded = np.zeros(node_count, dtype=bool)
+        self._surface_supported = np.zeros(node_count, dtype=bool)
+        self._surface_table_gaps = np.full(node_count, np.inf)
         self._replay_was_suspended = False
         self._replay_contact_blocked = False
         self._replay_gripper_contact_count = 0
@@ -1802,7 +1819,7 @@ class CableGraspEnv:
         self._replay_yaw = trajectory.delta_yaw
         self._replay_yaw_rate = trajectory.yaw_rate
         self._replay_valid_steps = int(bank.valid_steps[entry])
-        if self.config.replay_controller_version in CONTINUOUS_REPLAY_CONTROLLERS | {FORCE_REPLAY_CONTROLLER}:
+        if self._uses_surface_drive or self.config.replay_controller_version in CONTINUOUS_REPLAY_CONTROLLERS | {FORCE_REPLAY_CONTROLLER}:
             from .replay_bank import ContinuousReplayReference
             self._replay_reference = ContinuousReplayReference(
                 trajectory, self._replay_dt, self._replay_valid_steps,
@@ -2245,6 +2262,8 @@ class CableGraspEnv:
         self._last_ungated_scene_force[:] = 0.
         self._last_ungated_rigid_force[:] = 0.
         self._last_replay_force_grounded[:] = False
+        self._surface_supported[:] = False
+        self._surface_table_gaps[:] = np.inf
         if self._uses_force_replay:
             from .force_replay import prepare_force_replay
             self._replay_force_compiler = prepare_force_replay(self)
@@ -2945,7 +2964,8 @@ class CableGraspEnv:
                 self.config.rigid_motion_exit_y if uses_rigid_motion else None
             ),
             "rigid_motion_control": (
-                "material_force_tape_v5" if self._uses_force_replay
+                "table_supported_velocity_v1" if self._uses_surface_drive
+                else "material_force_tape_v5" if self._uses_force_replay
                 else "actual_progress_velocity_v1" if uses_rigid_motion else None
             ),
             "arm_motion_start_time": arm_motion_start_time,
@@ -3020,6 +3040,10 @@ class CableGraspEnv:
             ),
             "replay_force_compiler_parameters": force_compiler_parameters,
             "rigid_drive_version": self.config.rigid_drive_version,
+            "surface_drive_grounded_nodes": (
+                int(self._last_replay_force_grounded.sum()) if self._uses_surface_drive else None
+            ),
+            "surface_drive_elapsed": self._replay_elapsed if self._uses_surface_drive else None,
             "rigid_force_elapsed": self._replay_elapsed if self._uses_force_replay else None,
             "replay_force_tape_step": (
                 self._replay_force_tape.index(self.data.time) if self._replay_force_tape is not None else None
@@ -3275,9 +3299,9 @@ class CableGraspEnv:
         覆盖 L1/L2 扫描和 ``rigid_replay_v1`` 回放：确认抓取期间整体驱动
         与回放时钟一起暂停，松开后从暂停处续走而不是追赶进度。
         """
-        if self._uses_force_replay:
-            # Grasp/contact still participate in task judgement, never in tape
-            # scheduling. Do not reanchor, pause or accumulate missed forces.
+        if self._uses_force_replay or self._uses_surface_drive:
+            # Grasp/contact still participate in task judgement. Neither tape
+            # playback nor live surface feedback pauses or reanchors on grasp.
             self.rigid_motion_suspended = False
             self._replay_contact_blocked = False
             self._replay_was_suspended = False
@@ -3868,6 +3892,9 @@ class CableGraspEnv:
     def _apply_cable_disturbance(self) -> None:
         """按场景组合静止、整体运动和局部形变三个可审计分量。"""
 
+        if self._uses_surface_drive:
+            self._apply_surface_velocity_drive()
+            return
         if self._uses_force_replay:
             self._apply_replay_force_tape()
             return
@@ -3942,6 +3969,89 @@ class CableGraspEnv:
         self.data.xfrc_applied[self.cable_ids, :3] += (
             self.cable_mass[:, None] * intended
         )
+
+    @property
+    def _uses_surface_drive(self) -> bool:
+        return getattr(self.config, "rigid_drive_version", "feedback_v1") == "surface_velocity_v1"
+
+    def _surface_table_support_mask(self) -> np.ndarray:
+        """Use collision geometry height, independent of sparse contact pairs.
+
+        The lowest point of each capsule includes its radius and orientation.
+        A segment near the tabletop keeps its drive even without a contact pair.
+        Only this experimental controller uses the hysteretic support state.
+        """
+        from .surface_drive import table_support_mask
+
+        table = self.table_geom_id
+        rotation = self.data.geom_xmat[table].reshape(3, 3)
+        local_centers = (self.data.geom_xpos[self.cable_geom_ids]
+                         - self.data.geom_xpos[table]) @ rotation
+        capsule_axes = self.data.geom_xmat[self.cable_geom_ids].reshape(-1, 3, 3)[:, :, 2] @ rotation
+        radii = self.model.geom_size[self.cable_geom_ids, 0]
+        extents = np.abs(capsule_axes) * self._surface_geom_half_lengths[:, None] + radii[:, None]
+        gaps = local_centers[:, 2] - extents[:, 2] - self.model.geom_size[table, 2]
+        # A low segment outside the tabletop must not acquire conveyor drive.
+        overlaps_table = np.all(
+            np.abs(local_centers[:, :2]) <= self.model.geom_size[table, :2] + extents[:, :2], axis=1
+        )
+        gaps = np.where(overlaps_table, gaps, np.inf)
+        self._surface_table_gaps[:] = np.inf
+        np.minimum.at(self._surface_table_gaps, self._surface_geom_nodes, gaps)
+        self._surface_supported[:] = table_support_mask(self._surface_table_gaps, self._surface_supported)
+        return self._surface_supported.copy()
+
+    def _apply_surface_velocity_drive(self) -> None:
+        from .surface_drive import surface_accelerations
+        grounded = self._surface_table_support_mask()
+        self._last_replay_force_grounded[:] = grounded
+        positions = self.data.xpos[self.cable_ids]
+        velocities = np.zeros_like(positions)
+        for index in np.flatnonzero(grounded):
+            velocities[index] = self.body_linear_velocity(int(self.cable_ids[index]))
+        target_velocity = np.zeros(2)
+        target_rate = target_alpha = 0.
+        velocity_gain = self.config.rigid_velocity_gain
+        yaw_gain = 9.
+        if self._uses_replay_motion:
+            # Read only current-time derivatives; ignore position and yaw errors.
+            self._replay_elapsed = float(self.data.time)*self.config.replay_time_scale
+            _, target_velocity, _, yaw, target_rate, target_alpha = self._continuous_replay_targets()
+            if np.any(grounded):
+                offset = (np.average(self._rigid_reference_xy[grounded], axis=0,
+                          weights=self.cable_mass[grounded])-self._rigid_reference_com_xy)@self._planar_rotation(yaw)
+                target_velocity = target_velocity+target_rate*np.array([-offset[1], offset[0]])
+            velocity_gain = self.config.replay_velocity_gain
+            yaw_gain = self.config.replay_yaw_velocity_gain
+        elif self.data.time >= RIGID_MOTION_START_TIME:
+            target_velocity = np.array([0., self._rigid_motion_speed()])
+            if np.any(grounded):
+                m = self.cable_mass[grounded]
+                offset = np.average(positions[grounded, :2]-self._rigid_reference_xy[grounded], axis=0, weights=m)
+                _, tangent, progress, metric = self._rigid_motion_path_state(offset)
+                actual_velocity = np.average(velocities[grounded, :2], axis=0, weights=m)
+                _, target_rate = self._rigid_motion_rotation_state(progress, metric, tangent, actual_velocity)
+        translation, rotation, hold = surface_accelerations(
+            positions, velocities, self.cable_mass, grounded, target_velocity, target_rate,
+            velocity_gain=velocity_gain, max_acceleration=self.config.rigid_translation_max_acceleration,
+            yaw_velocity_gain=yaw_gain, yaw_feedforward=target_alpha,
+            reference=self._rigid_reference_xy if self.config.motion_mode == "rigid" and not self._uses_replay_motion else None,
+            shape_stiffness=self.config.rigid_shape_stiffness, shape_damping=self.config.rigid_shape_damping,
+            max_shape_acceleration=self.config.rigid_shape_max_acceleration,
+        )
+        shape = np.zeros_like(positions)
+        if self.config.motion_mode == "combined":
+            t = self.phase_offset+self.config.motion_frequency_scale*float(self.data.time)
+            shape = self._shape_acceleration(t, self.spatial_phase)
+        rigid_force = self.cable_mass[:, None]*(translation+rotation+hold)
+        self._last_ungated_rigid_force[:] = rigid_force
+        self._last_ungated_scene_force[:] = rigid_force+self.cable_mass[:, None]*shape
+        self.data.xfrc_applied[self.cable_ids, :3] += self._last_ungated_scene_force
+        self._last_shape_acceleration[:] = shape
+        self._last_rigid_translation_acceleration[:] = translation
+        self._last_rigid_rotation_acceleration[:] = rotation
+        self._last_rigid_shape_hold_acceleration[:] = hold
+        self._replay_elapsed = (float(self.data.time)+self.model.opt.timestep)*self.config.replay_time_scale
 
     @property
     def _uses_force_replay(self) -> bool:

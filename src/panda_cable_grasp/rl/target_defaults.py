@@ -78,7 +78,7 @@ def configure_target_training_defaults(args, argv):
                                             '--training-distribution', '--eval-distribution'})):
         args.workspace_scene_family = TARGET_PPO_DEFAULTS['workspace_scene_family']
     if (target and args.target_workspace is None
-            and args.workspace_scene_family in ('cable_x075_v1', 'cable_x075_force_v1')):
+            and args.workspace_scene_family in ('cable_x075_v1', 'cable_x075_force_v1', 'cable_x075_surface_v1')):
         from .workspace import DEFAULT_TARGET_WORKSPACE
         args.target_workspace = DEFAULT_TARGET_WORKSPACE
 
