@@ -103,7 +103,6 @@ def main():
                               n_epochs=5, target_kl=None, seed=configuration['seed'])
         model.c_original151_history = history
         model.c_adaptation_schedule = adaptation_schedule
-        model.async_rollouts_enabled = bool(plan.get('async_rollouts_enabled', False))
         model.rollout_gate_state = {}
         assert model.n_envs == args.workers
         env.reset()
@@ -130,7 +129,6 @@ def main():
             starting_checkpoint_sha256=plan['checkpoint_sha256'], reset_num_timesteps=False,
             original_151_config=plan['original_151_config'], statistics_source='stochastic training episodes',
             independent_evaluation_enabled=False, rollout_gate_profile='fast after speed adaptation',
-            rollout_sampler='async_fixed_quota_v1' if model.async_rollouts_enabled else 'synchronous_vector_steps',
             speed_levels=[1, 1.25, 1.5, 1.75, 2], minimum_added_per_speed=200000,
             success_threshold=.8, required_nonoverlapping_windows=2, episodes_per_speed_window=100)
         atomic(args.output/'training_config.json', configuration)

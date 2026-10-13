@@ -42,10 +42,6 @@ def main():
             while True:
                 now = time.time()
                 s.update(source_updated_at=utc(now), heartbeat_at=utc(now))
-                if m.get('purpose') == 'sampler_benchmark' and (out/'worker_ready.json').exists():
-                    s['benchmark_worker_ready'] = json.loads((out/'worker_ready.json').read_text())
-                    if s['status'] == 'starting':
-                        s.update(status='running', last_progress_at=utc(now), progress_deadline_at=utc(now+1800))
                 if (out/'training_health.json').exists():
                     h = json.loads((out/'training_health.json').read_text())
                     old = s['completed']
@@ -63,14 +59,6 @@ def main():
                     if code:
                         s.update(status='failed', error=(out/'stderr.log').read_text(errors='replace')[-5000:])
                     else:
-                        if m.get('purpose') == 'sampler_benchmark':
-                            report = json.loads((out/'benchmark.json').read_text())
-                            assert report['status'] == 'complete' and report['sampled_transitions'] == m['budget']
-                            assert report['finite'] and report['policy_unchanged'] and report['formal_samples'] == 0
-                            s.update(status='complete', experiment_state='complete', completed=m['budget'],
-                                     benchmark=report, last_progress_at=utc(now))
-                            atomic(path, s)
-                            return
                         model = out/'final_model.zip'
                         with zipfile.ZipFile(model) as z:
                             data = json.loads(z.read('data'))

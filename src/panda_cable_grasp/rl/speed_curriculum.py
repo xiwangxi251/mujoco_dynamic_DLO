@@ -149,12 +149,6 @@ def verify_workers(audits, state, original_compiled=None):
 
 
 class SpeedPPO(PPO):
-    def collect_rollouts(self, env, callback, rollout_buffer, n_rollout_steps):
-        if getattr(self, 'async_rollouts_enabled', False):
-            from .async_rollouts import collect_fixed_quota
-            return collect_fixed_quota(self, env, callback, rollout_buffer, n_rollout_steps)
-        return super().collect_rollouts(env, callback, rollout_buffer, n_rollout_steps)
-
     def _excluded_save_params(self):
         return super()._excluded_save_params() + ['_speed_callback']
 
@@ -263,8 +257,6 @@ class SpeedCallback(BaseCallback):
             actual_speed_measurement='50Hz control boundary; not physics peak')
         health['actual_speeds'] = {k: dict(mean=float(np.mean(v)), peak=float(np.max(v))) if v else None
                                   for k, v in self.speeds.items()}
-        health['sampler'] = 'async_fixed_quota_v1' if getattr(self.model, 'async_rollouts_enabled', False) else 'synchronous_vector_steps'
-        health['async_rollout_receipt'] = getattr(self.model, 'async_rollout_receipt', None)
         atomic(self.output/'training_health.json', health)
 
     def _on_rollout_start(self):
