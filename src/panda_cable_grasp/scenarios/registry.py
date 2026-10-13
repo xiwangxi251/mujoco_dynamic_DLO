@@ -261,12 +261,18 @@ class ScenarioConfig:
                 "rigid and combined scenarios must explicitly select "
                 "Level-1/Level-2 or the replay profile"
             )
-        if self.rigid_drive_version not in {"feedback_v1", "force_tape_v1"}:
+        if self.rigid_drive_version not in {"feedback_v1", "force_tape_v1", "surface_velocity_v1"}:
             raise ValueError("unsupported rigid_drive_version")
         if self.rigid_drive_version == "force_tape_v1" and self.motion_profile_version not in {
             "rigid_level1_single_pass_v2", "rigid_level2_single_pass_v2",
         }:
             raise ValueError("rigid_drive_version requires L1/L2 motion")
+        if self.rigid_drive_version == "surface_velocity_v1" and (
+            self.motion_profile_version not in {"rigid_level1_single_pass_v2", "rigid_replay_v1"}
+            or self.motion_type not in {MotionType.RIGID, MotionType.COMBINED}
+            or self.replay_controller_version == "force_tape_v5"
+        ):
+            raise ValueError("surface_velocity_v1 requires L1 or replay velocity motion without force tape")
         if self.replay_controller_version not in {"legacy_pd_v1", "continuous_ff_v2", "continuous_ff_v3", "continuous_ff_v4", "force_tape_v5"}:
             raise ValueError("unsupported replay_controller_version")
         if self.replay_controller_version != "legacy_pd_v1" and self.motion_profile_version != "rigid_replay_v1":
@@ -1366,6 +1372,16 @@ def _registered_scenarios() -> list[ScenarioConfig]:
             description=f"{source.description} Explicit uninterrupted whole-motion force playback family.",
             tags=tuple(tag for tag in source.tags if tag != "cable_x075_v1") + ("cable_x075_force_v1",),
         ))
+    for old_name, surface_name in zip(CABLE_X075_SCENARIO_NAMES, CABLE_X075_SURFACE_SCENARIO_NAMES):
+        source = by_name[old_name]
+        dynamic = source.motion_type in {MotionType.RIGID, MotionType.COMBINED}
+        scenarios.append(replace(
+            source, name=surface_name,
+            rigid_drive_version="surface_velocity_v1" if dynamic else source.rigid_drive_version,
+            replay_controller_version="continuous_ff_v2" if source.motion_profile_version == "rigid_replay_v1" else source.replay_controller_version,
+            description=f"{source.description} Experimental continuous table-supported velocity feedback.",
+            tags=tuple(tag for tag in source.tags if tag != "cable_x075_v1") + ("cable_x075_surface_v1",),
+        ))
     return scenarios
 
 
@@ -1387,9 +1403,14 @@ CABLE_X075_FORCE_SCENARIO_NAMES = tuple(
     name.removesuffix("_x075_v1") + "_x075_force_v1"
     for name in CABLE_X075_SCENARIO_NAMES
 )
+CABLE_X075_SURFACE_SCENARIO_NAMES = tuple(
+    name.removesuffix("_x075_v1") + "_x075_surface_v1"
+    for name in CABLE_X075_SCENARIO_NAMES
+)
 SCENARIO_FAMILIES = {
     "cable_x075_v1": CABLE_X075_SCENARIO_NAMES,
     "cable_x075_force_v1": CABLE_X075_FORCE_SCENARIO_NAMES,
+    "cable_x075_surface_v1": CABLE_X075_SURFACE_SCENARIO_NAMES,
 }
 SCENARIO_REGISTRY = ScenarioRegistry(_registered_scenarios())
 SCENARIOS = SCENARIO_REGISTRY
@@ -1565,6 +1586,7 @@ __all__ = [
     "CABLE_X075_SOURCE_NAMES",
     "CABLE_X075_SCENARIO_NAMES",
     "CABLE_X075_FORCE_SCENARIO_NAMES",
+    "CABLE_X075_SURFACE_SCENARIO_NAMES",
     "CABLE_X075_REPLAY_SCENARIO_NAMES",
     "LEGACY_PPO_SIX_SOURCE_NAMES",
     "SCENARIO_FAMILIES",

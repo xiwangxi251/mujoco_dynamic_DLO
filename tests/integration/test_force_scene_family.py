@@ -19,6 +19,21 @@ FORCE = 'cable_x075_force_v1'
 OLD = 'cable_x075_v1'
 
 
+@pytest.mark.parametrize('target', [False, True])
+def test_experimental_surface_family_is_explicit_and_curriculum_uses_its_names(monkeypatch,target):
+    family='cable_x075_surface_v1'
+    argv=['train','--workspace-scene-family',family]
+    if target:argv+=['--target-node-task','--workspace-curriculum']
+    else:argv+=['--ordinary-family-curriculum','--rollout-ability-curriculum','--eval-freq','0','--eval-workers','0']
+    monkeypatch.setattr(sys,'argv',argv)
+    args=train.parse_args()
+    assert tuple(args.training_scenario_names)==WORKSPACE_SCENE_FAMILIES[family]
+    if target:
+        assert args.target_workspace is not None
+    else:
+        assert {name for group in args.curriculum_stages for name in group}==set(WORKSPACE_SCENE_FAMILIES[family])
+
+
 def test_target_training_explicit_force_family_keeps_default_workspace(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['train', '--target-node-task', '--workspace-scene-family', FORCE,
                                      '--workspace-curriculum'])
