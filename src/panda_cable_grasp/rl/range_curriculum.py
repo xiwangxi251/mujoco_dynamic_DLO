@@ -12,9 +12,9 @@ from stable_baselines3.common.callbacks import BaseCallback
 from .ordered_curriculum import GROUPS, MIXES
 from ..scenarios.registry import get_scenario
 
-VERSION = 'range_ability_rollout_speed025_v2'
+VERSION = 'range_ability_rollout_v1'
 ALL_SCENES = tuple(n for group in GROUPS for n in group)
-RIGID_SPEED = (0.25 * 7 / 9, 0.25)
+RIGID_SPEED = (0.25 * 7 / 9, 0.30)
 SHAPE_STRENGTH = (1.0, 1.5)
 SHAPE_FREQUENCY = (7 / 9, 1.0)
 PROTOCOL = dict(version=VERSION, groups=GROUPS, budget=20000000,
@@ -32,8 +32,6 @@ PROTOCOL = dict(version=VERSION, groups=GROUPS, budget=20000000,
     statistics='stochastic training episodes; not independent evaluation')
 
 def axes(name):
-    if _OUTPUT_RESPONSE is not None and name in _OUTPUT_RESPONSE.tables:
-        return _OUTPUT_RESPONSE.axes(name)
     scenario = get_scenario(name)
     if scenario.motion_type.value == 'static':
         return ()
@@ -51,25 +49,6 @@ def cells(name):
 BOUNDS = dict(rigid_speed=RIGID_SPEED, shape_strength=SHAPE_STRENGTH,
               shape_frequency=SHAPE_FREQUENCY, replay_time_scale=SHAPE_FREQUENCY)
 
-_OUTPUT_RESPONSE = None
-
-def configure_output_response(path):
-    """Opt in to independently accepted actual-output ranges, before reset."""
-    global _OUTPUT_RESPONSE, VERSION
-    from .motion_response import MotionResponse
-    response=MotionResponse.load(path)
-    required={n for n in ALL_SCENES if get_scenario(n).motion_type.value in {'shape','combined'}}
-    if not required <= response.tables.keys():
-        raise ValueError('Measured response must cover both shape and combined scenes')
-    _OUTPUT_RESPONSE=response
-    VERSION='range_actual_amplitude_speed_v1_'+response.sha256[:12]
-    PROTOCOL.update(version=VERSION, measured_response_sha256=response.sha256,
-        measured_response_file=str(Path(path).resolve()),
-        measured_ranges={n:response.bounds(n) for n in response.tables},
-        shape_axes='actual amplitude RMS mm and residual node speed m/s',
-        response_validation=response.profile['validation'],
-        runtime='original continuous deformation drive; no extra pose hold or airborne shape gate')
-
 def sample_episode(scenario, rng, spec, phase):
     names=axes(scenario.name); available=cells(scenario.name)
     probabilities=np.asarray(spec['probabilities'], dtype=float)
@@ -77,10 +56,8 @@ def sample_episode(scenario, rng, spec, phase):
         raise ValueError('Invalid continuous sampler probabilities')
     cell=available[int(rng.choice(len(available),p=probabilities))]
     params={}
-    response=_OUTPUT_RESPONSE if _OUTPUT_RESPONSE is not None and scenario.name in _OUTPUT_RESPONSE.tables else None
-    bounds=response.bounds(scenario.name) if response else BOUNDS
     for axis,bit in zip(names,cell):
-        lo,hi=bounds[axis];mid=(lo+hi)/2
+        lo,hi=BOUNDS[axis];mid=(lo+hi)/2
         params[axis]=float(rng.uniform(lo,mid) if bit=='0' else rng.uniform(mid,hi))
     overrides=dict(rigid_frequency_scale=None, replay_time_scale=1.0)
     if 'rigid_speed' in params:
@@ -89,17 +66,9 @@ def sample_episode(scenario, rng, spec, phase):
         overrides.update(disturbance_strength=params['shape_strength'], motion_frequency_scale=params['shape_frequency'])
     if 'replay_time_scale' in params:
         overrides['replay_time_scale']=params['replay_time_scale']
-    if response:
-        drivers=response.solve(scenario.name,params)
-        allowed={'disturbance_strength','motion_frequency_scale','rigid_motion_nominal_speed'}
-        if set(drivers)-allowed: raise ValueError('Calibration may only adjust original motion driver parameters')
-        overrides.update(drivers)
-        if 'rigid_motion_nominal_speed' in drivers: overrides['rigid_frequency_scale']=1.
     return dict(version=VERSION, scenario=scenario.name, phase=int(phase), cell=cell,
                 axes=names, parameters=params, overrides=overrides,
-                sampling_probabilities=probabilities.tolist(),
-                **(dict(measured_response_sha256=response.sha256,
-                         internal_driver_parameters=drivers) if response else {}))
+                sampling_probabilities=probabilities.tolist())
 
 def counts(queue):
     return {k:sum(r[k] for r in queue) for k in ('success','loaded','secured','attempt')}
