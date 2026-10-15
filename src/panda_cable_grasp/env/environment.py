@@ -342,6 +342,10 @@ class EnvConfig:
     rigid_translation_scale: float = 1.0
     rigid_rotation_scale: float = 1.0
     rigid_motion_nominal_speed: float = 0.25 # L1/L2标称平均速度，单位m/s
+    rigid_motion_speed_range: tuple[float, float] | None = None
+    initial_placement_version: str = "legacy_v1"
+    initial_placement_min_fraction: float = 0.5
+    initial_placement_fallback_fraction: float = 0.4
     rigid_motion_exit_y: float = 0.70
     # 传送带模式：整体运动的驱动力只作用于与桌面接触的线缆节点，
     # 被夹起/悬空的节点不再受虚拟体积力驱动（视觉上更像传送带带动）。
@@ -520,6 +524,26 @@ class EnvConfig:
             )
         if self.initial_cable_center_x is not None and not math.isfinite(self.initial_cable_center_x):
             raise ValueError("initial_cable_center_x must be finite")
+        if self.initial_placement_version not in {'legacy_v1', 'sector_fraction_v1', 'sector_fraction_yaw_v2', 'simple_rigid_yaw_v3'}:
+            raise ValueError('Unsupported initial placement version')
+        if self.initial_placement_version == 'simple_rigid_yaw_v3' and (
+                self.motion_mode != 'rigid'
+                or self.motion_profile_version != 'rigid_level1_single_pass_v2'
+                or self.initial_shape_bank is not None
+                or self.n_objects != 1 or self.object_family != 'cable'):
+            raise ValueError('Simple rigid yaw requires a single simple-initial L1 rigid cable')
+        if self.initial_placement_version in {'sector_fraction_v1', 'sector_fraction_yaw_v2'} and (
+                self.motion_mode != 'static' or self.n_objects != 1 or self.object_family != 'cable'):
+            raise ValueError('Sector placement requires a single static cable')
+        if not 0 < self.initial_placement_fallback_fraction <= self.initial_placement_min_fraction <= 1:
+            raise ValueError('Invalid static placement fractions')
+        if self.initial_placement_version == 'sector_fraction_yaw_v2' and (
+                self.initial_placement_min_fraction != .3 or self.initial_placement_fallback_fraction != .3):
+            raise ValueError('Yaw-diverse static placement requires a strict 30% minimum')
+        if self.rigid_motion_speed_range is not None:
+            low, high = self.rigid_motion_speed_range
+            if not (math.isfinite(low) and math.isfinite(high) and 0 < low <= high):
+                raise ValueError('Invalid rigid speed range')
         if self.motion_mode not in {"static", "rigid", "shape", "combined"}:
             raise ValueError(f"unsupported motion_mode: {self.motion_mode!r}")
         if self.motion_regularity not in {
@@ -1627,6 +1651,7 @@ class CableGraspEnv:
         self._rigid_initial_shape_family = "none"
         self._rigid_initial_tangent_angles = np.zeros(node_count - 1)
         self._rigid_motion_rotation_sign = 1.0
+        self._initial_rigid_yaw_deg: float | None = None
         self._sine_axis: np.ndarray | None = None
         self._sine_rest_xy: np.ndarray | None = None
         self._sine_rest_z: np.ndarray | None = None
@@ -1971,7 +1996,18 @@ class CableGraspEnv:
         else:
             self.episode_seed = None
 
+        self._initial_rigid_yaw_deg = None
+        if self.config.initial_placement_version == 'simple_rigid_yaw_v3':
+            # Independent stream preserves the original curve, speed draw,
+            # random phases and motion's rotation direction for paired seeds.
+            yaw_rng = self.rng if seed is None else np.random.default_rng(int(seed) ^ 0xA61E)
+            self._initial_rigid_yaw_deg = float(yaw_rng.uniform(-180., 180.)) if randomize else 0.
         mujoco.mj_resetData(self.model, self.data)
+        if self.config.rigid_motion_speed_range is not None:
+            speed_rng = self.rng if seed is None else np.random.default_rng(int(seed) ^ 0x510ED)
+            self.config.rigid_motion_nominal_speed = float(
+                speed_rng.uniform(*self.config.rigid_motion_speed_range) if randomize
+                else np.mean(self.config.rigid_motion_speed_range))
         self.data.qpos[:9] = self.ready_qpos
         self.data.ctrl[:8] = self.ready_ctrl
         self._invalidate_contact_cache()
@@ -2144,9 +2180,60 @@ class CableGraspEnv:
             f"{self.config.shape_motion_scale:.17g}|"
             f"{self.phase_offset:.17g}|{self.spatial_phase:.17g}"
         ).encode("ascii")
+        if self._initial_rigid_yaw_deg is not None:
+            profile_header += f'|simple_rigid_yaw_v3|{self._initial_rigid_yaw_deg:.17g}'.encode('ascii')
         self._invalidate_contact_cache()
         mujoco.mj_forward(self.model, self.data)
         self._rigid_reference_xy[:] = self.data.xpos[self.cable_ids, :2]
+        self._initial_sector_coverage = None
+        self._initial_sector_fraction_used = None
+        self._initial_sector_yaw_deg = None
+        if self.config.initial_placement_version == 'sector_fraction_v1':
+            from .sector_placement import sample_translation
+            placement_rng = self.rng if seed is None else np.random.default_rng(int(seed) ^ 0x5EC70)
+            shift, coverage, fraction = sample_translation(
+                self._rigid_reference_xy, placement_rng,
+                self.table_xy_min + self.cable_radius, self.table_xy_max - self.cable_radius,
+                self.config.initial_placement_min_fraction, self.config.initial_placement_fallback_fraction)
+            self.data.qpos[self.cable_free_qadr:self.cable_free_qadr + 2] += shift
+            self.initial_cable_translation[:] += shift
+            self._invalidate_contact_cache()
+            mujoco.mj_forward(self.model, self.data)
+            self._rigid_reference_xy[:] = self.data.xpos[self.cable_ids, :2]
+            self._initial_sector_coverage = coverage
+            self._initial_sector_fraction_used = fraction
+            profile_header += f'|sector_fraction_v1|{coverage:.17g}|{fraction:.17g}'.encode('ascii')
+        elif self.config.initial_placement_version == 'sector_fraction_yaw_v2':
+            from .sector_placement import sample_rotated_translation
+            placement_rng = self.rng if seed is None else np.random.default_rng(int(seed) ^ 0x5EC70)
+            reference = self._rigid_reference_xy.copy()
+            yaw, shift, coverage, fraction = sample_rotated_translation(
+                reference, placement_rng, self.table_xy_min+self.cable_radius,
+                self.table_xy_max-self.cable_radius, self.config.initial_placement_min_fraction)
+            rotation = self._planar_rotation(yaw).T
+            center = reference.mean(axis=0)
+            root = self.data.qpos[self.cable_free_qadr:self.cable_free_qadr+2].copy()
+            self.data.qpos[self.cable_free_qadr:self.cable_free_qadr+2] = center + rotation @ (root-center) + shift
+            quaternion = self.data.qpos[self.cable_free_qadr+3:self.cable_free_qadr+7].copy()
+            yaw_quaternion = np.array([math.cos(yaw/2), 0., 0., math.sin(yaw/2)])
+            mujoco.mju_mulQuat(self.data.qpos[self.cable_free_qadr+3:self.cable_free_qadr+7], yaw_quaternion, quaternion)
+            # Static reset velocities are zero; rotate the free root's world
+            # linear velocity as well to preserve rigid-transform semantics.
+            linear_velocity = self.data.qvel[self.cable_free_dadr:self.cable_free_dadr+2].copy()
+            self.data.qvel[self.cable_free_dadr:self.cable_free_dadr+2] = rotation @ linear_velocity
+            self.initial_cable_translation[:] += shift
+            self._invalidate_contact_cache()
+            mujoco.mj_forward(self.model, self.data)
+            self._rigid_reference_xy[:] = self.data.xpos[self.cable_ids, :2]
+            expected = (reference-center) @ rotation.T + center + shift
+            if np.max(np.abs(self._rigid_reference_xy-expected)) > 1e-9:
+                raise RuntimeError('Static yaw placement did not preserve the planned rigid transform')
+            self._initial_sector_coverage = coverage
+            self._initial_sector_fraction_used = fraction
+            self._initial_sector_yaw_deg = math.degrees(yaw)
+            profile_header += f'|sector_fraction_yaw_v2|{yaw:.17g}|{coverage:.17g}|{fraction:.17g}'.encode('ascii')
+        if self.config.rigid_motion_speed_range is not None:
+            profile_header += f'|rigid_speed_range|{self.config.rigid_motion_nominal_speed:.17g}'.encode('ascii')
         self._rigid_reference_com_xy[:] = np.average(
             self._rigid_reference_xy, axis=0, weights=self.cable_mass
         )
@@ -3060,6 +3147,13 @@ class CableGraspEnv:
                 if self._uses_initial_shape_bank else None
             ),
             "initial_shape_entry": self._initial_shape_entry,
+            "initial_placement_version": self.config.initial_placement_version,
+            "initial_sector_coverage": self._initial_sector_coverage,
+            "initial_sector_fraction_used": self._initial_sector_fraction_used,
+            "initial_sector_yaw_deg": self._initial_sector_yaw_deg,
+            "initial_rigid_yaw_deg": self._initial_rigid_yaw_deg,
+            "rigid_motion_nominal_speed": self.config.rigid_motion_nominal_speed,
+            "rigid_motion_speed_range": self.config.rigid_motion_speed_range,
             "initial_shape_step": (
                 self._initial_shape_step
                 if self._initial_shape_entry is not None else None
@@ -3747,6 +3841,8 @@ class CableGraspEnv:
             tangents = tangents + math.radians(
                 self.config.initial_cable_yaw_deg
             )
+            if self._initial_rigid_yaw_deg is not None:
+                tangents = tangents + math.radians(self._initial_rigid_yaw_deg)
             self._rigid_initial_shape_family = family
             self._rigid_motion_rotation_sign = rotation_sign
             self._rigid_initial_tangent_angles[:tangents.size] = tangents

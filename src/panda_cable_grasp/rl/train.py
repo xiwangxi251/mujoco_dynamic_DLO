@@ -1195,7 +1195,7 @@ def parse_args() -> argparse.Namespace:
             ActionWorkspace(args.action_workspace)
         except (ValueError, KeyError, OSError) as error:
             parser.error(str(error))
-    if args.ordinary_family_curriculum and (args.target_node_task or args.workspace_scene_family not in ('cable_x075_v1', 'cable_x075_force_v1', 'cable_x075_surface_v1')):
+    if args.ordinary_family_curriculum and (args.target_node_task or args.workspace_scene_family not in ('cable_x075_v1', 'cable_x075_force_v1', 'cable_x075_surface_v1', 'cable_x075_sector_speed_v1', 'cable_x075_sector_speed_v2', 'cable_x075_sector_speed_v3')):
         parser.error('Ordinary family curriculum requires an explicit cable x075 scene family')
     if args.target_workspace is not None:
         if not args.target_node_task or args.observation_mode != "state":
@@ -1382,8 +1382,12 @@ def parse_args() -> argparse.Namespace:
         parser.error(str(error))
     args.curriculum_stages = RL_L1_CURRICULUM_STAGES
     if args.ordinary_family_curriculum:
-        suffix = {'cable_x075_force_v1': '_x075_force_v1', 'cable_x075_surface_v1': '_x075_surface_v1'}.get(args.workspace_scene_family, '_x075_v1')
+        suffix = {'cable_x075_force_v1': '_x075_force_v1', 'cable_x075_surface_v1': '_x075_surface_v1', 'cable_x075_sector_speed_v1': '_x075_sector_speed_v1', 'cable_x075_sector_speed_v2': '_x075_sector_speed_v2'}.get(args.workspace_scene_family, '_x075_v1')
         variant = lambda name: 'dev_' + name.removeprefix('id_') + suffix
+        if args.workspace_scene_family == 'cable_x075_sector_speed_v3':
+            from ..scenarios.registry import CABLE_X075_SOURCE_NAMES
+            variants = dict(zip(CABLE_X075_SOURCE_NAMES, WORKSPACE_SCENE_FAMILIES[args.workspace_scene_family]))
+            variant = variants.__getitem__
         static = (variant('id_static'), variant('id_static_midshape_v1'))
         component = (variant('id_shape_nominal_current'), variant('id_rigid_l1_nominal'),
                      variant('id_rigid_l1_midshape_v1'), variant('id_rigid_replay_shape_nominal'))
@@ -1398,7 +1402,7 @@ def parse_args() -> argparse.Namespace:
             tuple((n, b / len(static)) for n in static) + tuple((n, c / len(component)) for n in component) + ((combined[0], 1-b-c),),
         )
     if args.range_motion_curriculum:
-        if args.workspace_scene_family in ('cable_x075_force_v1', 'cable_x075_surface_v1'):
+        if args.workspace_scene_family not in (None, 'cable_x075_v1'):
             parser.error('Range curriculum retains its original scene family')
         args.rollout_ability_curriculum = True
         if args.eval_workers != 0 or args.target_node_task:

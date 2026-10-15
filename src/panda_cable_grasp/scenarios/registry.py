@@ -156,6 +156,10 @@ class ScenarioConfig:
     # None preserves the original model/bank placement. Used only by an
     # explicitly selected placement variant such as cable_x075_v1.
     initial_cable_center_x: float | None = None
+    initial_placement_version: str = "legacy_v1"
+    initial_placement_min_fraction: float = 0.5
+    initial_placement_fallback_fraction: float = 0.4
+    rigid_motion_speed_range: tuple[float, float] | None = None
     disturbance_strength: float = 1.50
     frequency_scale: float = 1.0
     shape_motion_scale: float = SHAPE_MOTION_SCALE
@@ -229,6 +233,26 @@ class ScenarioConfig:
                 raise ValueError("initial_cable_center_x must be finite")
             if self.n_objects != 1 or self.object_family != "cable":
                 raise ValueError("initial_cable_center_x requires a single cable")
+        if self.initial_placement_version not in {'legacy_v1', 'sector_fraction_v1', 'sector_fraction_yaw_v2', 'simple_rigid_yaw_v3'}:
+            raise ValueError('Unsupported initial placement version')
+        if self.initial_placement_version == 'simple_rigid_yaw_v3' and (
+                self.motion_type is not MotionType.RIGID
+                or self.motion_profile_version != 'rigid_level1_single_pass_v2'
+                or self.initial_shape_bank is not None
+                or self.n_objects != 1 or self.object_family != 'cable'):
+            raise ValueError('Simple rigid yaw requires a single simple-initial L1 rigid cable')
+        if self.initial_placement_version in {'sector_fraction_v1', 'sector_fraction_yaw_v2'} and self.motion_type is not MotionType.STATIC:
+            raise ValueError('Sector placement requires static motion')
+        if not 0 < self.initial_placement_fallback_fraction <= self.initial_placement_min_fraction <= 1:
+            raise ValueError('Invalid static placement fractions')
+        if self.initial_placement_version == 'sector_fraction_yaw_v2' and (
+                self.initial_placement_min_fraction != .3 or self.initial_placement_fallback_fraction != .3):
+            raise ValueError('Yaw-diverse static placement requires a strict 30% minimum')
+        if self.rigid_motion_speed_range is not None:
+            bounds = tuple(self.rigid_motion_speed_range)
+            if len(bounds) != 2 or not all(math.isfinite(x) for x in bounds) or not 0 < bounds[0] <= bounds[1]:
+                raise ValueError('Invalid rigid speed range')
+            object.__setattr__(self, 'rigid_motion_speed_range', bounds)
         allowed_profiles = {
             "factorized_v1",
             "factorized_v2",
@@ -637,6 +661,10 @@ class ScenarioConfig:
             "initial_shape_bank": None,
             "replay_use_snapshot_position": False,
             "initial_cable_center_x": None,
+            "initial_placement_version": "legacy_v1",
+            "initial_placement_min_fraction": 0.5,
+            "initial_placement_fallback_fraction": 0.4,
+            "rigid_motion_speed_range": None,
             "arm_motion_start_delay": 0.0,
         }
         for field_name, default_value in object_defaults.items():
@@ -688,6 +716,11 @@ class ScenarioConfig:
             "initial_shape_bank": self.initial_shape_bank,
             "replay_use_snapshot_position": self.replay_use_snapshot_position,
             "initial_cable_center_x": self.initial_cable_center_x,
+            "initial_placement_version": self.initial_placement_version,
+            "initial_placement_min_fraction": self.initial_placement_min_fraction,
+            "initial_placement_fallback_fraction": self.initial_placement_fallback_fraction,
+            "rigid_motion_speed_range": self.rigid_motion_speed_range,
+            "rigid_motion_nominal_speed": 0.25,
             "motion_regularity": self.regularity.value,
             "motion_frequency_scale": self.frequency_scale,
             "shape_motion_scale": self.shape_motion_scale,
@@ -1382,6 +1415,34 @@ def _registered_scenarios() -> list[ScenarioConfig]:
             description=f"{source.description} Experimental continuous table-supported velocity feedback.",
             tags=tuple(tag for tag in source.tags if tag != "cable_x075_v1") + ("cable_x075_surface_v1",),
         ))
+    by_name = {scenario.name: scenario for scenario in scenarios}
+    for surface_name, new_name in zip(CABLE_X075_SURFACE_SCENARIO_NAMES, CABLE_X075_SECTOR_SPEED_SCENARIO_NAMES):
+        source = by_name[surface_name]
+        simple_rigid = source.motion_profile_version == 'rigid_level1_single_pass_v2'
+        scenarios.append(replace(source, name=new_name,
+            initial_placement_version='sector_fraction_v1' if source.motion_type is MotionType.STATIC else 'legacy_v1',
+            rigid_motion_speed_range=SECTOR_SPEED_NOMINAL_RANGES[source.name] if simple_rigid else None,
+            tags=source.tags + ('cable_x075_sector_speed_v1',),
+            description=f'{source.description} Static sector placement and continuous whole-motion speed range.'))
+    by_name = {scenario.name: scenario for scenario in scenarios}
+    for old_name, new_name in zip(CABLE_X075_SECTOR_SPEED_SCENARIO_NAMES, CABLE_X075_SECTOR_SPEED_V2_SCENARIO_NAMES):
+        source = by_name[old_name]
+        static = source.motion_type is MotionType.STATIC
+        scenarios.append(replace(source, name=new_name,
+            initial_placement_version='sector_fraction_yaw_v2' if static else source.initial_placement_version,
+            initial_placement_min_fraction=.3 if static else source.initial_placement_min_fraction,
+            initial_placement_fallback_fraction=.3 if static else source.initial_placement_fallback_fraction,
+            tags=source.tags + ('cable_x075_sector_speed_v2',),
+            description=(f'{source.description} Static initial placement v2: strict30% coverage, uniform full-circle yaw.'
+                if static else f'{source.description} Unchanged dynamic member of the static placement v2 family.')))
+    by_name = {scenario.name: scenario for scenario in scenarios}
+    source = by_name[CABLE_X075_SECTOR_SPEED_V2_SCENARIO_NAMES[1]]
+    scenarios.append(replace(
+        source, name=CABLE_X075_SECTOR_SPEED_V3_SCENARIO_NAMES[1],
+        initial_placement_version='simple_rigid_yaw_v3',
+        tags=source.tags + ('cable_x075_sector_speed_v3', 'initial_yaw'),
+        description=f'{source.description} Same simple curve with seed-paired uniform initial yaw in [-180,180) degrees.',
+    ))
     return scenarios
 
 
@@ -1407,10 +1468,32 @@ CABLE_X075_SURFACE_SCENARIO_NAMES = tuple(
     name.removesuffix("_x075_v1") + "_x075_surface_v1"
     for name in CABLE_X075_SCENARIO_NAMES
 )
+CABLE_X075_SECTOR_SPEED_SCENARIO_NAMES = tuple(
+    name.removesuffix('_x075_surface_v1') + '_x075_sector_speed_v1'
+    for name in CABLE_X075_SURFACE_SCENARIO_NAMES
+)
+CABLE_X075_SECTOR_SPEED_V2_SCENARIO_NAMES = tuple(
+    name.removesuffix('_sector_speed_v1') + '_sector_speed_v2'
+    for name in CABLE_X075_SECTOR_SPEED_SCENARIO_NAMES
+)
+# Reuse the six unchanged v2 identities; only simple-initial whole motion changes.
+CABLE_X075_SECTOR_SPEED_V3_SCENARIO_NAMES = tuple(
+    name.removesuffix('_sector_speed_v2') + '_sector_speed_v3' if index == 1 else name
+    for index, name in enumerate(CABLE_X075_SECTOR_SPEED_V2_SCENARIO_NAMES)
+)
+# Two-seed ready-arm endpoint calibration, 0.82–3.42 s; actual COM targets 0.108–0.289 m/s.
+SECTOR_SPEED_NOMINAL_RANGES = {
+    'dev_rigid_l1_nominal_x075_surface_v1': (0.1453872818951525, 0.3281325717121518),
+    'dev_rigid_l1_midshape_v1_x075_surface_v1': (0.15781214589501508, 0.3432631931877228),
+    'dev_combined_l1_nominal_x075_surface_v1': (0.13409083703911281, 0.32252254139323017),
+}
 SCENARIO_FAMILIES = {
     "cable_x075_v1": CABLE_X075_SCENARIO_NAMES,
     "cable_x075_force_v1": CABLE_X075_FORCE_SCENARIO_NAMES,
     "cable_x075_surface_v1": CABLE_X075_SURFACE_SCENARIO_NAMES,
+    "cable_x075_sector_speed_v1": CABLE_X075_SECTOR_SPEED_SCENARIO_NAMES,
+    "cable_x075_sector_speed_v2": CABLE_X075_SECTOR_SPEED_V2_SCENARIO_NAMES,
+    "cable_x075_sector_speed_v3": CABLE_X075_SECTOR_SPEED_V3_SCENARIO_NAMES,
 }
 SCENARIO_REGISTRY = ScenarioRegistry(_registered_scenarios())
 SCENARIOS = SCENARIO_REGISTRY

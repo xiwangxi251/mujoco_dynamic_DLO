@@ -162,10 +162,17 @@ class RolloutMotionCurriculum(OrderedMotionCurriculum):
         self._apply()
         self.output.mkdir(parents=True,exist_ok=True)
         p=self.output/'rollout_episodes.csv'
+        self.extra_episode_fields = ('rigid_motion_nominal_speed', 'motion_frequency_scale',
+            'initial_sector_coverage', 'initial_sector_fraction_used', 'initial_shape_source_seed',
+            'initial_cable_dx', 'initial_cable_dy', 'motion_profile_hash') if self.scene_family in {'cable_x075_sector_speed_v1', 'cable_x075_sector_speed_v2', 'cable_x075_sector_speed_v3'} else ()
+        if self.scene_family in {'cable_x075_sector_speed_v2', 'cable_x075_sector_speed_v3'}:
+            self.extra_episode_fields += ('initial_sector_yaw_deg',)
+        if self.scene_family == 'cable_x075_sector_speed_v3':
+            self.extra_episode_fields += ('initial_rigid_yaw_deg',)
         exists=p.exists()
         self.file=p.open('a',newline='');self.writer=csv.DictWriter(self.file,fieldnames=[
             'episode','timesteps','scenario_name','phase_at_completion','difficulty_at_completion',
-            'eligible_for_current_gate','success','lift_attempt','loaded_lift','ever_grasped','ever_aligned_pinch'])
+            'eligible_for_current_gate','success','lift_attempt','loaded_lift','ever_grasped','ever_aligned_pinch'] + list(self.extra_episode_fields))
         if not exists:self.writer.writeheader();self.file.flush()
         self._save_state()
 
@@ -201,7 +208,8 @@ class RolloutMotionCurriculum(OrderedMotionCurriculum):
             self.writer.writerow(dict(episode=self.episode_counter,timesteps=self.num_timesteps,scenario_name=name,
                 phase_at_completion=phase,difficulty_at_completion=difficulty,eligible_for_current_gate=int(eligible),
                 success=result['success'],lift_attempt=result['attempt'],loaded_lift=result['loaded'],ever_grasped=result['secured'],
-                ever_aligned_pinch=int(bool(episode.get('ever_aligned_pinch',info.get('ever_aligned_pinch',False))))))
+                ever_aligned_pinch=int(bool(episode.get('ever_aligned_pinch',info.get('ever_aligned_pinch',False)))),
+                **{key: info.get(key) for key in self.extra_episode_fields}))
             if eligible:self.windows.add(name,result)
         self.file.flush();self._save_state(persist=False)
         return True
