@@ -880,14 +880,16 @@ class StrictSuccessEvalCallback(BaseCallback):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO for dynamic cable grasping")
-    from .workspace import add_workspace_arguments, WORKSPACE_SCENE_FAMILIES
+    from .workspace import add_workspace_arguments, WORKSPACE_SCENE_FAMILIES, ACTIVE_SCENARIO_FAMILIES, scene_family_argument
     add_workspace_arguments(parser)
     parser.add_argument("--workspace-curriculum", action="store_true")
     parser.add_argument("--eval-replay-bank-dir", type=Path,
                         help="separate held-out replay bank; uses strict bank seed matching")
     parser.add_argument("--eval-seed-pool-size", type=int, default=0,
                         help="conditioned eval reset retry pool starting at eval-seed; 0 disables")
-    parser.add_argument("--workspace-scene-family", choices=tuple(WORKSPACE_SCENE_FAMILIES))
+    parser.add_argument("--workspace-scene-family", type=scene_family_argument,
+        metavar="{" + ",".join(ACTIVE_SCENARIO_FAMILIES) + "}",
+        help="Active scene family; archived family names remain accepted for saved configurations")
     parser.add_argument("--target-node-task", action="store_true")
     parser.add_argument("--target-reward-profile", choices=("legacy", "tolerance_progress_v2", "tolerance_progress_v3", "tolerance_progress_v4", "tolerance_progress_v5", "tolerance_progress_v6"), default=None)
     parser.add_argument("--rl-config-file", type=Path,

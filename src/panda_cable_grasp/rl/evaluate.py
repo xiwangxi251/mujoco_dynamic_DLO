@@ -1509,9 +1509,9 @@ def parse_args() -> argparse.Namespace:
             "cross-policy success-rate evaluation"
         )
     )
-    from .workspace import add_workspace_arguments, WORKSPACE_SCENE_FAMILIES
+    from .workspace import add_workspace_arguments, WORKSPACE_SCENE_FAMILIES, ACTIVE_SCENARIO_FAMILIES, scene_family_argument
     add_workspace_arguments(parser)
-    parser.add_argument("--workspace-scene-family", choices=tuple(WORKSPACE_SCENE_FAMILIES))
+    parser.add_argument("--workspace-scene-family", type=scene_family_argument, metavar="{" + ",".join(ACTIVE_SCENARIO_FAMILIES) + "}", help="Active scene family; archived names remain accepted for saved configurations")
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument('--evaluation-protocol', choices=('saved-stage', 'six-scenes'),
         default='saved-stage', help='target-node default: saved workspace/course; six-scenes is a separate full-scene test')

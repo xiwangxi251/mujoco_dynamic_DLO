@@ -1495,6 +1495,16 @@ SCENARIO_FAMILIES = {
     "cable_x075_sector_speed_v2": CABLE_X075_SECTOR_SPEED_V2_SCENARIO_NAMES,
     "cable_x075_sector_speed_v3": CABLE_X075_SECTOR_SPEED_V3_SCENARIO_NAMES,
 }
+# Daily entry points. Keep the complete historical map above for saved configs
+# and existing tools; do not remove v2 members reused by the active v3 family.
+ACTIVE_SCENARIO_FAMILIES = {
+    name: scenes for name, scenes in SCENARIO_FAMILIES.items()
+    if name in {'cable_x075_v1', 'cable_x075_sector_speed_v3', 'cable_x075_length_half_one_v1'}
+}
+HISTORICAL_SCENARIO_FAMILIES = {
+    name: scenes for name, scenes in SCENARIO_FAMILIES.items()
+    if name not in ACTIVE_SCENARIO_FAMILIES
+}
 SCENARIO_REGISTRY = ScenarioRegistry(_registered_scenarios())
 SCENARIOS = SCENARIO_REGISTRY
 DEFAULT_SCENARIO = SCENARIO_REGISTRY[DEFAULT_SCENARIO_NAME]
@@ -1673,6 +1683,8 @@ __all__ = [
     "CABLE_X075_REPLAY_SCENARIO_NAMES",
     "LEGACY_PPO_SIX_SOURCE_NAMES",
     "SCENARIO_FAMILIES",
+    "ACTIVE_SCENARIO_FAMILIES",
+    "HISTORICAL_SCENARIO_FAMILIES",
     "DEFAULT_SCENARIO",
     "DEFAULT_SCENARIO_NAME",
     "FREQUENCY_SCALES",

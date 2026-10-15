@@ -9,13 +9,22 @@ from stable_baselines3.common.callbacks import BaseCallback
 from .target_node import TargetNodeTask
 from ..env.workspace_geometry import AnnularSector, DEFAULT_TARGET_WORKSPACE
 from ..scenarios.registry import (
-    CABLE_X075_REPLAY_SCENARIO_NAMES, LEGACY_PPO_SIX_SOURCE_NAMES, SCENARIO_FAMILIES,
+    CABLE_X075_REPLAY_SCENARIO_NAMES, LEGACY_PPO_SIX_SOURCE_NAMES, SCENARIO_FAMILIES, ACTIVE_SCENARIO_FAMILIES,
 )
 
 WORKSPACE_SCENE_FAMILIES = {
     "legacy_ppo_six": LEGACY_PPO_SIX_SOURCE_NAMES,
     **SCENARIO_FAMILIES,
 }
+def scene_family_argument(value):
+    # Historical names remain accepted for exact old-config reproduction, but
+    # are absent from the normal help/menu. No remapping of saved identities.
+    if value not in WORKSPACE_SCENE_FAMILIES:
+        import argparse
+        raise argparse.ArgumentTypeError('Unknown scene family: ' + value)
+    return value
+
+
 WORKSPACE_STAGES = (
     ("static_workspace_all_nodes", (1,0,0,0,0,0), 0.),
     ("complex_static_workspace", (.3,0,0,0,.7,0), 0.),
