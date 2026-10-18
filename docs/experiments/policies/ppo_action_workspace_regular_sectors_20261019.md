@@ -1,11 +1,20 @@
 # PPO regular-sector action workspace
 
-The existing `workspace3d_20261010.json` remains the default historical
-131-cell map. The regular-sector map is an explicit opt-in asset:
-`workspace3d_regular_sectors_20261014.json`. Pass its path with
-`--action-workspace` to use it. Training configuration records the selected
-map version and SHA256; loading resolves bundled maps by that hash so relocated
-checkpoints can still use their original map.
+`workspace3d_regular_sectors_20261014.json` is the default action workspace
+for fresh ordinary PPO runs using NERO, vertical-down task-space actions, and
+the `enhanced6_bounded_dls_v1` controller. This keeps requested TCP translations
+inside the measured regular-sector region before inverse kinematics.
+
+`workspace3d_20261010.json` remains available as the historical 131-cell map.
+Use `--action-workspace <path>` to select a specific map, or
+`--disable-action-workspace` to opt out. Unless explicitly overridden, resume
+runs retain the workspace recorded by their checkpoint; checkpoints without a
+workspace stay without one. Runs using an RL config file retain that file's map
+setting unless a workspace option is passed.
+Target-node tasks and legacy execution profiles do not receive this default.
+Training configuration records the selected map version and SHA256; loading
+resolves bundled maps by that hash so relocated checkpoints can still use their
+original map.
 
 The regular sectors retain the scan's selected layer regions:
 
@@ -25,5 +34,5 @@ interiors, other orientations, open jaws or loaded grasp motion.
 
 The map clips requested XYZ translation before inverse kinematics. It does not
 change PPO observations, sampled actions/log probabilities, yaw or gripper
-commands, reward, physics, or success criteria. This asset is not enabled by
-default and does not silently change existing training configurations.
+commands, reward, physics, or success criteria. The default applies only to new
+compatible runs; existing checkpoints retain their recorded behavior.

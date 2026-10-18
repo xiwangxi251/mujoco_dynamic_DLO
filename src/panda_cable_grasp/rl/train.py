@@ -200,6 +200,9 @@ def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
         if getattr(args, 'action_workspace', None):
             values['action_workspace_path'] = str(args.action_workspace.resolve())
             values['action_workspace_sha256'] = __import__('hashlib').sha256(args.action_workspace.read_bytes()).hexdigest()
+        elif getattr(args, 'disable_action_workspace', False):
+            values['action_workspace_path'] = None
+            values['action_workspace_sha256'] = None
         return RLConfig(**values)
     return RLConfig(
         arm_velocity_limits_enabled=(getattr(args, 'arm_velocity_limits', None) is not False),
@@ -236,6 +239,43 @@ def rl_config_from_args(args: argparse.Namespace) -> RLConfig:
         singularity_safety_penalty_cap=args.singularity_safety_penalty_cap,
         safety_penalty_ramp_env_steps=args.safety_penalty_ramp_env_steps,
     )
+
+
+def configure_action_workspace_default(args: argparse.Namespace) -> None:
+    """Choose a safe fresh-run default while preserving saved runs on resume."""
+    if getattr(args, 'disable_action_workspace', False) or args.action_workspace is not None:
+        return
+    if args.resume is not None:
+        from .target_defaults import checkpoint_configuration
+        saved = checkpoint_configuration(args.resume)
+        workspace = saved.get('action_workspace')
+        if workspace is None:
+            rl_config = saved.get('rl_config', {})
+            path = rl_config.get('action_workspace_path')
+            digest = rl_config.get('action_workspace_sha256')
+            workspace = ({'path': path, 'sha256': digest} if path and digest else None)
+        if workspace is None:
+            return
+        if isinstance(workspace, dict):
+            path, digest = workspace.get('path'), workspace.get('sha256')
+            if digest:
+                from .action_workspace import load_action_workspace
+                args.action_workspace = load_action_workspace(path or '.', digest).path
+            elif path and Path(path).is_file():
+                args.action_workspace = Path(path)
+            else:
+                raise ValueError('Saved action workspace has no resolvable path/hash')
+        elif isinstance(workspace, str) and Path(workspace).is_file():
+            args.action_workspace = Path(workspace)
+        else:
+            raise ValueError('Saved action workspace metadata is invalid')
+        return
+    if args.rl_config_file is not None or args.target_node_task:
+        return
+    if (args.robot == 'nero' and args.action_mode == 'task_space_vertical_down'
+            and args.controller_profile == 'enhanced6_bounded_dls_v1'):
+        from .action_workspace import DEFAULT_ACTION_WORKSPACE
+        args.action_workspace = DEFAULT_ACTION_WORKSPACE
 
 
 def pointcloud_config_from_args(
@@ -1156,12 +1196,24 @@ def parse_args() -> argparse.Namespace:
                         help='Per-scene promotion thresholds; fast uses 40/50/40%% and one complete window')
     parser.add_argument('--schedule-total-timesteps', type=int, default=0,
                         help='Global schedule horizon; preserved in checkpoint across continuations')
-    parser.add_argument('--action-workspace', type=Path, help='Measured TCP execution map; does not enable target-node task')
+    action_workspace_group = parser.add_mutually_exclusive_group()
+    action_workspace_group.add_argument(
+        '--action-workspace', type=Path,
+        help='Measured TCP execution map; overrides the compatible PPO default',
+    )
+    action_workspace_group.add_argument(
+        '--disable-action-workspace', action='store_true',
+        help='Disable the default measured TCP execution map for a fresh compatible PPO run',
+    )
     parser.add_argument('--ordinary-family-curriculum', action='store_true', help='Map ordinary L1 curriculum to the selected placement family')
     args = parser.parse_args()
     from .target_defaults import configure_target_training_defaults
     try:
         configure_target_training_defaults(args, sys.argv[1:])
+    except (ValueError, OSError, TypeError) as error:
+        parser.error(str(error))
+    try:
+        configure_action_workspace_default(args)
     except (ValueError, OSError, TypeError) as error:
         parser.error(str(error))
     if args.robot not in ROBOT_SPECS or args.action_mode not in ('task_space', 'task_space_vertical_down', 'joint_target'):

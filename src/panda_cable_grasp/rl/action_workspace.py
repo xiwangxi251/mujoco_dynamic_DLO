@@ -9,13 +9,14 @@ from pathlib import Path
 
 import numpy as np
 
-DEFAULT_ACTION_WORKSPACE = Path(__file__).with_name('workspaces') / 'workspace3d_20261010.json'
-REGULAR_ACTION_WORKSPACE = Path(__file__).with_name('workspaces') / 'workspace3d_regular_sectors_20261014.json'
+DEFAULT_ACTION_WORKSPACE = Path(__file__).with_name('workspaces') / 'workspace3d_regular_sectors_20261014.json'
+REGULAR_ACTION_WORKSPACE = DEFAULT_ACTION_WORKSPACE
+LEGACY_ACTION_WORKSPACE = Path(__file__).with_name('workspaces') / 'workspace3d_20261010.json'
 
 
 def load_action_workspace(path, expected_sha256):
     """Resolve a saved map by content hash, including relocated bundled maps."""
-    candidates = dict.fromkeys((Path(path), DEFAULT_ACTION_WORKSPACE, REGULAR_ACTION_WORKSPACE))
+    candidates = dict.fromkeys((Path(path), DEFAULT_ACTION_WORKSPACE, LEGACY_ACTION_WORKSPACE))
     for candidate in candidates:
         if candidate.is_file() and hashlib.sha256(candidate.read_bytes()).hexdigest() == expected_sha256:
             return ActionWorkspace(candidate)
