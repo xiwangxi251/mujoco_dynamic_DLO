@@ -12,6 +12,7 @@ import numpy as np
 from ..env.environment import CableGraspEnv
 from ..env.control import ENHANCED6_BOUNDED_DLS_V1, absolute_pose_twist, solve_bounded_full6
 from ..env.kinematics import point_jacobian, quat_error, rotation_to_quat
+from ..env.sector_placement import STATIC_SECTOR
 
 
 class Phase(Enum):
@@ -48,6 +49,8 @@ class PolicyConfig:
     # Geometry selectors retain their chosen material point throughout an
     # attempt; proximity to another fold must not silently change the target.
     preserve_selected_material_target: bool = False
+    # One provisional-to-B adoption per approach attempt, never during descent.
+    whole_geometry_reselect_once: bool = False
     target_middle_fraction: float = 0.20
     target_min_crossing_angle_deg: float = 60.0
     intercept_x_limits: tuple[float, float] = (0.30, 0.82)
@@ -216,6 +219,10 @@ class PolicyConfig:
             raise ValueError("target_filter_alpha must be in (0, 1]")
         if self.target_selection_mode not in {"middle", "middle_angle", "middle_geometry", "whole_geometry"}:
             raise ValueError("target_selection_mode must be middle, middle_angle, middle_geometry, or whole_geometry")
+        if not isinstance(self.whole_geometry_reselect_once, bool):
+            raise ValueError("whole_geometry_reselect_once must be boolean")
+        if self.whole_geometry_reselect_once and self.target_selection_mode != "whole_geometry":
+            raise ValueError("whole_geometry_reselect_once requires whole_geometry")
         if not 0.0 < self.target_middle_fraction < 0.5:
             raise ValueError("target_middle_fraction must be in (0, 0.5)")
         if not 0.0 <= self.target_min_crossing_angle_deg <= 90.0:
@@ -455,16 +462,28 @@ class DynamicCableGraspPolicy:
         closing = (delta @ (rotation @ self.env.gripper_closing_axis_local))[inside]
         return bool(float(closing.max() - closing.min()) + 2.0 * radius > aperture)
 
-    def _choose_initial_target(self, desired_rotation: np.ndarray) -> None:
+    def _whole_geometry_in_workspace(self, position: np.ndarray) -> bool:
+        """Use sector B for whole-geometry scoring and keep the existing Z range."""
+        position = np.asarray(position)
+        return bool(
+            STATIC_SECTOR.contains_xy(position[None, :2])[0]
+            and self.config.intercept_z_limits[0]
+            <= position[2] <= self.config.intercept_z_limits[1]
+        )
+
+    def _choose_initial_target(
+        self, desired_rotation: np.ndarray, *, require_workspace: bool = False,
+    ) -> bool:
         """Pick one near-middle node without changing the environment's task."""
 
         node_ids = self._policy_node_ids()
-        self.selected_target_body_id = self.env.target_body_id
-        self.selected_target_index = node_ids.index(self.selected_target_body_id)
-        self.selected_target_crossing_angle_deg = float("nan")
-        self.selected_target_corridor_clearance = float("nan")
+        if not require_workspace:
+            self.selected_target_body_id = self.env.target_body_id
+            self.selected_target_index = node_ids.index(self.selected_target_body_id)
+            self.selected_target_crossing_angle_deg = float("nan")
+            self.selected_target_corridor_clearance = float("nan")
         if self.config.target_selection_mode == "middle":
-            return
+            return False
 
         positions = self.env.data.xpos[node_ids, :2]
         closing = (
@@ -526,11 +545,7 @@ class DynamicCableGraspPolicy:
                 # whose node happens to lie one step closer to the midpoint.
                 if whole_geometry_mode:
                     point3 = self.env.data.xpos[node_ids[index]]
-                    in_workspace = (
-                        self.config.intercept_x_limits[0] <= point3[0] <= self.config.intercept_x_limits[1]
-                        and self.config.intercept_y_limits[0] <= point3[1] <= self.config.intercept_y_limits[1]
-                        and self.config.intercept_z_limits[0] <= point3[2] <= self.config.intercept_z_limits[1]
-                    )
+                    in_workspace = self._whole_geometry_in_workspace(point3)
                     support = float(np.linalg.norm(
                         self.env.data.xpos[node_ids[min(index + 3, len(node_ids)-1)]]
                         - self.env.data.xpos[node_ids[max(index - 3, 0)]]
@@ -561,7 +576,14 @@ class DynamicCableGraspPolicy:
                     )
             candidates.append((index, angle, quality, jaw_clearance))
         if not candidates:
-            return
+            return False
+        if whole_geometry_mode and self.config.whole_geometry_reselect_once:
+            inside = [candidate for candidate in candidates if self._whole_geometry_in_workspace(
+                self.env.data.xpos[node_ids[candidate[0]]])]
+            if inside:
+                candidates = inside
+            elif require_workspace:
+                return False
         if self.config.retry_hard_blacklist and self.attempted_target_indices:
             fresh = [
                 candidate for candidate in candidates
@@ -602,11 +624,53 @@ class DynamicCableGraspPolicy:
         self.selected_target_body_id = node_ids[index]
         self.selected_target_crossing_angle_deg = angle
         self.selected_target_corridor_clearance = jaw_clearance
+        return True
+
+    def _begin_approach_target_attempt(self) -> None:
+        self._approach_retarget_used = False
+        self._provisional_target = bool(
+            self.config.whole_geometry_reselect_once
+            and not self._whole_geometry_in_workspace(
+                self.env.data.xpos[self.selected_target_body_id])
+        )
+
+    def _maybe_adopt_workspace_target(self) -> None:
+        """Adopt one eligible sector-B target before a material segment is locked."""
+        if (not self.config.whole_geometry_reselect_once
+                or self.phase not in {Phase.SETTLE, Phase.APPROACH}
+                or self.locked_segment_index is not None
+                or self._approach_retarget_used or not self._provisional_target):
+            return
+        if self._whole_geometry_in_workspace(self.env.data.xpos[self.selected_target_body_id]):
+            self._provisional_target = False
+            return
+        positions = self.env.data.xpos[self._policy_node_ids()][2:-2]
+        available = (STATIC_SECTOR.contains_xy(positions[:, :2])
+                     & (positions[:, 2] >= self.config.intercept_z_limits[0])
+                     & (positions[:, 2] <= self.config.intercept_z_limits[1]))
+        if not np.any(available):
+            return
+        old_index = self.selected_target_index
+        if not self._choose_initial_target(
+            self._tangent_reference_rotation, require_workspace=True,
+        ):
+            return
+        self._approach_retarget_used = True
+        self._provisional_target = False
+        self.proactive_retarget_count += 1
+        self.proactive_retarget_history.append(dict(
+            time=float(self.env.data.time), phase=self.phase.name,
+            phase_start=float(self.phase_start), attempt=int(self.retry_count),
+            previous_node=int(old_index), selected_node=int(self.selected_target_index),
+            reason="provisional_outside_B_to_candidate_inside_B",
+        ))
 
     def reset(self) -> None:
         self.phase = Phase.SETTLE
         self.phase_start = float(self.env.data.time)
         self.retry_count = 0
+        self.proactive_retarget_count = 0
+        self.proactive_retarget_history: list[dict] = []
         self.attempted_target_indices: set[int] = set()
         self.attempt_failure_count = 0
         self.last_attempt_failure = None
@@ -667,6 +731,7 @@ class DynamicCableGraspPolicy:
             desired_rotation @ self.env.gripper_approach_axis_local
         )
         self._choose_initial_target(desired_rotation)
+        self._begin_approach_target_attempt()
         self.filtered_target = self._initial_target()
         if self.config.follow_target_tangent:
             self._update_target_tangent_orientation()
@@ -747,8 +812,9 @@ class DynamicCableGraspPolicy:
             else:
                 prediction_horizon = self.config.prediction_horizon
         predicted = position + prediction_horizon * velocity
-        predicted[0] = np.clip(predicted[0], *self.config.intercept_x_limits)
-        predicted[1] = np.clip(predicted[1], *self.config.intercept_y_limits)
+        if self.config.target_selection_mode != "whole_geometry":
+            predicted[0] = np.clip(predicted[0], *self.config.intercept_x_limits)
+            predicted[1] = np.clip(predicted[1], *self.config.intercept_y_limits)
         predicted[2] = np.clip(predicted[2], *self.config.intercept_z_limits)
         # 对预测值而不是原始测量做低通滤波，既保留快速横向跟踪，也避免把接触抖动送入IK。
         self.filtered_target += self.config.target_filter_alpha * (
@@ -1300,6 +1366,7 @@ class DynamicCableGraspPolicy:
             # 单侧指垫先接触时也应保持当前线段位于指间；这里仅改变机器人目标，
             # 不会撤掉环境运动驱动，也不把单侧接触当作确认抓取。
             self.filtered_target = self._lock_segment_near(hand)
+        self._maybe_adopt_workspace_target()
         target = self._predicted_segment(
             prediction_horizon=0.0 if close_contacts else None
         )
@@ -1488,6 +1555,7 @@ class DynamicCableGraspPolicy:
                     self._choose_initial_target(self._nero_grasp_rotation(
                         self.config.nero_grasp_yaw_offset_deg
                     ) if self.env.robot == "nero" else self.VERTICAL_GRASP_ROTATION)
+                self._begin_approach_target_attempt()
                 self.filtered_target = self._initial_target()
                 self._transition(Phase.APPROACH)
             return self._ik_action(desired, self.env.gripper_open_ctrl)
@@ -1603,6 +1671,9 @@ class DynamicCableGraspPolicy:
             "policy_selected_target_corridor_clearance": (
                 self.selected_target_corridor_clearance
             ),
+            "policy_proactive_retarget_count": self.proactive_retarget_count,
+            "policy_provisional_target": self._provisional_target,
+            "policy_approach_retarget_used": self._approach_retarget_used,
             "strict_vertical_gripper": self.config.strict_vertical_gripper,
             "mean_tilt_error_rad": (
                 self.tilt_error_sum / max(self.tilt_error_samples, 1)
