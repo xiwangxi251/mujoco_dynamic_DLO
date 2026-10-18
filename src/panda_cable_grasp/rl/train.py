@@ -1886,7 +1886,7 @@ def main() -> None:
         "ordinary_family_curriculum": args.ordinary_family_curriculum,
         "ordinary_reward_profile": args.ordinary_reward_profile,
         "lift_height_baseline_version": ("first_confirmed_holding_v1" if args.ordinary_reward_profile == "physical_progress_v2" else "episode_initial_max_v1"),
-        "action_workspace": (dict(path=str(args.action_workspace.resolve()), sha256=__import__("hashlib").sha256(args.action_workspace.read_bytes()).hexdigest(), version="measured_polar_cells_v1") if args.action_workspace else None),
+        "action_workspace": (dict(path=str(args.action_workspace.resolve()), sha256=__import__("hashlib").sha256(args.action_workspace.read_bytes()).hexdigest(), version=json.loads(args.action_workspace.read_text(encoding="utf-8"))["version"]) if args.action_workspace else None),
         "curriculum_training_mixes": args.curriculum_training_mixes,
         "curriculum_stage1_static_replay": args.curriculum_stage1_static_replay,
         "curriculum_stage2_static_replay": args.curriculum_stage2_static_replay,

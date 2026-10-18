@@ -1,0 +1,97 @@
+{
+  "version": "measured_layer_sectors_v1",
+  "center_xy_m": [
+    0.35,
+    0.0
+  ],
+  "height_reference": "TCP relative to table top",
+  "source_commit": "c9b162944096663593968f1f4d4838a0e3a675d1",
+  "source_summary_sha256": "d3a7b0190eace6176a39d3f8bcbc1a0bf08b401491a676470fa684731f80d025",
+  "source_candidate_sha256": "3f7234cddbc3e37690f99e8ef951f59c118580bf55e6ea2b0d2aef37908b0aa3",
+  "source_cells_sha256": "02f1704a9100b42fbcce79388f448f6afe3f993cb18cb7cc22bb80f72766c810",
+  "source_tests": 1603,
+  "source_passes": 596,
+  "selection": "original per-height sampled_sector; adjacent sectors intersect between measured heights",
+  "interpolation_limitations": "finite fixed-down closed-jaw unloaded samples; interiors and other poses not certified",
+  "layer_sectors": [
+    {
+      "height_m": 0.005,
+      "inner_radius_m": 0.28,
+      "outer_radius_m": 0.52,
+      "angle_min_deg": -20,
+      "angle_max_deg": 80
+    },
+    {
+      "height_m": 0.05,
+      "inner_radius_m": 0.28,
+      "outer_radius_m": 0.52,
+      "angle_min_deg": -20,
+      "angle_max_deg": 80
+    },
+    {
+      "height_m": 0.1,
+      "inner_radius_m": 0.28,
+      "outer_radius_m": 0.52,
+      "angle_min_deg": -20,
+      "angle_max_deg": 60
+    },
+    {
+      "height_m": 0.15,
+      "inner_radius_m": 0.2,
+      "outer_radius_m": 0.52,
+      "angle_min_deg": -20,
+      "angle_max_deg": 60
+    },
+    {
+      "height_m": 0.2,
+      "inner_radius_m": 0.2,
+      "outer_radius_m": 0.44,
+      "angle_min_deg": -20,
+      "angle_max_deg": 40
+    }
+  ],
+  "cells_r_theta_z": [
+    [
+      0.28,
+      0.52,
+      -20,
+      80,
+      0.005,
+      0.05
+    ],
+    [
+      0.28,
+      0.52,
+      -20,
+      60,
+      0.05,
+      0.1
+    ],
+    [
+      0.28,
+      0.52,
+      -20,
+      60,
+      0.1,
+      0.15
+    ],
+    [
+      0.2,
+      0.44,
+      -20,
+      40,
+      0.15,
+      0.2
+    ]
+  ],
+  "excluded_heights_m": [
+    0.3
+  ],
+  "unselected_refinement_heights_m": [
+    0.0275,
+    0.075,
+    0.125,
+    0.175,
+    0.25
+  ]
+}

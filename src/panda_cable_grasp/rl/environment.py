@@ -338,13 +338,9 @@ class RLCableGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self.rl_config = rl_config or RLConfig()
         self._action_workspace = None
         if self.rl_config.action_workspace_path:
-            from .action_workspace import ActionWorkspace, DEFAULT_ACTION_WORKSPACE
-            path = Path(self.rl_config.action_workspace_path)
-            if not path.is_file():
-                path = DEFAULT_ACTION_WORKSPACE
-            self._action_workspace = ActionWorkspace(path)
-            if self.rl_config.action_workspace_sha256 != self._action_workspace.sha256:
-                raise ValueError("Action workspace hash mismatch")
+            from .action_workspace import load_action_workspace
+            self._action_workspace = load_action_workspace(
+                self.rl_config.action_workspace_path, self.rl_config.action_workspace_sha256)
         self._workspace_projection_count = 0
         self._workspace_projection_distance = 0.
         self._last_workspace_request = np.zeros(3)
