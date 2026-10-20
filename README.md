@@ -161,6 +161,8 @@ panda_cable_grasp/
 
 PPO多worker训练默认采用固定配额异步采样；`--sampler sync`可恢复逐步同步。
 配额、尾批、回调及恢复约定见[PPO采样后端](docs/reference/ppo_sampling.md)。
+仿真特权未来轨迹可用`--future-geometry`显式开启，默认关闭；
+协议与checkpoint约定见[可选未来观测](docs/reference/ppo_future_geometry.md)。
 
 - `outputs/scripted/`：规则策略录像与状态。
 - `outputs/benchmarks/`：基准实验 CSV、manifest 和模型快照。

@@ -337,6 +337,9 @@ def make_configured_env(
         env.set_motion_difficulty(stage[2])
     if pointcloud:
         return DLOPointCloudObservation(env, pointcloud_config_from_args(args))
+    if getattr(args, 'future_geometry', False):
+        from .future_geometry import FutureGeometryObservation
+        return FutureGeometryObservation(env)
     return env
 
 
@@ -920,6 +923,8 @@ class StrictSuccessEvalCallback(BaseCallback):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO for dynamic cable grasping")
+    parser.add_argument('--future-geometry', action=argparse.BooleanOptionalAction, default=None,
+                        help='Research opt-in: fixed initial 0..3s privileged future geometry; default off for fresh training')
     parser.add_argument('--sampler', choices=('async_fixed_quota', 'sync'),
                         default='async_fixed_quota',
                         help='Default: independently ready workers with fixed per-worker quotas; sync restores step barriers')
@@ -1548,6 +1553,16 @@ def parse_args() -> argparse.Namespace:
         if (args.robot, args.controller_profile, args.action_mode) != (
                 'nero', 'enhanced6_bounded_dls_v1', 'task_space_vertical_down'):
             parser.error('Scaled arm guards are validated only for NERO enhanced6 vertical-down task space')
+    from .future_geometry import resolve_future_mode
+    from .target_defaults import checkpoint_configuration
+    try:
+        args.future_geometry = resolve_future_mode(args.future_geometry,
+            checkpoint_configuration(args.resume) if args.resume is not None else {})
+    except ValueError as error:
+        parser.error(str(error))
+    if args.future_geometry and (args.observation_mode != 'state' or args.target_node_task
+                                or args.action_mode == 'joint_target'):
+        parser.error('Future geometry requires ordinary 5-D free-action state observations')
     return args
 
 
@@ -1705,6 +1720,9 @@ def main() -> None:
         model.lr_schedule = learning_rate
 
     saved_global_schedule = getattr(model, 'training_global_schedule', None)
+    from .future_geometry import PROTOCOL as FUTURE_PROTOCOL, resolve_future_mode
+    resolve_future_mode(args.future_geometry, model=model)
+    model.future_geometry_protocol = dict(FUTURE_PROTOCOL) if args.future_geometry else None
     global_schedule = resolve_global_schedule(args, saved_global_schedule, starting_timesteps)
     if global_schedule:
         horizon = global_schedule['total_timesteps']
@@ -1821,6 +1839,8 @@ def main() -> None:
     bind_learner(args)
     configuration = {
         "algorithm": "PPO",
+        "future_geometry_enabled": args.future_geometry,
+        "future_geometry": dict(FUTURE_PROTOCOL) if args.future_geometry else None,
         "sampler_requested": args.sampler,
         "sampler": 'async_fixed_quota' if use_async else 'sync',
         "sampling_protocol": dict(
@@ -2055,6 +2075,10 @@ def main() -> None:
         configuration["curriculum_success_rate"] = .40
         configuration["curriculum_first_grasp_correct_rate"] = .60
         configuration["curriculum_motion_difficulty"] = "explicit seven-stage workspace curriculum"
+    if args.future_geometry:
+        from .future_geometry import OBSERVATION_VERSION, FUTURE_NAMES
+        configuration['observation_interface_version'] = OBSERVATION_VERSION
+        configuration['observation_names'] += list(FUTURE_NAMES)
     if args.controller_profile == "enhanced6_bounded_dls_v1":
         configuration["action"] = configuration["action"].split(";", 1)[0] + "; enhanced full6 bounded DLS, gravity feedforward and enhanced servo"
     configuration['action'] += ('; arm velocity guards enabled' if configuration['arm_velocity_limits_enabled']

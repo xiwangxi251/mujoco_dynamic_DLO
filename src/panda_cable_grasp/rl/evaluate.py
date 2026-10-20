@@ -248,6 +248,16 @@ def configure_target_evaluation(env, args, model=None):
                 saved.get('eval_scenario_weights'))
 
 
+def wrap_future_evaluation(env, args, model):
+    from .future_geometry import FutureGeometryObservation, resolve_future_mode
+    enabled = resolve_future_mode(getattr(args, 'future_geometry', None),
+                                  getattr(args, 'saved_evaluation_config', {}), model)
+    args.future_geometry = enabled
+    if enabled:
+        return FutureGeometryObservation(env)
+    return env
+
+
 def resolve_scenario_names(
     scenario: str | None,
     distribution: str,
@@ -563,7 +573,7 @@ def _manifest(
     output_dir: Path,
 ) -> dict[str, object]:
     project_root = Path(__file__).resolve().parents[1]
-    rl_source = inspect.getsourcefile(type(env))
+    rl_source = inspect.getsourcefile(type(env.unwrapped))
     base_source = inspect.getsourcefile(type(env.base_env))
     taxonomy_source = Path(__file__).resolve().parents[1] / "failure_taxonomy.py"
     action_seconds = float(
@@ -612,7 +622,10 @@ def _manifest(
             "grasp_aperture_qualification_enabled": False,
             "target_termination_version": "public_success_or_original_timeout_v1",
             "rl_interface_version": action_interface_version(args.action_mode),
-            "observation_interface_version": "target_node_state_v1" if env.goal else "baseline_state_v1",
+            "observation_interface_version": ('state99_future3s_1419_v1' if getattr(args, 'future_geometry', False)
+                                               else "target_node_state_v1" if env.goal else "baseline_state_v1"),
+            "future_geometry": (getattr(model, 'future_geometry_protocol', None)
+                                or getattr(args, 'saved_evaluation_config', {}).get('future_geometry')),
             "task_definition": (
                 "continuous physical lift/hold AND requested material node tolerance"
                 if env.goal else "any-node physical lift/hold"
@@ -631,6 +644,8 @@ def _manifest(
                 _file_record(Path(base_source)) if base_source else None
             ),
             "rl_environment_source": _file_record(Path(rl_source)) if rl_source else None,
+            "observation_wrapper_source": (_file_record(Path(inspect.getsourcefile(type(env))))
+                                            if getattr(args, 'future_geometry', False) else None),
             "env_config": asdict(env.base_env.config),
             "rl_config": asdict(env.rl_config),
             "action_seconds": action_seconds,
@@ -984,6 +999,7 @@ def run_headless(args: argparse.Namespace, model: PPO) -> None:
         replay_seed_fallback=getattr(args, "replay_seed_fallback", "resample"),
     )
     configure_target_evaluation(env, args, model)
+    env = wrap_future_evaluation(env, args, model)
 
 
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_seed{args.seed}"
@@ -1439,6 +1455,7 @@ def run_viewer(args: argparse.Namespace, model: PPO) -> None:
         replay_seed_fallback=getattr(args, "replay_seed_fallback", "resample"),
     )
     configure_target_evaluation(env, args, model)
+    env = wrap_future_evaluation(env, args, model)
 
     observation, info = env.reset(seed=args.seed)
     episode = 1
@@ -1513,6 +1530,8 @@ def parse_args() -> argparse.Namespace:
     add_workspace_arguments(parser)
     parser.add_argument("--workspace-scene-family", type=scene_family_argument, metavar="{" + ",".join(ACTIVE_SCENARIO_FAMILIES) + "}", help="Active scene family; archived names remain accepted for saved configurations")
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument('--future-geometry', action=argparse.BooleanOptionalAction, default=None,
+                        help='Default: inherit checkpoint future-observation protocol; ordinary checkpoints remain current-only')
     parser.add_argument('--evaluation-protocol', choices=('saved-stage', 'six-scenes'),
         default='saved-stage', help='target-node default: saved workspace/course; six-scenes is a separate full-scene test')
     parser.add_argument("--target-node-index", type=int, default=None,
@@ -1658,7 +1677,13 @@ def main() -> None:
             "clip_range": 0.2,
         },
     )
-    expected_size = 109 if evaluation_rl_config(arguments).target_node_task else 99
+    from .future_geometry import resolve_future_mode
+    try:
+        arguments.future_geometry = resolve_future_mode(arguments.future_geometry,
+            arguments.saved_evaluation_config, policy)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    expected_size = 1419 if arguments.future_geometry else 109 if evaluation_rl_config(arguments).target_node_task else 99
     if getattr(policy.observation_space, "shape", None) is not None and policy.observation_space.shape != (expected_size,):
         raise SystemExit("checkpoint observation shape disagrees with its saved target-task configuration")
     if arguments.headless:
