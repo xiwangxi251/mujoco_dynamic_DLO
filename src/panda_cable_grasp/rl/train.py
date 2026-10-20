@@ -920,6 +920,9 @@ class StrictSuccessEvalCallback(BaseCallback):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PPO for dynamic cable grasping")
+    parser.add_argument('--sampler', choices=('async_fixed_quota', 'sync'),
+                        default='async_fixed_quota',
+                        help='Default: independently ready workers with fixed per-worker quotas; sync restores step barriers')
     from .workspace import add_workspace_arguments, WORKSPACE_SCENE_FAMILIES, ACTIVE_SCENARIO_FAMILIES, scene_family_argument
     add_workspace_arguments(parser)
     parser.add_argument("--workspace-curriculum", action="store_true")
@@ -1572,8 +1575,14 @@ def main() -> None:
     check_candidate.close()
 
     factories = [make_worker(rank, args) for rank in range(args.workers)]
+    use_async = args.sampler == 'async_fixed_quota' and args.workers > 1
+    model_class = PPO
     if args.workers == 1:
         vector_env = DummyVecEnv(factories)
+    elif use_async:
+        from .async_rollouts import FixedQuotaPPO, FixedQuotaVecEnv
+        model_class = FixedQuotaPPO
+        vector_env = FixedQuotaVecEnv(factories, start_method='spawn')
     else:
         vector_env = SubprocVecEnv(factories, start_method="spawn")
     vector_env = VecMonitor(
@@ -1630,7 +1639,7 @@ def main() -> None:
         }
         if args.observation_mode == "pointcloud":
             policy_kwargs["features_extractor_class"] = PointNet2FeaturesExtractor
-        model = PPO(
+        model = model_class(
             policy_name,
             vector_env,
             learning_rate=learning_rate,
@@ -1653,7 +1662,7 @@ def main() -> None:
     else:
         # Explicit overrides make resumed training use this invocation's CLI
         # settings instead of silently inheriting unstable legacy defaults.
-        model = PPO.load(
+        model = model_class.load(
             args.resume,
             env=vector_env,
             device=args.device,
@@ -1724,6 +1733,10 @@ def main() -> None:
         save_path=str(args.output / "checkpoints"),
         name_prefix="ppo_cable",
     )
+    if use_async:
+        from .async_rollouts import SampleCheckpointCallback
+        checkpoint_callback = SampleCheckpointCallback(args.checkpoint_steps, args.output/'checkpoints')
+        model.sampler_progress_path = args.output/'sampler_progress.json'
     metrics_path = args.output / "training_metrics.csv"
     metrics_callback = TrainingMetricsCallback(metrics_path, window=100,
                                                goal_task=args.target_node_task)
@@ -1808,6 +1821,18 @@ def main() -> None:
     bind_learner(args)
     configuration = {
         "algorithm": "PPO",
+        "sampler_requested": args.sampler,
+        "sampler": 'async_fixed_quota' if use_async else 'sync',
+        "sampling_protocol": dict(
+            version='async_fixed_quota_v2' if use_async else 'sb3_synchronous',
+            full_batch_per_worker_steps=args.n_steps,
+            full_batch_samples=args.workers*args.n_steps,
+            fast_workers_replace_slow_samples=False,
+            policy_fixed_during_batch=True,
+            callbacks='live worker-aligned arrivals' if use_async else 'vector steps',
+            setters='queued between worker steps' if use_async else 'synchronous',
+            exact_final_budget=(use_async or args.ordinary_reward_profile == 'session_height_v1'
+                                or args.rollout_ability_curriculum)),
         "execution_profile_requested": args.execution_profile,
         "execution_defaults_source": args.execution_defaults_source,
         "robot": args.robot,
@@ -2080,13 +2105,13 @@ def main() -> None:
     )
 
     try:
-        if args.ordinary_reward_profile == 'session_height_v1' or args.rollout_ability_curriculum:
+        if not use_async and (args.ordinary_reward_profile == 'session_height_v1' or args.rollout_ability_curriculum):
             from .exact_budget import install_exact_budget
             install_exact_budget()
         model.learn(
             total_timesteps=args.timesteps,
             callback=callbacks,
-            progress_bar=True,
+            progress_bar=not use_async,
             reset_num_timesteps=args.resume is None,
         )
         model.save(args.output / "final_model")

@@ -65,6 +65,7 @@ class TrainingHealthCallback(BaseCallback):
                       optimizer_and_bookkeeping_seconds=getattr(self, 'optimizer_and_bookkeeping_seconds', None))
         record['penalty_ramp_schedule'] = getattr(self.model, 'penalty_ramp_schedule', None)
         record['target_evaluation_stage'] = getattr(self.model, 'target_evaluation_stage', None)
+        record['async_rollout'] = getattr(self.model, 'async_rollout_receipt', None)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix('.tmp')
         temporary.write_text(json.dumps(record, indent=2), encoding='utf-8')

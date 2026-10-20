@@ -186,8 +186,10 @@ class TrainingMetricsCallback(BaseCallback):
                 "episode_length": episode_length,
                 "lifted_fraction": lifted_fraction,
                 "scenario_name": info.get("scenario_name"),
-                "phase_at_completion": getattr(self.model, "ordinary_evaluation_phase", 0),
-                "difficulty_at_completion": getattr(self.model, "ordinary_evaluation_difficulty", 0.0),
+                "phase_at_completion": info.get("rollout_episode_phase",
+                                                getattr(self.model, "ordinary_evaluation_phase", 0)),
+                "difficulty_at_completion": info.get("rollout_episode_difficulty",
+                                                     getattr(self.model, "ordinary_evaluation_difficulty", 0.0)),
                 **({key: info.get(key) for key in (
                     "goal_node_index", "goal_node_error", "goal_success",
                     "any_node_success", "wrong_target_grasp_count",

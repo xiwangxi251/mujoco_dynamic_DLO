@@ -13,8 +13,10 @@ class ArmSpeedDiagnostics(BaseCallback):
 
     def _on_step(self):
         actions = np.asarray(self.locals['actions'])
+        worker_indices = self.locals.get('worker_indices', range(len(actions)))
         for rank, (info, done) in enumerate(zip(self.locals['infos'], self.locals['dones'])):
-            sums = self.reward_sums.setdefault(rank, {})
+            worker = int(worker_indices[rank])
+            sums = self.reward_sums.setdefault(worker, {})
             for key, value in info.items():
                 if key.startswith('reward_') and isinstance(value, (int, float, np.number)):
                     sums[key] = sums.get(key, 0.) + float(value)
@@ -36,12 +38,12 @@ class ArmSpeedDiagnostics(BaseCallback):
                         'gripper_velocity_limit_ratio','gravity_torque_saturation_step_ratio',
                         'table_execution_guard','action_workspace_projection_count',
                         'action_workspace_projection_distance_m')
-                record = dict(timesteps=self.num_timesteps, worker=rank,
+                record = dict(timesteps=self.num_timesteps, worker=worker,
                               reward_component_sums=sums.copy(),
                               metrics={k:info.get(k) for k in keys})
                 with (self.output/'arm_episode_diagnostics.jsonl').open('a') as stream:
                     stream.write(json.dumps(record, default=lambda x: x.tolist() if isinstance(x,np.ndarray) else str(x))+'\n')
-                self.reward_sums[rank] = {}
+                self.reward_sums[worker] = {}
         return True
 
     def _on_rollout_end(self):

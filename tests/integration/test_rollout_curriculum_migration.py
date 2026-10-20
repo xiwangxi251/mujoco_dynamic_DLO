@@ -57,6 +57,7 @@ def test_native_spawned_train_and_resume_without_eval(tmp_path, monkeypatch):
     train.main()
     cfg = json.loads((first / 'training_config.json').read_text())
     assert cfg['actual_eval_workers'] == 0 and not cfg['independent_evaluation_enabled']
+    assert cfg['sampler'] == 'async_fixed_quota'
     assert cfg['ordered_curriculum']['version'] == VERSION
     model = PPO.load(first / 'final_model.zip', device='cpu')
     assert model.num_timesteps == 14
@@ -83,10 +84,13 @@ def test_native_spawned_train_and_resume_without_eval(tmp_path, monkeypatch):
     health = json.loads((second / 'training_health.json').read_text())
     assert health['parameters_finite'] and health['rollout_fps'] > 0
     assert health['phase'] == 1
+    assert health['async_rollout']['no_pending_steps']
+    assert sum(health['async_rollout']['per_worker_steps']) == health['async_rollout']['transitions']
 
     third = tmp_path / 'fast'
     monkeypatch.setattr(sys, 'argv', cli(third, ['--resume', str(second / 'final_model.zip'),
-        '--timesteps', '6', '--schedule-total-timesteps', '0', '--rollout-gate-profile', 'fast']))
+        '--timesteps', '6', '--schedule-total-timesteps', '0', '--rollout-gate-profile', 'fast',
+        '--sampler', 'sync']))
     train.main()
     fast = PPO.load(third / 'final_model.zip', device='cpu')
     assert fast.num_timesteps == 32 and fast.rollout_gate_state['phase'] == 1
@@ -95,6 +99,7 @@ def test_native_spawned_train_and_resume_without_eval(tmp_path, monkeypatch):
     assert len(fast.rollout_gate_state['windows']['queues'][GROUPS[1][0]]) == 0
     cfg = json.loads((third / 'training_config.json').read_text())
     assert cfg['rollout_gate_profile'] == 'fast' and cfg['actual_eval_workers'] == 0
+    assert cfg['sampler'] == 'sync'
 
     fast.rollout_gate_state=dict(version=FAST_PROTOCOL['version'],phase=13,
         windows=dict(consecutive=18),episode_counter=2000)
@@ -110,6 +115,7 @@ def test_native_spawned_train_and_resume_without_eval(tmp_path, monkeypatch):
     cfg=json.loads((fourth/'training_config.json').read_text())
     assert cfg['rollout_initial_phase']==14 and len(cfg['ordered_curriculum']['phases'])==15
     assert cfg['actual_eval_workers']==0
+    assert cfg['sampler']=='async_fixed_quota'
     assert len(consolidated.rollout_gate_state['windows']['queues'])==7
 
 

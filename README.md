@@ -159,6 +159,9 @@ panda_cable_grasp/
 
 ## 输出目录
 
+PPO多worker训练默认采用固定配额异步采样；`--sampler sync`可恢复逐步同步。
+配额、尾批、回调及恢复约定见[PPO采样后端](docs/reference/ppo_sampling.md)。
+
 - `outputs/scripted/`：规则策略录像与状态。
 - `outputs/benchmarks/`：基准实验 CSV、manifest 和模型快照。
 - `outputs/rl/train/`：PPO checkpoint、TensorBoard 和评估结果。
